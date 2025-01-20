@@ -13,7 +13,7 @@ from mmengine.runner import load_checkpoint
 from mmengine.model.base_module import BaseModule, ModuleList
 from mmcv.cnn.bricks.transformer import PatchEmbed
 from mmseg.models.builder import BACKBONES
-from mmseg.utils import get_root_logger
+from mmengine.logging import MMLogger
 from utils import resize_pos_embed, DropPath
 
 T_MAX = 8192 # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
@@ -354,7 +354,7 @@ class VRWKV(BaseModule):
         self.num_extra_tokens = 0
         self.num_layers = depth
         self.drop_path_rate = drop_path_rate
-        logger = get_root_logger()
+        logger = MMLogger.get_current_instance()
         logger.info(f'layer_scale: {init_values is not None}')
 
         self.patch_embed = PatchEmbed(
@@ -412,7 +412,7 @@ class VRWKV(BaseModule):
             self.ln1 = nn.LayerNorm(self.embed_dims)
     
     def init_weights(self):
-        logger = get_root_logger()
+        logger = MMLogger.get_current_instance()
         if self.init_cfg is None:
             logger.warn(f'No pre-trained weights for '
                         f'{self.__class__.__name__}, '

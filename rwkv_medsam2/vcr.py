@@ -4,10 +4,11 @@ from torch.utils.cpp_extension import load
 import torch.utils.checkpoint as cp
 
 import math
-from typing import Tuple, Optional
+
+from typing import Tuple, Optional, List
 
 # Import custom modules
-from refinement import RefinementModule, UncertaintyHead
+from .refinement import RefinementModule, UncertaintyHead
 from ext.vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
 from ext.vrwkv.utils import resize_pos_embed, DropPath
 
@@ -372,91 +373,99 @@ class VCRBackbone(nn.Module):
 
     A backbone that:
       1. Uses FusedMbConv for an initial stage,
-      2. Uses MbConv for a secondary stage,
+      2. Uses MbConv for secondary stages,
       3. Flattens the resulting feature map,
       4. Processes tokens with RWKV blocks,
-      5. (Optionally) adds uncertainty & refinement modules.
+      5. Returns multi-scale features for FPN.
+
+    The backbone follows a similar structure to Hiera but replaces the attention blocks
+    with RWKV blocks. It outputs features in a format compatible with SAM2's image encoder.
 
     Args:
         - in_channels (int): Number of input channels (usually 3 for RGB).
-        - fused_stage_cfg (dict): Config dict for the FusedMbConv stage (e.g. out_ch, depth, stride).
-        - mbconv_stage_cfg (dict): Config dict for the MbConv stage (similarly).
         - embed_dim (int): Channel dimension after CNN stages for the flattened tokens.
         - rwkv_depth (int): Number of RWKV blocks to apply.
-        - mlp_ratio (float): Expansion ratio in each RWKV block’s channel mix.
+        - mlp_ratio (float): Expansion ratio in each RWKV block's channel mix.
         - drop_path (float): Drop path rate for RWKV blocks.
         - with_pos_embed (bool): Whether to add a learnable positional embedding after flattening.
-        - init_patch_size (Tuple[int,int]): The stride or scale factor from the entire CNN. 
-            We use this to guess how large the final feature map might be.
-        - use_uncertainty (bool): Whether to attach an uncertainty head.
-        - use_refinement (bool): Whether to attach a refinement module.
+        - init_patch_size (Tuple[int,int]): The stride or scale factor from the entire CNN.
+            Used to initialize positional embeddings.
+        - stage_channels (List[int]): Output channels for each stage [stage0,...,stage3].
+            Must match FPN's backbone_channel_list.
+        - stage_depths (List[int]): Number of blocks in each stage.
+        - stage_strides (List[int]): Stride for each stage.
     """
     def __init__(
         self,
         in_channels: int = 3,
-        fused_stage_cfg: Optional[dict] = None,
-        mbconv_stage_cfg: Optional[dict] = None,
         embed_dim: int = 768,
         rwkv_depth: int = 4,
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         with_pos_embed: bool = True,
         init_patch_size: Tuple[int,int] = (16,16),
-        use_uncertainty: bool = False,
-        use_refinement: bool = False
+        stage_channels: List[int] = [112, 224, 448, 896],
+        stage_depths: List[int] = [2, 2, 2, 2],
+        stage_strides: List[int] = [2, 2, 2, 2],
     ):
         super().__init__()
 
-        # --- Stage 1: FusedMbConv Stage Config ---
-        fused_cfg = fused_stage_cfg if fused_stage_cfg is not None else {}
-        fused_out_ch = fused_cfg.get("out_ch", 32)
-        fused_depth = fused_cfg.get("depth", 2)
-        fused_stride = fused_cfg.get("stride", 1)
-        self.fused_stage = FusedMbConvStage(
+        # Stage 0: Initial FusedMbConv stage
+        self.stage0 = FusedMbConvStage(
             in_channels=in_channels,
-            out_channels=fused_out_ch,
-            depth=fused_depth,
-            stride=fused_stride,
-            expand_ratio=fused_cfg.get("expand_ratio", 4.0),
-            act_layer=fused_cfg.get("act_layer", nn.ReLU),
-            norm_layer=fused_cfg.get("norm_layer", nn.BatchNorm2d)
-        )
-        
-        # --- Stage 2: MBConv Stage Config ---
-        mbconv_cfg = mbconv_stage_cfg if mbconv_stage_cfg is not None else {}
-        mbconv_out_ch = mbconv_cfg.get("out_ch", 32)
-        mbconv_depth = mbconv_cfg.get("depth", 2)
-        mbconv_stride = mbconv_cfg.get("stride", 1)
-        self.mbconv_stage = MbConvStage(
-            in_channels=fused_out_ch,
-            out_channels=mbconv_out_ch,
-            depth=mbconv_depth,
-            stride=mbconv_stride,
-            expand_ratio=mbconv_cfg.get("expand_ratio", 4.0),
-            act_layer=mbconv_cfg.get("act_layer", nn.ReLU),
-            norm_layer=mbconv_cfg.get("norm_layer", nn.BatchNorm2d)
+            out_channels=stage_channels[0],
+            depth=stage_depths[0],
+            stride=stage_strides[0],
+            expand_ratio=4.0,
+            act_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm2d,
         )
 
-        # --- Stage 3: Project final CNN output to embed_dim if needed ---
-        self.final_cnn_proj = nn.Conv2d(
-            in_channels=mbconv_out_ch,
-            out_channels=embed_dim,
-            kernel_size=1,
-            bias=False
+        # Stages 1-3: MbConv stages
+        self.stage1 = MbConvStage(
+            in_channels=stage_channels[0],
+            out_channels=stage_channels[1], 
+            depth=stage_depths[1],
+            stride=stage_strides[1],
+            expand_ratio=4.0,
+            act_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm2d,
         )
 
-        # --- Optional Position Embedding ---
+        self.stage2 = MbConvStage(
+            in_channels=stage_channels[1],
+            out_channels=stage_channels[2],
+            depth=stage_depths[2], 
+            stride=stage_strides[2],
+            expand_ratio=4.0,
+            act_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm2d,
+        )
+
+        self.stage3 = MbConvStage(
+            in_channels=stage_channels[2],
+            out_channels=stage_channels[3],
+            depth=stage_depths[3],
+            stride=stage_strides[3],
+            expand_ratio=4.0,
+            act_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm2d,
+        )
+
+        # Positional embedding for final scale
         self.with_pos_embed = with_pos_embed
         if self.with_pos_embed:
             max_hw = init_patch_size[0] * init_patch_size[1]
-            self.pos_embed = nn.Parameter(torch.zeros(1, max_hw, embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_hw, stage_channels[-1]))
+            # Initialize with learned positional embeddings
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
         else:
             self.pos_embed = None
 
-        # --- Stage 4: RWKV Blocks ---
+        # RWKV blocks on final scale
         self.rwkv_blocks = nn.ModuleList([
             RWKVBlock(
-                embed_dim=embed_dim,
+                embed_dim=stage_channels[-1],
                 total_layer=rwkv_depth,
                 layer_id=i,
                 mlp_ratio=mlp_ratio,
@@ -468,60 +477,55 @@ class VCRBackbone(nn.Module):
                 key_norm=False,
                 use_layer_scale=True,
                 layer_scale_init_value=1e-2,
-                with_cp=False
+                with_cp=False,
             )
             for i in range(rwkv_depth)
         ])
 
-        self.final_norm = nn.LayerNrom(embed_dim, eps=1e-6)
+        # Final LayerNorm
+        self.final_norm = nn.LayerNorm(stage_channels[-1], eps=1e-6)
 
+        # Channel list for FPN (high to low resolution)
+        self.channel_list = stage_channels[::-1]
 
-    def init_weights(self):
-        pass
-
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
-        Forward pass of the VCR model.
-            1) FusedMbConv Stage
-            2) MbConv Stage
-            3) Final conv projection
-            4) Flatten and positional embedding
-            5) RWKV Blocks
-            6) Final norm
-        Returns features
+        Forward pass through backbone.
+        
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+            
+        Returns:
+            List of feature maps [feat3_rnn, feat2, feat1, feat0] with channels
+            [896, 448, 224, 112] and progressively higher spatial resolution
         """
-        B, C, H, W = x.shape
+        # CNN stages
+        feat0 = self.stage0(x)      # (B, 112, H/2, W/2)
+        feat1 = self.stage1(feat0)  # (B, 224, H/4, W/4) 
+        feat2 = self.stage2(feat1)  # (B, 448, H/8, W/8)
+        feat3 = self.stage3(feat2)  # (B, 896, H/16, W/16)
 
-        # --- Stage 1: FusedMbConv Stage ---
-        x = self.fused_stage(x) # out: (B, fused_out_ch, H, W)
+        # Process final scale with RWKV
+        B, C, Hf, Wf = feat3.shape
+        x3 = feat3.flatten(2).transpose(1, 2).contiguous()  # (B, N, C)
 
-        # --- Stage 2: MBConv Stage ---
-        x = self.mbconv_stage(x) # out: (B, mbconv_out_ch, H, W)
-
-        # --- Stage 3: Final Conv Projection ---
-        x = self.final_cnn_proj(x) # out: (B, embed_dim, H, W)
-
-        # --- Stage 4: Flatten and Positional Embedding ---
-        B, E, Hf, Wf = x.shape
-        x = x.flatten(2).transpose(1, 2).contiguous() # (B, N, E), N = Hf * Wf
-
+        # Add positional embedding
         if self.with_pos_embed and self.pos_embed is not None:
-            x = x + resize_pos_embed(
+            x3 = x3 + resize_pos_embed(
                 self.pos_embed,
                 src_shape=(int(math.sqrt(self.pos_embed.shape[1])),) * 2,
                 dst_shape=(Hf, Wf),
                 mode="bicubic",
-                num_extra_tokens=0
+                num_extra_tokens=0,
             )
 
-        # --- Stage 5: RWKV Blocks ---
-        for rwkv_block in self.rwkv_blocks:
-            x = rwkv_block(x, patch_resolution=(Hf, Wf)) # shape remains (B, N, E)
+        # Apply RWKV blocks
+        for block in self.rwkv_blocks:
+            x3 = block(x3, (Hf, Wf))
 
-        # --- Stage 6: Final Norm in Flattened Form ---
-        x = self.final_norm(x)
+        # Final norm and reshape
+        x3 = self.final_norm(x3)
+        feat3_rnn = x3.transpose(1, 2).reshape(B, C, Hf, Wf)
 
-        # --- Unflatten to (B, E, Hf, Wf) ---
-        x_2d = x.transpose(1, 2).reshape(B, E, Hf, Wf).contiguous()
-
-        return x_2d
+        # Return multi-scale features for FPN
+        return [feat3_rnn, feat2, feat1, feat0]

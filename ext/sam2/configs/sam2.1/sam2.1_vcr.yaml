@@ -10,12 +10,9 @@ model:
   image_encoder:
     _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
     scalp: 1
+
     trunk:
-      _target_: sam2.modeling.backbones.hieradet.Hiera
-      embed_dim: 112
-      num_heads: 2
-    trunk:
-      _target: rwkv_medsam2.vcr.VCRBackbone
+      _target_: rwkv_medsam2.vcr.VCRBackbone
       in_channels: 3
       fused_stage_cfg:
         out_ch: 32
