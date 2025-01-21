@@ -106,7 +106,7 @@ model:
         kernel_size: 7
         padding: 3
         layer_scale_init_value: 1e-6
-        use_dwconv: True
+        use_dwconv: true
       num_layers: 2
 
   # ---------------------------
