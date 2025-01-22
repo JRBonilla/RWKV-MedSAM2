@@ -9,11 +9,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.utils.checkpoint as cp
 
-from mmengine.runner import load_checkpoint
-from mmengine.model.base_module import BaseModule, ModuleList
-from mmcv.cnn.bricks.transformer import PatchEmbed
-from mmseg.models.builder import BACKBONES
-from mmengine.logging import MMLogger
+# from mmengine.runner import load_checkpoint
+# from mmengine.model.base_module import BaseModule, ModuleList
+# from mmcv.cnn.bricks.transformer import PatchEmbed
+# from mmseg.models.builder import BACKBONES
+# from mmengine.logging import MMLogger
 from utils import resize_pos_embed, DropPath
 
 T_MAX = 8192 # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
@@ -22,6 +22,139 @@ T_MAX = 8192 # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
 from torch.utils.cpp_extension import load
 wkv_cuda = load(name="wkv", sources=["cuda/wkv_op.cpp", "cuda/wkv_cuda.cu"],
                 verbose=True, extra_cuda_cflags=['-res-usage', '--maxrregcount 60', '--use_fast_math', '-O3', '-Xptxas -O3', f'-DTmax={T_MAX}'])
+
+def get_logger(name=__name__):
+    """
+    Creates and returns a logger with a standard configuration.
+    
+    Args:
+        name (str): The name for the logger. Defaults to the module name.
+        
+    Returns:
+        logging.Logger: A configured logger instance with stream handler and formatter.
+    """
+    logger = logging.getLogger(name)
+    if not logger.hasHandlers():
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+class PatchEmbed(nn.Module):
+    """
+    Image to Patch Embedding using Conv2d.
+    
+    Args:
+        in_channels (int): Number of input channels.
+        input_size (int or tuple): Size of the input image.
+        embed_dims (int): Number of embedding dimensions.
+        conv_type (str): Type of convolution to use ('Conv2d' or 'ConvTranspose2d').
+        kernel_size (int): Size of the convolutional kernel.
+        stride (int): Stride for the convolution.
+        padding (str): Padding method ('corner' or 'same').
+        bias (bool): Whether to use bias in the convolution.
+    """
+    def __init__(self,
+                 in_channels=3,
+                 input_size=224,
+                 embed_dims=768,
+                 conv_type='Conv2d',
+                 kernel_size=16,
+                 stride=16,
+                 padding='corner',
+                 bias=True):
+        super().__init__()
+        
+        self.embed_dims = embed_dims
+        if isinstance(input_size, int):
+            input_size = (input_size, input_size)
+        elif isinstance(input_size, tuple):
+            if len(input_size) == 1:
+                input_size = (input_size[0], input_size[0])
+            assert len(input_size) == 2
+            
+        if padding == 'corner':
+            padding = 0
+        
+        # Calculate output size
+        h_out = math.floor((input_size[0] + 2 * padding - kernel_size) / stride + 1)
+        w_out = math.floor((input_size[1] + 2 * padding - kernel_size) / stride + 1)
+        self.init_out_size = (h_out, w_out)
+        
+        if conv_type == 'Conv2d':
+            self.projection = nn.Conv2d(
+                in_channels,
+                embed_dims,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=bias)
+        else:
+            raise TypeError(f'Unsupported conv type: {conv_type}')
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.projection(x)
+        h, w = x.shape[2:]
+        x = x.flatten(2).transpose(1, 2)
+        return x, (h, w)
+
+def load_checkpoint(model, checkpoint_path, map_location='cpu', logger=None, strict=True, revise_keys=None):
+    """
+    Load checkpoint from a file.
+    
+    Args:
+        model (nn.Module): Model to load checkpoint.
+        checkpoint_path (str): Path to checkpoint file.
+        map_location (str): Location to map tensors. Defaults to 'cpu'.
+        logger (logging.Logger, optional): Logger for printing info.
+        strict (bool): Whether to strictly enforce matching keys. Defaults to True.
+        revise_keys (list): List of (old_key, new_key) pairs to rename keys. Defaults to None.
+        
+    Returns:
+        dict: The loaded checkpoint.
+    """
+    if logger is None:
+        logger = get_logger()
+        
+    logger.info(f'Loading checkpoint from {checkpoint_path}')
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+    
+    if revise_keys is not None:
+        for old_key, new_key in revise_keys:
+            state_dict = {k.replace(old_key, new_key): v 
+                         for k, v in state_dict.items()}
+    
+    # Filter out unnecessary keys
+    model_state_dict = model.state_dict()
+    loaded_state_dict = {
+        k: v for k, v in state_dict.items()
+        if k in model_state_dict
+    }
+    
+    # Check for missing and unexpected keys
+    missing_keys = set(model_state_dict.keys()) - set(loaded_state_dict.keys())
+    unexpected_keys = set(state_dict.keys()) - set(model_state_dict.keys())
+    
+    if missing_keys:
+        logger.warning(f'Missing keys in source state_dict: {missing_keys}')
+    if unexpected_keys:
+        logger.warning(f'Unexpected keys in source state_dict: {unexpected_keys}')
+    
+    # Load the filtered state dict
+    model.load_state_dict(loaded_state_dict, strict=strict)
+    
+    logger.info(f'Checkpoint loaded successfully')
+    return checkpoint
 
 
 class WKV(torch.autograd.Function):
@@ -88,7 +221,7 @@ def q_shift(input, shift_pixel=1, gamma=1/4, patch_resolution=None):
     return output.flatten(2).transpose(1, 2)
 
 
-class VRWKV_SpatialMix(BaseModule):
+class VRWKV_SpatialMix(nn.Module):
     def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
                  channel_gamma=1/4, shift_pixel=1, init_mode='fancy',
                  key_norm=False):
@@ -194,7 +327,7 @@ class VRWKV_SpatialMix(BaseModule):
         return rwkv
 
 
-class VRWKV_ChannelMix(BaseModule):
+class VRWKV_ChannelMix(nn.Module):
     def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
                  channel_gamma=1/4, shift_pixel=1, hidden_rate=4, init_mode='fancy',
                  key_norm=False):
@@ -261,7 +394,7 @@ class VRWKV_ChannelMix(BaseModule):
         return rkv
 
 
-class Block(BaseModule):
+class Block(nn.Module):
     def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
                  channel_gamma=1/4, shift_pixel=1, drop_path=0., hidden_rate=4,
                  init_mode='fancy', init_values=None, post_norm=False,
@@ -312,8 +445,7 @@ class Block(BaseModule):
             x = _inner_forward(x)
         return x
 
-@BACKBONES.register_module()
-class VRWKV(BaseModule):
+class VRWKV(nn.Module):
     """
     norm w and norm u
     """
@@ -354,7 +486,7 @@ class VRWKV(BaseModule):
         self.num_extra_tokens = 0
         self.num_layers = depth
         self.drop_path_rate = drop_path_rate
-        logger = MMLogger.get_current_instance()
+        logger = get_logger(__name__)
         logger.info(f'layer_scale: {init_values is not None}')
 
         self.patch_embed = PatchEmbed(
@@ -388,7 +520,7 @@ class VRWKV(BaseModule):
                 f'Invalid out_indices {index}'
         self.out_indices = out_indices
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.layers = ModuleList()
+        self.layers = nn.ModuleList()
         for i in range(self.num_layers):
             self.layers.append(Block(
                 n_embd=embed_dims,
@@ -412,7 +544,7 @@ class VRWKV(BaseModule):
             self.ln1 = nn.LayerNorm(self.embed_dims)
     
     def init_weights(self):
-        logger = MMLogger.get_current_instance()
+        logger = get_logger(__name__)
         if self.init_cfg is None:
             logger.warn(f'No pre-trained weights for '
                         f'{self.__class__.__name__}, '
