@@ -17,8 +17,8 @@ T_MAX = 8192
 wkv_cuda = load(
     name="wkv",
     sources=[
-        "../ext/vrwkv/cuda/wkv_op.cpp",
-        "../ext/vrwkv/cuda/wkv_cuda.cu"
+        "ext/vrwkv/cuda/wkv_op.cpp",
+        "ext/vrwkv/cuda/wkv_cuda.cu"
     ],
     verbose=True,
     extra_cuda_cflags=[
