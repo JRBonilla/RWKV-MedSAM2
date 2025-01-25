@@ -14,12 +14,12 @@ model:
       _target_: rwkv_medsam2.vcr.VCRBackbone
       in_channels: 3
       fused_stage_cfg:
-        out_ch: 32
+        out_ch: 112
         depth: 2
         stride: 2
         expand_ratio: 4.0
       mbconv_stage_cfg:
-        out_ch: 64
+        out_ch: 224
         depth: 2
         stride: 2
         expand_ratio: 4.0

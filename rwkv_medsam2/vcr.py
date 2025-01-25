@@ -393,14 +393,14 @@ class VCRBackbone(nn.Module):
 
         # Use config parameters or defaults
         fused_cfg = fused_stage_cfg or {
-            'out_ch': 32,
+            'out_ch': 112,
             'depth': 2,
             'stride': 2,
             'expand_ratio': 4.0
         }
         
         mbconv_cfg = mbconv_stage_cfg or {
-            'out_ch': 64,
+            'out_ch': 224,
             'depth': 2,
             'stride': 2,
             'expand_ratio': 4.0
