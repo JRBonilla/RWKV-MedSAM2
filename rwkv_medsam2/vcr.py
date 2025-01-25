@@ -12,26 +12,6 @@ from .refinement import RefinementModule, UncertaintyHead
 from ext.vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
 from ext.vrwkv.utils import resize_pos_embed, DropPath
 
-# CUDA settings for WKV
-T_MAX = 8192
-wkv_cuda = load(
-    name="wkv",
-    sources=[
-        "ext/vrwkv/cuda/wkv_op.cpp",
-        "ext/vrwkv/cuda/wkv_cuda.cu"
-    ],
-    verbose=True,
-    extra_cuda_cflags=[
-        "-O3",
-        "-res-usage",
-        "--maxrregcount=60",
-        "--use_fast_math",
-        "-O3",
-        "-Xptxas -O3",
-        f"-DTmax={T_MAX}"
-    ],
-)
-
 class FusedMbConv(nn.Module):
     """
     Implementation of a fused Mobile Inverted Bottleneck (FusedMbConv):
@@ -328,7 +308,7 @@ class RWKVBlock(nn.Module):
             shift_mode=shift_mode,
             channel_gamma=channel_gamma,
             shift_pixel=shift_pixel,
-            hidden_rate=mlp_ratio,
+            hidden_rate=int(mlp_ratio),
             init_mode=init_mode,
             key_norm=key_norm
         )
@@ -390,10 +370,10 @@ class VCRBackbone(nn.Module):
         - with_pos_embed (bool): Whether to add a learnable positional embedding after flattening.
         - init_patch_size (Tuple[int,int]): The stride or scale factor from the entire CNN.
             Used to initialize positional embeddings.
-        - stage_channels (List[int]): Output channels for each stage [stage0,...,stage3].
-            Must match FPN's backbone_channel_list.
-        - stage_depths (List[int]): Number of blocks in each stage.
-        - stage_strides (List[int]): Stride for each stage.
+        - fused_stage_cfg (dict, optional): Configuration for the FusedMbConv stage.
+        - mbconv_stage_cfg (dict, optional): Configuration for the MbConv stages.
+        - use_uncertainty (bool, optional): Whether to use uncertainty heads. Default: False.
+        - use_refinement (bool, optional): Whether to use refinement heads. Default: False.
     """
     def __init__(
         self,
@@ -404,19 +384,43 @@ class VCRBackbone(nn.Module):
         drop_path: float = 0.0,
         with_pos_embed: bool = True,
         init_patch_size: Tuple[int,int] = (16,16),
-        stage_channels: List[int] = [112, 224, 448, 896],
-        stage_depths: List[int] = [2, 2, 2, 2],
-        stage_strides: List[int] = [2, 2, 2, 2],
+        fused_stage_cfg: dict = None,
+        mbconv_stage_cfg: dict = None,
+        use_uncertainty: bool = False,
+        use_refinement: bool = False,
     ):
         super().__init__()
+
+        # Use config parameters or defaults
+        fused_cfg = fused_stage_cfg or {
+            'out_ch': 32,
+            'depth': 2,
+            'stride': 2,
+            'expand_ratio': 4.0
+        }
+        
+        mbconv_cfg = mbconv_stage_cfg or {
+            'out_ch': 64,
+            'depth': 2,
+            'stride': 2,
+            'expand_ratio': 4.0
+        }
+
+        # Calculate stage channels based on configs
+        stage_channels = [
+            fused_cfg['out_ch'],              # Stage 0
+            mbconv_cfg['out_ch'],             # Stage 1
+            mbconv_cfg['out_ch'] * 2,         # Stage 2
+            mbconv_cfg['out_ch'] * 4          # Stage 3
+        ]
 
         # Stage 0: Initial FusedMbConv stage
         self.stage0 = FusedMbConvStage(
             in_channels=in_channels,
             out_channels=stage_channels[0],
-            depth=stage_depths[0],
-            stride=stage_strides[0],
-            expand_ratio=4.0,
+            depth=fused_cfg['depth'],
+            stride=fused_cfg['stride'],
+            expand_ratio=fused_cfg['expand_ratio'],
             act_layer=nn.ReLU,
             norm_layer=nn.BatchNorm2d,
         )
@@ -424,10 +428,10 @@ class VCRBackbone(nn.Module):
         # Stages 1-3: MbConv stages
         self.stage1 = MbConvStage(
             in_channels=stage_channels[0],
-            out_channels=stage_channels[1], 
-            depth=stage_depths[1],
-            stride=stage_strides[1],
-            expand_ratio=4.0,
+            out_channels=stage_channels[1],
+            depth=mbconv_cfg['depth'],
+            stride=mbconv_cfg['stride'],
+            expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
             norm_layer=nn.BatchNorm2d,
         )
@@ -435,9 +439,9 @@ class VCRBackbone(nn.Module):
         self.stage2 = MbConvStage(
             in_channels=stage_channels[1],
             out_channels=stage_channels[2],
-            depth=stage_depths[2], 
-            stride=stage_strides[2],
-            expand_ratio=4.0,
+            depth=mbconv_cfg['depth'],
+            stride=mbconv_cfg['stride'],
+            expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
             norm_layer=nn.BatchNorm2d,
         )
@@ -445,9 +449,9 @@ class VCRBackbone(nn.Module):
         self.stage3 = MbConvStage(
             in_channels=stage_channels[2],
             out_channels=stage_channels[3],
-            depth=stage_depths[3],
-            stride=stage_strides[3],
-            expand_ratio=4.0,
+            depth=mbconv_cfg['depth'],
+            stride=mbconv_cfg['stride'],
+            expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
             norm_layer=nn.BatchNorm2d,
         )
@@ -468,7 +472,7 @@ class VCRBackbone(nn.Module):
                 embed_dim=stage_channels[-1],
                 total_layer=rwkv_depth,
                 layer_id=i,
-                mlp_ratio=mlp_ratio,
+                mlp_ratio=int(mlp_ratio),
                 drop_path=drop_path,
                 shift_mode="q_shift",
                 channel_gamma=0.25,
