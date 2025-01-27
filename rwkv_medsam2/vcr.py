@@ -7,15 +7,51 @@ import math
 
 from typing import Tuple, Optional, List
 
-# Import custom modules
+# Import custom modules for refinement and uncertainty prediction
 from .refinement import RefinementModule, UncertaintyHead
 from ext.vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
 from ext.vrwkv.utils import resize_pos_embed, DropPath
 
+class VCRStem(nn.Module):
+    """
+    Initial stem block that processes raw input images.
+    
+    Reduces spatial dimensions by 2x while increasing channels through:
+    - 3x3 strided convolution 
+    - Batch normalization
+    - ReLU activation
+
+    Args:
+        in_channels (int, optional): Number of input channels. Default: 3.
+        out_channels (int, optional): Number of output channels. Default: 32.
+    """
+    def __init__(self, in_channels=3, out_channels=32):
+        super().__init__()
+
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels, 
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        # Basic conv -> BN -> ReLU sequence
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
 class FusedMbConv(nn.Module):
     """
     Implementation of a fused Mobile Inverted Bottleneck (FusedMbConv):
-    Combines expand and depthwise convolutions into a single 3x3 convolution.
+    Combines expand and depthwise convolutions into a single 3x3 convolution
+    for improved efficiency. Includes optional residual connection when stride=1
+    and channels match.
 
     Args:
         - in_channels (int): Number of input channels.
@@ -42,7 +78,7 @@ class FusedMbConv(nn.Module):
 
         # Fused 3x3 convolution + BN + activation
         self.fused_conv = nn.Conv2d(
-            in_channels=in_channels if not self.expand else hidden_dim,
+            in_channels=in_channels,
             out_channels=hidden_dim,
             kernel_size=3,
             stride=stride,
@@ -53,8 +89,8 @@ class FusedMbConv(nn.Module):
         self.fused_bn = norm_layer(hidden_dim)
         self.fused_act = act_layer(inplace=True)
 
-        # Projection layer (1x1 convolution + BN)
-        if self.expand:
+        # Projection layer (1x1 convolution + BN) if needed
+        if self.expand or (out_channels != in_channels):
             self.project_conv = nn.Conv2d(
                 in_channels=hidden_dim,
                 out_channels=out_channels,
@@ -64,6 +100,8 @@ class FusedMbConv(nn.Module):
                 bias=False
             )
             self.project_bn = norm_layer(out_channels)
+        else:
+            self.project_conv = None
 
     def forward(self, x):
         identity = x
@@ -86,13 +124,14 @@ class FusedMbConv(nn.Module):
 
 class FusedMbConvStage(nn.Module):
     """
-    Stage stacking multiple FusedMbConv blocks.
+    Stage stacking multiple FusedMbConv blocks for hierarchical feature extraction.
+    First block handles stride and channel changes, subsequent blocks maintain dimensions.
 
     Args:
         - in_channels (int): Number of input channels.
         - out_channels (int): Number of output channels.
         - depth (int, optional): Number of blocks. Default is 2.
-        - stride (int, optional): Convolution stride. Default is 1.
+        - stride (int, optional): Stride for first block. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
         - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
@@ -127,12 +166,13 @@ class FusedMbConvStage(nn.Module):
 
 class MbConv(nn.Module):
     """
-    Classic Mobile Inverted Bottleneck (MBConv).
+    Classic Mobile Inverted Bottleneck (MBConv) with separate expansion,
+    depthwise, and projection layers. Includes skip connection when possible.
 
     Args:
         - in_channels (int): Number of input channels.
         - out_channels (int): Number of output channels.
-        - stride (int, optional): Convolution stride. Default is 1.
+        - stride (int, optional): Stride for depthwise conv. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
         - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
@@ -208,7 +248,17 @@ class MbConv(nn.Module):
 
 class MbConvStage(nn.Module):
     """
-    Stage stacking multiple MbConv blocks.
+    Stage stacking multiple MbConv blocks for hierarchical feature extraction.
+    First block handles stride and channel changes, subsequent blocks maintain dimensions.
+
+    Args:
+        - in_channels (int): Number of input channels.
+        - out_channels (int): Number of output channels.
+        - depth (int, optional): Number of blocks. Default is 2.
+        - stride (int, optional): Stride for first block. Default is 1.
+        - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
+        - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
+        - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
     """
     def __init__(
         self,
@@ -240,19 +290,19 @@ class MbConvStage(nn.Module):
 
 class RWKVBlock(nn.Module):
     """
-    Implementation of an RWKV block.
-    This block follows a two-step sequence.
-        1. LayerNorm + SpatialMix + residual
-        2. LayerNorm + ChannelMix + residual
+    Implementation of an RWKV (Receptance Weighted Key Value) block.
+    This block follows a two-step sequence:
+        1. LayerNorm -> SpatialMix (attention-like) -> residual
+        2. LayerNorm -> ChannelMix (feedforward-like) -> residual
 
     Optionally applies:
-        - DropPath (for Stochastic Depth)
-        - Learnable per-branch scaling (layer scale),
-        - Checkpointing (to save memory at the cost of extra compute)
+        - DropPath (for stochastic depth regularization)
+        - Learnable per-branch scaling (layer scale)
+        - Gradient checkpointing (to save memory at the cost of extra compute)
 
     Args:
         - embed_dim (int): Number of channels (C) in input features (B, N, C).
-        - total_layers (int): Total number of RWKV layers in the model (used by VRWKV modules).
+        - total_layer (int): Total number of RWKV layers in the model (used by VRWKV modules).
         - layer_id (int): Index of this layer (starting at 0).
         - mlp_ratio (float, optional): Expansion ratio for ChannelMix. Default: 4.0.
         - drop_path (float, optional): Dropout path rate for stochastic depth. Default: 0.0.
@@ -323,14 +373,14 @@ class RWKVBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, patch_resolution: tuple) -> torch.Tensor:
         def _inner_forward(t):
-            # --- Sub-block A: Spatial Mix ---
+            # --- Sub-block A: Spatial Mix with residual ---
             t_norm = self.norm1(t)
             out_spatial = self.spatial_mix(t_norm, patch_resolution)
             if self.use_layer_scale:
                 out_spatial *= self.gamma1
             t += self.drop_path(out_spatial)
 
-            # --- Sub-block B: Channel Mix ---
+            # --- Sub-block B: Channel Mix with residual ---
             t_norm = self.norm2(t)
             out_channel = self.channel_mix(t_norm, patch_resolution)
             if self.use_layer_scale:
@@ -347,19 +397,14 @@ class RWKVBlock(nn.Module):
 
 class VCRBackbone(nn.Module):
     """
-    V ision
-    C NN
-    R WKV
+    Vision CNN-RWKV hybrid backbone that combines:
+    1. Efficient mobile convolutions (FusedMbConv and MbConv) for early processing
+    2. RWKV blocks for global context modeling
+    3. Multi-scale feature outputs compatible with FPN
 
-    A backbone that:
-      1. Uses FusedMbConv for an initial stage,
-      2. Uses MbConv for secondary stages,
-      3. Flattens the resulting feature map,
-      4. Processes tokens with RWKV blocks,
-      5. Returns multi-scale features for FPN.
-
-    The backbone follows a similar structure to Hiera but replaces the attention blocks
-    with RWKV blocks. It outputs features in a format compatible with SAM2's image encoder.
+    The architecture progressively reduces spatial resolution while increasing channels,
+    then applies RWKV blocks for long-range dependencies. Outputs features at multiple
+    scales for downstream tasks like segmentation.
 
     Args:
         - in_channels (int): Number of input channels (usually 3 for RGB).
@@ -391,6 +436,9 @@ class VCRBackbone(nn.Module):
     ):
         super().__init__()
 
+        stem_out_channels = (fused_stage_cfg or {}).get('out_ch', 112)
+        self.stem = VCRStem(in_channels=in_channels, out_channels=stem_out_channels)
+
         # Use config parameters or defaults
         fused_cfg = fused_stage_cfg or {
             'out_ch': 112,
@@ -416,7 +464,7 @@ class VCRBackbone(nn.Module):
 
         # Stage 0: Initial FusedMbConv stage
         self.stage0 = FusedMbConvStage(
-            in_channels=in_channels,
+            in_channels=stem_out_channels,
             out_channels=stage_channels[0],
             depth=fused_cfg['depth'],
             stride=fused_cfg['stride'],
@@ -425,7 +473,7 @@ class VCRBackbone(nn.Module):
             norm_layer=nn.BatchNorm2d,
         )
 
-        # Stages 1-3: MbConv stages
+        # Stages 1-3: MbConv stages with increasing channels
         self.stage1 = MbConvStage(
             in_channels=stage_channels[0],
             out_channels=stage_channels[1],
@@ -500,10 +548,17 @@ class VCRBackbone(nn.Module):
             x: Input tensor of shape (B, C, H, W)
             
         Returns:
-            List of feature maps [feat3_rnn, feat2, feat1, feat0] with channels
-            [896, 448, 224, 112] and progressively higher spatial resolution
+            List of feature maps [feat0, feat1, feat2, feat3_rnn] with channels
+            [112, 224, 448, 896] and progressively halved spatial resolution:
+            - feat0: 1/2 resolution features from FusedMbConv
+            - feat1: 1/4 resolution features from first MbConv
+            - feat2: 1/8 resolution features from second MbConv
+            - feat3_rnn: 1/16 resolution features processed by RWKV blocks
         """
-        # CNN stages
+        # Initial stem block reduces spatial dims by 2x while increasing channels
+        x = self.stem(x)
+        
+        # Process through CNN stages with progressively increasing channels and decreasing resolution
         feat0 = self.stage0(x)      # (B, 112, H/2, W/2)
         feat1 = self.stage1(feat0)  # (B, 224, H/4, W/4) 
         feat2 = self.stage2(feat1)  # (B, 448, H/8, W/8)
@@ -532,4 +587,4 @@ class VCRBackbone(nn.Module):
         feat3_rnn = x3.transpose(1, 2).reshape(B, C, Hf, Wf)
 
         # Return multi-scale features for FPN
-        return [feat3_rnn, feat2, feat1, feat0]
+        return [feat0, feat1, feat2, feat3_rnn]
