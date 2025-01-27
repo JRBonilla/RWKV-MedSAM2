@@ -31,7 +31,8 @@ REQUIRED_PACKAGES = [
     'hydra-core>=1.3.2',
     'iopath>=0.1.10',
     'pillow>=9.4.0',
-    "ninja>=1.11.0"
+    "ninja>=1.11.0",
+    "sam2>=1.1.0"
 ]
 
 # Build the SAM2 CUDA extension
