@@ -17,33 +17,56 @@ class VCRStem(nn.Module):
     Initial stem block that processes raw input images.
     
     Reduces spatial dimensions by 2x while increasing channels through:
-    - 3x3 strided convolution 
-    - Batch normalization
-    - ReLU activation
+    - First 3x3 strided convolution (stride=2)
+    - Batch normalization + activation
+    - Second 3x3 convolution (stride=1)
 
     Args:
-        in_channels (int, optional): Number of input channels. Default: 3.
-        out_channels (int, optional): Number of output channels. Default: 32.
+        in_channels (int): Number of input channels. Default: 3
+        out_channels (int): Number of output channels. Default: 32
+        act_layer (nn.Module): Activation layer. Default: nn.ReLU
+        norm_layer (nn.Module): Normalization layer. Default: nn.BatchNorm2d
+        norm_eps (float): Epsilon for normalization. Default: 1e-6
+        bias (bool): Whether to use bias in convolutions. Default: False
     """
-    def __init__(self, in_channels=3, out_channels=32):
+    def __init__(
+            self,
+            in_channels=3,
+            out_channels=32,
+            act_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm2d,
+            norm_eps=1e-6,
+            bias=False
+        ):
         super().__init__()
 
-        self.conv = nn.Conv2d(
+        self.conv1 = nn.Conv2d(
             in_channels=in_channels,
-            out_channels=out_channels, 
+            out_channels=out_channels,
             kernel_size=3,
             stride=2,
             padding=1,
-            bias=False
+            bias=bias
         )
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=bias
+        )
+
+        self.norm = norm_layer(out_channels, eps=norm_eps)
+        self.act = act_layer(inplace=True)
     
     def forward(self, x):
-        # Basic conv -> BN -> ReLU sequence
-        x = self.conv(x)
-        x = self.bn(x)
+        # Process input through stem block with 2x spatial reduction
+        x = self.conv1(x)
+        x = self.norm(x)
         x = self.act(x)
+        x = self.conv2(x)
         return x
 
 class FusedMbConv(nn.Module):
