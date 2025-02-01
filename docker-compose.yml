@@ -1,6 +1,7 @@
 services:
   training:
     build: .
+    image: rwkv-medsam2
     runtime: nvidia
     shm_size: '8gb'
     environment:

@@ -24,8 +24,6 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 # Required dependencies
 REQUIRED_PACKAGES = [
-    'torch>=2.5.1',
-    'torchvision>=0.20.1',
     'numpy>=1.24.4',
     'tqdm>=4.66.1',
     'hydra-core>=1.3.2',
@@ -36,10 +34,10 @@ REQUIRED_PACKAGES = [
 ]
 
 # Build the SAM2 CUDA extension
-BUILD_CUDA = os.getenv("SAM2_BUILD_CUDA", "1") == "1"
+BUILD_CUDA = os.getenv("SAM2_BUILD_CUDA", "1").strip().lower() in ["1", "true", "yes"]
 
 # Allow SAM2 installation to proceed even with build errors
-BUILD_ALLOW_ERRORS = os.getenv("SAM2_BUILD_ALLOW_ERRORS", "1") == "1"
+BUILD_ALLOW_ERRORS = os.getenv("SAM2_BUILD_ALLOW_ERRORS", "1").strip().lower() in ["1", "true", "yes"]
 
 # Catch and skip errors during extension building and print a warning message
 CUDA_ERROR_MSG = (
@@ -130,7 +128,7 @@ setup(
     license=LICENSE,
     packages=find_packages(),
     install_requires=REQUIRED_PACKAGES,
-    python_requires=">=3.8.10",
+    python_requires=">=3.10.0",
     ext_modules=get_extensions(),
     cmdclass=cmdclass,
 )
