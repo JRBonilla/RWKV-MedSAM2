@@ -1,5 +1,3 @@
-.git
-.gitignore
 __pycache__
 *.pyc
 *.pyo
@@ -12,3 +10,4 @@ venv/
 data/
 checkpoints/
 *.pt
+*.tar

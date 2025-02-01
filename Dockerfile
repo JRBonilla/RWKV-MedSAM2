@@ -50,5 +50,14 @@ ENV SAM2_BUILD_ALLOW_ERRORS=1
 # Build CUDA extensions
 RUN python setup.py build_ext --inplace
 
+# Copy the entrypoint script
+COPY scripts/entrypoint.sh /entrypoint.sh
+
+# Make the entrypoint script executable
+RUN chmod +x /entrypoint.sh
+
+# Set the entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
+
 # Default command
 CMD ["/bin/bash"]
