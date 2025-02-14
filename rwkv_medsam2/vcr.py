@@ -563,6 +563,19 @@ class VCRBackbone(nn.Module):
         # Channel list for FPN (high to low resolution)
         self.channel_list = stage_channels[::-1]
 
+        # Optional uncertainty and refinement modules.
+        self.use_uncertainty = use_uncertainty
+        self.use_refinement = use_refinement
+        if self.use_uncertainty:
+            self.uncertainty_head = UncertaintyHead(in_channels=stage_channels[-1], out_channels=1)
+        if self.use_refinement:
+            mid_channels = stage_channels[-1] // 2
+            self.refinement_module = RefinementModule(
+                in_channels=stage_channels[-1],
+                mid_channels=mid_channels,
+                out_channels=stage_channels[-1],
+            )
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
         Forward pass through backbone.
@@ -608,6 +621,11 @@ class VCRBackbone(nn.Module):
         # Final norm and reshape
         x3 = self.final_norm(x3)
         feat3_rnn = x3.transpose(1, 2).reshape(B, C, Hf, Wf)
+
+        if self.use_uncertainty or self.use_refinement:
+            uncertainty_map = self.uncertainty_head(feat3_rnn) if self.use_uncertainty else None
+            if self.use_refinement:
+                feat3_rnn = self.refinement_module(feat3_rnn, uncertainty_map)
 
         # Return multi-scale features for FPN
         return [feat0, feat1, feat2, feat3_rnn]
