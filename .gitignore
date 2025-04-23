@@ -2,3 +2,4 @@ checkpoints/
 images/
 *.pt
 rwkv-medsam2.tar
+*.log
