@@ -3,16 +3,20 @@ import pickle
 import pandas as pd
 import json
 import logging
+import random
 from tqdm import tqdm
 from preprocessor import Preprocessor
-import random
+from collections import defaultdict
 
 from helpers import *
 
 # Base directories
-BASE_UNPROC = "F:/Datasets/"
-BASE_PROC = "F:/Preprocessed/"
-INDEX_DIR = "F:/DatasetIndexes"  # Directory where index and groups JSON files are stored
+# BASE_UNPROC = "F:/Datasets/"
+# BASE_PROC   = "F:/Preprocessed/"
+# INDEX_DIR   = "F:/DatasetIndexes/Groups"
+BASE_UNPROC = "/data/research/"
+BASE_PROC   = "/data/Preprocessed/"
+INDEX_DIR   = "/data/DatasetIndexes/Groups"
 
 class UnifiedMedicalDataset:
     """
@@ -45,7 +49,7 @@ class UnifiedMedicalDataset:
         os.makedirs(normalize_path(os.path.join(self.output_dir, ".preprocessing_logs")), exist_ok=True)
         self.processed_pairs = {"train": 0, "test": 0}
 
-    def process(self, preprocessor: Preprocessor, force_structure=True, max_groups=0):
+    def process(self, preprocessor: Preprocessor, max_groups=0):
         """
         Process the dataset by reorganizing files according to the pre-built groups JSON file.
 
@@ -55,19 +59,12 @@ class UnifiedMedicalDataset:
 
         Args:
             preprocessor (Preprocessor): An instance for preprocessing (if needed).
-            force_structure (bool): Whether to force a specific directory structure (not used in this example).
             max_groups (int): Maximum number of groups to process per split (train/test).
         """
-        dataset_logger = logging.getLogger(f"UnifiedMedicalDataset.{self.dataset_name}")
-        dataset_logger.setLevel(logging.INFO)
-        dataset_log_path = normalize_path(os.path.join(self.output_dir, ".preprocessing_logs", f"{self.dataset_name}.log"))
-        if not dataset_logger.handlers:
-            fh = logging.FileHandler(dataset_log_path)
-            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-            dataset_logger.addHandler(fh)
+        self.preprocessor = preprocessor
 
-        dataset_logger.info(f"Processing dataset '{self.dataset_name}'...")
-        print(f"\nProcessing dataset '{self.dataset_name}'...")
+        self.preprocessor.dataset_logger.info(f"Processing dataset '{self.dataset_name}'...")
+        self.preprocessor.main_logger.info(f"\nProcessing dataset '{self.dataset_name}'...")
 
         grouping_regex = self.metadata.get("grouping_regex")
         subdataset_configs = get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
@@ -77,11 +74,11 @@ class UnifiedMedicalDataset:
         try:
             with open(groups_file, "r") as f:
                 groups_data = json.load(f)
-            dataset_logger.info(f"Using groups file {groups_file} for dataset '{self.dataset_name}'.")
+            self.preprocessor.dataset_logger.info(f"Using groups file {groups_file} for dataset '{self.dataset_name}'.")
 
             # Expect the groups file to contain a nested structure under the key "subdatasets".
             subdatasets = groups_data.get("subdatasets", [])
-            dataset_logger.info("Found {} subdataset(s).".format(len(subdatasets)))
+            self.preprocessor.dataset_logger.info(f"Found {len(subdatasets)} subdataset(s).")
             
             # Flatten the nested subdataset structure: add subdataset information to each group.
             flat_groups = []
@@ -94,15 +91,20 @@ class UnifiedMedicalDataset:
                         group["subdataset_modality"] = sub_modality
                         flat_groups.append(group)
 
+            # Sample up to max_groups per split per subdataset
             if max_groups > 0:
-                # Apply max_groups separately per split.
-                train_groups = [g for g in flat_groups if g["split"]=="train"]
-                test_groups = [g for g in flat_groups if g["split"]=="test"]
-                if len(train_groups) > max_groups:
-                    train_groups = random.sample(train_groups, max_groups)
-                if len(test_groups) > max_groups:
-                    test_groups = random.sample(test_groups, max_groups)
-                flat_groups = train_groups + test_groups
+                groups_by_key = defaultdict(list)
+                for g in flat_groups:
+                    key = (g["subdataset_name"], g["split"])
+                    groups_by_key[key].append(g)
+
+                sampled = []
+                for grp_list in groups_by_key.values():
+                    if len(grp_list) > max_groups:
+                        sampled.extend(random.sample(grp_list, max_groups))
+                    else:
+                        sampled.extend(grp_list)
+                flat_groups = sampled
 
             # Build the identifiers dictionary for further processing.
             identifiers = {}
@@ -110,15 +112,15 @@ class UnifiedMedicalDataset:
                 key = (g["identifier"], g["split"], g.get("subdataset_name"))
                 identifiers[key] = g
 
-            grouping_metadata = self._process_grouping_and_copy(identifiers, subdataset_configs, dataset_logger)
+            grouping_metadata = self._process_grouping_and_copy(identifiers, subdataset_configs, self.preprocessor.dataset_logger)
         except Exception as e:
-            dataset_logger.error(f"Error loading groups file {groups_file}: {e}.")
+            self.preprocessor.dataset_logger.error(f"Error loading groups file {groups_file}: {e}.")
             return
 
         total_groups = len(grouping_metadata)
-        print(f"Processing of dataset '{self.dataset_name}' complete. {total_groups} identifier group(s) processed. Outputs at: {self.output_dir}")
-        self.metadata["Num Images"] = sum(len(entry["images"]) for entry in grouping_metadata)
-        self.metadata["Num Masks"] = sum(len(entry["masks"]) for entry in grouping_metadata)
+        self.preprocessor.main_logger.info(f"Processing of dataset '{self.dataset_name}' complete. {total_groups} identifier group(s) processed. Outputs at: {self.output_dir}")
+        # self.metadata["Num Images"] = sum(len(entry["images"]) for entry in grouping_metadata)
+        # self.metadata["Num Masks"] = sum(len(entry["masks"]) for entry in grouping_metadata)
         self.metadata["Preprocessed?"] = "yes"
 
         grouping_meta_path = normalize_path(os.path.join(self.output_dir, "groupings.json"))
@@ -127,56 +129,152 @@ class UnifiedMedicalDataset:
 
     def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger):
         """
-        Process each group: sort image and mask file paths, build the appropriate output directory path,
-        call the helper to copy the files, and return updated grouping metadata.
+        Process each group in the identifiers dictionary by copying and preprocessing the corresponding image and mask files.
 
-        Uses subdataset information to decide the output structure (i.e. modality and subdataset name).
+        For each group, the function extracts and sorts file paths, builds output directories, and calls the preprocess_group method
+        of the preprocessor with the pipeline as the first argument. It then collects all processed image files (PNG) from the image
+        output directory and all processed mask files (either PNG or .nii.gz) from the mask output directory. If preprocess_group
+        returned multiple modality NIfTIs, this function splits the group into separate entries with distinct identifiers.
 
         Args:
-            identifiers (dict): Dictionary of groups keyed by an identifier tuple.
-            subdataset_configs (list or None): List of subdataset configuration objects, if applicable.
-            logger (logging.Logger): Logger instance for debug output.
+            identifiers (dict): A dictionary with group identifiers as keys and group metadata as values.
+            subdataset_configs (list): A list of subdataset configuration dictionaries.
+            logger (logging.Logger): The logger to use for logging.
 
         Returns:
-            list: A list of processed group dictionaries containing file paths and subdataset info.
+            list: A list of dictionaries, each containing the group identifier, original and processed image and mask file lists,
+                  and preprocessing metadata.
         """
         grouping_metadata = []
         for key, entry in identifiers.items():
             if not entry["images"]:
                 logger.warning(f"Group {key} has no images. Skipping...")
                 continue
-            # Extract file paths.
-            image_paths = [item["path"] if isinstance(item, dict) else item for item in entry["images"]]
-            mask_paths = [item["path"] if isinstance(item, dict) else item for item in entry["masks"]]
+
+            # Extract and sort file paths
+            image_paths = [
+                item["path"] if isinstance(item, dict) else item
+                for item in entry["images"]
+            ]
+            mask_paths = [
+                item["path"] if isinstance(item, dict) else item
+                for item in entry["masks"]
+            ]
             image_paths.sort()
             mask_paths.sort()
+
             composite_id = get_composite_identifier(entry)
-            # Use subdataset information to build the output directory.
+
+            # Build output directories
             sub_name = entry.get("subdataset_name") or entry.get("name")
-            sub_modality = entry.get("subdataset_modality") or (self.metadata.get("modalities") or ["default"])[0]
+            sub_modality = entry.get("subdataset_modality") or ((self.metadata.get("modalities") or ["default"])[0])
+            sub_pipeline = entry.get("subdataset_pipeline")
+
+            # Only use subdataset name if it exists
             if sub_name:
-                out_dir = os.path.join(self.output_dir, sub_modality, sub_name, entry["split"])
+                out_dir = os.path.join(self.output_dir,
+                                       sub_modality,
+                                       sub_name,
+                                       entry["split"])
             else:
-                out_dir = os.path.join(self.output_dir, sub_modality, entry["split"])
+                out_dir = os.path.join(self.output_dir,
+                                       sub_modality,
+                                       entry["split"])
+        
+            # If composite_id starts with the split name, drop that prefix so
+            # we don’t end up with “train/train/…”
             id_subfolders = composite_id.split("_")
-            out_dir = os.path.join(out_dir, *id_subfolders)
-            out_dir = normalize_path(out_dir)
+            if id_subfolders and id_subfolders[0] == entry["split"]:
+                id_subfolders = id_subfolders[1:]
+        
+            out_dir = normalize_path(os.path.join(out_dir, *id_subfolders))
+
             img_out_dir = os.path.join(out_dir, "images")
             mask_out_dir = os.path.join(out_dir, "masks")
             os.makedirs(img_out_dir, exist_ok=True)
             os.makedirs(mask_out_dir, exist_ok=True)
-            copy_group_files(image_paths, mask_paths, img_out_dir, mask_out_dir, composite_id, logger=logger)
-            grouping_metadata.append({
-                "identifier": composite_id,
-                "additional": entry["additional"],
-                "subdataset_name": sub_name,
-                "subdataset_modality": sub_modality,
-                "split": entry["split"],
-                "images": entry["images"],
-                "masks": entry["masks"]
-            })
-        return grouping_metadata
 
+            # Call preprocess_group with pipeline as first argument
+            try:
+                preprocessing_metadata = self.preprocessor.preprocess_group(
+                    sub_name,
+                    sub_pipeline,
+                    image_paths,
+                    mask_paths,
+                    sub_modality,
+                    img_out_dir,
+                    mask_out_dir,
+                    composite_id
+                )
+            except Exception as e:
+                logger.error(f"Error preprocessing group {key}: {e}", exc_info=True)
+                continue
+
+            # Gather all processed files from img_out_dir and mask_out_dir
+            proc_imgs = sorted(
+                os.path.join(img_out_dir, fn)
+                for fn in os.listdir(img_out_dir)
+                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+            )
+            proc_masks = sorted(
+                os.path.join(mask_out_dir, fn)
+                for fn in os.listdir(mask_out_dir)
+                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+            )
+
+            # Drop this group if no masks were produced
+            if not proc_masks:
+                logger.warning(f"Group {key} produced no processed masks. Skipping group.")
+                continue
+
+            # If preprocess_group returned multiple modality NIfTIs, split into separate entries
+            if (isinstance(preprocessing_metadata, dict)
+                    and "image_niftis" in preprocessing_metadata
+                    and len(preprocessing_metadata["image_niftis"]) > 1):
+                for idx, img_nif in enumerate(preprocessing_metadata["image_niftis"]):
+                    new_id = f"{composite_id}_modality{idx}"
+                    split_entry = {
+                        "identifier":  new_id,
+                        "short_id":    self.preprocessor._short_id(new_id),
+                        "images":      entry["images"],
+                        "masks":       entry["masks"],  # original raw-mask paths
+                        "proc_images": [img_nif],          # put the NIfTI path here
+                        "proc_masks":  preprocessing_metadata.get("mask_niftis", []),
+                        "preprocessing_metadata": {
+                            "resize_shape": preprocessing_metadata.get("resize_shape"),
+                            "volume_shape": preprocessing_metadata.get("volume_shape")
+                        }
+                    }
+                    grouping_metadata.append(split_entry)
+            else:
+                entry_dict = {
+                    "identifier":             composite_id,
+                    "short_id":               self.preprocessor._short_id(composite_id),
+                    "images":                 entry["images"],
+                    "masks":                  entry["masks"],
+                    "proc_images":            proc_imgs,
+                    "proc_masks":             proc_masks,
+                    "preprocessing_metadata": {}
+                }
+
+                # Always include resize_shape if present
+                if isinstance(preprocessing_metadata, dict) and "resize_shape" in preprocessing_metadata:
+                    entry_dict["preprocessing_metadata"]["resize_shape"] = preprocessing_metadata["resize_shape"]
+
+                # If video metadata is present, include fps & num_frames
+                if isinstance(preprocessing_metadata, dict) and "fps" in preprocessing_metadata and "num_frames" in preprocessing_metadata:
+                    entry_dict["preprocessing_metadata"]["fps"] = preprocessing_metadata["fps"]
+                    entry_dict["preprocessing_metadata"]["num_frames"] = preprocessing_metadata["num_frames"]
+
+                # If 3D metadata is present, include volume_shape and NIfTI paths
+                if isinstance(preprocessing_metadata, dict) and "volume_shape" in preprocessing_metadata:
+                    entry_dict["preprocessing_metadata"]["volume_shape"] = preprocessing_metadata["volume_shape"]
+                    entry_dict["preprocessing_metadata"]["image_niftis"] = preprocessing_metadata.get("image_niftis", [])
+                    entry_dict["preprocessing_metadata"]["mask_niftis"] = preprocessing_metadata.get("mask_niftis", [])
+
+                grouping_metadata.append(entry_dict)
+
+        return grouping_metadata
 
 class DatasetLoader:
     """
@@ -185,7 +283,7 @@ class DatasetLoader:
     Loads dataset metadata from a CSV file, instantiates UnifiedMedicalDataset objects,
     processes each dataset, and updates the CSV file with new metadata.
     """
-    def __init__(self, csv_path, preprocessor: Preprocessor):
+    def __init__(self, csv_path):
         """
         Initialize the DatasetLoader.
 
@@ -198,18 +296,63 @@ class DatasetLoader:
         self.datasets = []
         for name, meta in self.metadata.items():
             self.datasets.append(UnifiedMedicalDataset(name, meta))
-        self.preprocessor = preprocessor
 
-    def process_all(self, force_structure=True, max_groups=0):
+    def process_all(self, max_groups=0):
         """
         Process all datasets by reorganizing files based on their groups JSON files.
 
         Args:
-            force_structure (bool): (Optional) Whether to force a specific directory structure.
-            max_groups (int): (Optional) Maximum number of groups per split (train/test) to process.
+            max_groups (int): Optional maximum number of groups per split (train/test) to process.
         """
         for dataset in tqdm(self.datasets, desc="Processing all datasets"):
-            dataset.process(self.preprocessor, force_structure=force_structure, max_groups=max_groups)
+            # Skip PAIP2019. Temporary: Takes too long.
+            if dataset.dataset_name == "PAIP2019":
+                continue
+
+            dataset_logger = logging.getLogger(f"UnifiedMedicalDataset.{dataset.dataset_name}")
+            dataset_logger.setLevel(logging.INFO)
+
+            # Ensure a dedicated log directory and file for this dataset
+            dataset_log_dir = os.path.join(BASE_PROC, dataset.dataset_name, ".preprocessing_logs")
+            os.makedirs(dataset_log_dir, exist_ok=True)
+            dataset_log_path = os.path.join(dataset_log_dir, f"{dataset.dataset_name}.log")
+            if not dataset_logger.handlers:
+                fh = logging.FileHandler(dataset_log_path)
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+                dataset_logger.addHandler(fh)
+
+            # Check if this dataset contains CT modality and attempt to load global CT statistics
+            meta = dataset.metadata
+            global_ct_stats = None
+            if any(m.lower() == "ct" for m in meta.get("modalities", [])):
+                stats_path = os.path.join(INDEX_DIR, "CTStats", f"{dataset.dataset_name}_ct_stats.json")
+                try:
+                    with open(stats_path, "r") as sf:
+                        ct_stats = json.load(sf)
+                    global_ct_stats = (ct_stats["mean"], ct_stats["std"])
+                    dataset_logger.info(
+                        f"Loaded CT stats: mean={global_ct_stats[0]:.4f}, std={global_ct_stats[1]:.4f}"
+                    )
+                except Exception as e:
+                    dataset_logger.warning(f"Could not load CT stats from {stats_path}: {e}")
+
+                preprocessor = Preprocessor(
+                    target_size=(512, 512),
+                    dataset_logger=dataset_logger,
+                    global_ct_stats=global_ct_stats,
+                    dataset_name=dataset.dataset_name,
+                    background_value=meta.get("background_value", 0)
+                )
+            else:
+                preprocessor = Preprocessor(
+                    target_size=(512, 512),
+                    dataset_logger=dataset_logger,
+                    dataset_name=dataset.dataset_name,
+                    background_value=meta.get("background_value", 0)
+                )
+
+            dataset.process(preprocessor, max_groups=max_groups)
+
         self.update_csv()
 
     def update_csv(self):
@@ -252,11 +395,9 @@ class DatasetLoader:
         print(f"Dataset loader loaded from {export_path}.")
         return loader
 
-
 if __name__ == "__main__":
     csv_path = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
-    preprocessor = Preprocessor(target_size=(1024, 1024))
-    loader = DatasetLoader(csv_path, preprocessor)
-    loader.process_all(force_structure=True, max_groups=2)
+    loader = DatasetLoader(csv_path)
+    loader.process_all(max_groups=2)
     export_path = normalize_path(os.path.join(BASE_PROC, "datasets.pkl"))
     loader.export(export_path)

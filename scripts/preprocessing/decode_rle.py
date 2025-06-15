@@ -22,13 +22,16 @@ def decode_rle(rle, height, width):
     return mask_flat.reshape((height, width))
 
 def main():
-    csv_path = "./CheXpert.csv"
+    # csv_path = "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert.csv"
+    csv_path = "/data/jrbonill/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert.csv"
     print("Loading CSV file, please wait...")
     df = pd.read_csv(csv_path)
     print("CSV file loaded successfully.")
 
-    base_output_train = "./preprocessed_chexpert/train"
-    base_output_test = "./preprocessed_chexpert/test"
+    # base_output_train = "F:/Datasets/CheXpert/preprocessed_chexpert/train"
+    # base_output_test = "F:/Datasets/CheXpert/preprocessed_chexpert/test"
+    base_output_train = "/data/jrbonill/data/research/CheXpert/preprocessed_chexpert/train"
+    base_output_test  = "/data/jrbonill/data/research/CheXpert/preprocessed_chexpert/test"
     os.makedirs(base_output_train, exist_ok=True)
     os.makedirs(base_output_test, exist_ok=True)
 

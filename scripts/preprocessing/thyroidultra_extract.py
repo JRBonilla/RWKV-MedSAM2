@@ -8,8 +8,10 @@ import cv2
 import matplotlib.pyplot as plt
 
 # Path to the ThyroidUltra dataset
-HDF5_PATH = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
-OUTPUT_DIR = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
+# HDF5_PATH  = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
+# OUTPUT_DIR = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
+HDF5_PATH  = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
+OUTPUT_DIR = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Function to overlay a mask onto an image for debugging (optional)
@@ -48,7 +50,7 @@ def extract_sample(num_samples=5):
         annot_ids = f["annot_id"][:num_samples]
         frame_nums = f["frame_num"][:num_samples]
 
-        print(f"🔍 Extracting a sample of {num_samples} images/masks for testing...")
+        print(f"Extracting a sample of {num_samples} images/masks for testing...")
 
         for i in tqdm(range(num_samples), desc="Extracting Sample"):
             # Save ultrasound image
@@ -57,16 +59,16 @@ def extract_sample(num_samples=5):
 
             # Check the unique values in the mask
             unique_values = np.unique(masks[i])
-            print(f"🔍 Mask {i} unique values: {unique_values}")
+            print(f"Mask {i} unique values: {unique_values}")
 
             # Normalize the mask properly
             mask_data = masks[i]
             if mask_data.max() > 1:  # If values are above 1, assume raw pixel values
                 mask_data = (mask_data / mask_data.max()) * 255  # Normalize to 0-255
-            elif mask_data.max() == 1:  # If it's binary (0 and 1)
+            elif mask_data.max() == 1:  # If it's binary
                 mask_data = mask_data * 255  # Scale up to 0-255
             else:
-                print(f"⚠️ Warning: Mask {i} contains only zeros. It may be empty.")
+                print(f"Warning: Mask {i} contains only zeros. It may be empty.")
 
             # Convert mask to 8-bit and save
             mask = Image.fromarray(mask_data.astype(np.uint8))
@@ -76,7 +78,7 @@ def extract_sample(num_samples=5):
         metadata_sample_df = pd.DataFrame({"annot_id": annot_ids.flatten(), "frame_num": frame_nums.flatten()})
         metadata_sample_df.to_csv(os.path.join(sample_output_dir, "metadata_sample.csv"), index=False)
 
-    print(f"✅ Sample extraction complete! Check '{sample_output_dir}'.")
+    print(f"Sample extraction complete! Check '{sample_output_dir}'.")
 
 # Function to extract the full dataset in chunks
 def extract_full_dataset(chunk_size=500):
@@ -91,11 +93,11 @@ def extract_full_dataset(chunk_size=500):
 
     with h5py.File(HDF5_PATH, "r") as f:
         total_samples = f["image"].shape[0]
-        print(f"📢 Total samples: {total_samples}. Extracting in chunks of {chunk_size}...")
+        print(f"Total samples: {total_samples}. Extracting in chunks of {chunk_size}...")
 
         for start in range(0, total_samples, chunk_size):
             end = min(start + chunk_size, total_samples)
-            print(f"🔄 Processing chunk {start}-{end}...")
+            print(f"Processing chunk {start}-{end}...")
 
             images = f["image"][start:end]
             masks = f["mask"][start:end]
@@ -116,7 +118,7 @@ def extract_full_dataset(chunk_size=500):
                 elif mask_data.max() == 1:  # If it's binary (0 and 1)
                     mask_data = mask_data * 255  # Scale up to 0-255
                 else:
-                    print(f"⚠️ Warning: Mask {img_index} contains only zeros. It may be empty.")
+                    print(f"Warning: Mask {img_index} contains only zeros. It may be empty.")
 
                 # Convert mask to 8-bit and save
                 mask = Image.fromarray(mask_data.astype(np.uint8))
@@ -124,13 +126,13 @@ def extract_full_dataset(chunk_size=500):
 
                 metadata_list.append({"annot_id": annot_ids[i].flatten()[0], "frame_num": frame_nums[i].flatten()[0]})
 
-            print(f"✅ Chunk {start}-{end} completed.")
+            print(f"Chunk {start}-{end} completed.")
 
     # Save full metadata
     metadata_df = pd.DataFrame(metadata_list)
     metadata_df.to_csv(os.path.join(full_output_dir, "metadata_full.csv"), index=False)
 
-    print(f"✅ Full dataset extraction complete! Check '{full_output_dir}'.")
+    print(f"Full dataset extraction complete! Check '{full_output_dir}'.")
 
 # Run sample extraction first
 # extract_sample()

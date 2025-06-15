@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import datetime
 import random
 from tqdm import tqdm
 
@@ -13,11 +14,21 @@ from helpers import (
     extract_identifier_from_path,
     match_subdataset_regex,
     get_regex_configs,
+    set_indexing_log,
+    get_extension
 )
 
 # Define base directories
-BASE_UNPROC = "F:/Datasets/"
-INDEX_DIR = "F:/DatasetIndexes"  # Directory where index JSON files and logs are stored
+# BASE_UNPROC = "F:/Datasets/"
+# INDEX_DIR   = "F:/DatasetIndexes"  # Directory where index JSON files and logs are stored
+BASE_UNPROC = "/data/research/"
+INDEX_DIR   = "/data/DatasetIndexes"  # Directory where index JSON files and logs are stored
+
+# If a pipeline isn't specified in the header, infer it from file-extension:
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg"} 
+VOLUME_EXTS = {
+    ".nii", ".nii.gz", ".nrrd", ".mhd", ".mha", ".img", ".hdr", ".dicom", ".dcm", ".npy"
+}
 
 # Configure logger: log to both console and a file named "indexing.log"
 logger = logging.getLogger("DatasetIndexer")
@@ -28,13 +39,32 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(ch)
     
-    # File handler: logs will be saved to INDEX_DIR/indexing.log
+    # File handler: logs saved to INDEX_DIR/indexing_<timestamp>.log
     os.makedirs(INDEX_DIR, exist_ok=True)
-    log_file_path = os.path.join(INDEX_DIR, "indexing.log")
+    # e.g. indexing_20250520_141305.log
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(INDEX_DIR, f"indexing_{timestamp}.log")
     fh = logging.FileHandler(log_file_path)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(fh)
 
+def determine_pipeline(file_path):
+    """
+    Determine the pipeline to use for a given file by its extension.
+
+    Args:
+        file_path (str): The path to the file.
+
+    Returns:
+        str: The pipeline to use ("Video", "2D", or "3D").
+    """
+    ext = get_extension(file_path)
+    if ext in VIDEO_EXTS:
+        return "Video"
+    elif ext in VOLUME_EXTS:
+        return "3D"
+    else:
+        return "2D"
 
 def compute_group_key(rec, split, grouping_strategy, subdataset_configs, base_dir):
     """
@@ -80,7 +110,6 @@ def compute_group_key(rec, split, grouping_strategy, subdataset_configs, base_di
             return None, None, None
         key = (ident, split, frozenset(additional.items()) if additional else None)
         return key, additional, None
-
 
 def build_groupings(index_data, dataset_dir, metadata):
     """
@@ -133,9 +162,11 @@ def build_groupings(index_data, dataset_dir, metadata):
         if subdataset_configs and config:
             sname = config.name or "default"
             modality = getattr(config, "modality", (metadata.get("modalities") or ["default"])[0])
+            pipeline = config.pipeline or determine_pipeline(rec["path"])
         else:
             sname = "default"
             modality = (metadata.get("modalities") or ["default"])[0]
+            pipeline = determine_pipeline(rec["path"])
         ensure_subdataset(sname, modality)
         group_dict = subdatasets[sname]["train"]
         if key not in group_dict:
@@ -146,7 +177,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                 "images": [],
                 "masks": [],
                 "subdataset_name": sname,
-                "subdataset_modality": modality
+                "subdataset_modality": modality,
+                "subdataset_pipeline": pipeline
             }
         group_dict[key]["images"].append({"path": rec["path"], "id": rec["id"]})
     
@@ -160,9 +192,11 @@ def build_groupings(index_data, dataset_dir, metadata):
         if subdataset_configs and config:
             sname = config.name or "default"
             modality = getattr(config, "modality", (metadata.get("modalities") or ["default"])[0])
+            pipeline = config.pipeline or determine_pipeline(rec["path"])
         else:
             sname = "default"
             modality = (metadata.get("modalities") or ["default"])[0]
+            pipeline = determine_pipeline(rec["path"])
         ensure_subdataset(sname, modality)
         sub_test = subdatasets[sname]["test"]
         if key not in sub_test:
@@ -173,7 +207,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                 "images": [],
                 "masks": [],
                 "subdataset_name": sname,
-                "subdataset_modality": modality
+                "subdataset_modality": modality,
+                "subdataset_pipeline": pipeline
             }
         sub_test[key]["images"].append({"path": rec["path"], "id": rec["id"]})
     
@@ -247,6 +282,16 @@ def build_groupings(index_data, dataset_dir, metadata):
 
             group_dict[mask_key]["masks"].append({"path": rec["path"], "id": rec.get("id")})
     
+    # Remove groups with no masks
+    for sname, sub in subdatasets.items():
+        for split in ("train","test"):
+            orphan_keys = [k for k, grp in sub[split].items() if len(grp["masks"]) == 0]
+            for k in orphan_keys:
+                # Record and remove
+                index_data.setdefault("unannotated_groups", []).append(f"{sname}.{split}:{k[0]}")
+                logger.warning(f"Removing unannotated group {k} from {sname}.{split}")
+                del sub[split][k]
+
     # If no test images were provided, randomly split each training group.
     for sname, sub in subdatasets.items():
         if len(index_data.get("images_test", [])) == 0:
@@ -277,7 +322,6 @@ def build_groupings(index_data, dataset_dir, metadata):
     
     return {"subdatasets": out_subdatasets}
 
-
 def index_dataset(dataset_name, metadata):
     """
     Index a dataset by scanning for images and mask files, and grouping them by subdataset.
@@ -289,6 +333,7 @@ def index_dataset(dataset_name, metadata):
         dataset_name (str): Name of the dataset.
         metadata (dict): Dataset metadata including folder names, file types, and grouping parameters.
     """
+    set_indexing_log(INDEX_DIR, dataset_name)
     root_folder = metadata.get("root_directory") or ""
     dataset_dir = (normalize_path(os.path.join(BASE_UNPROC, dataset_name, root_folder))
                    if root_folder else normalize_path(os.path.join(BASE_UNPROC, dataset_name)))
@@ -369,17 +414,29 @@ def index_dataset(dataset_name, metadata):
     index_data["groups"] = groups
 
     # Write the full index file.
-    index_file_path = os.path.join(INDEX_DIR, f"{dataset_name}_index.json")
+    index_folder = os.path.join(INDEX_DIR, "Indexes")
+    os.makedirs(index_folder, exist_ok=True)
+    index_file_path = os.path.join(index_folder, f"{dataset_name}_index.json")
     with open(index_file_path, "w") as index_file:
         json.dump(index_data, index_file, indent=2)
     logger.info(f"Dataset index with grouped splits for '{dataset_name}' saved to {index_file_path}.")
 
     # Write out a separate groups-only file.
-    groups_file = os.path.join(INDEX_DIR, f"{dataset_name}_groups.json")
+    groups_folder = os.path.join(INDEX_DIR, "Groups")
+    os.makedirs(groups_folder, exist_ok=True)
+    groups_file = os.path.join(groups_folder, f"{dataset_name}_groups.json")
     with open(groups_file, "w") as gf:
         json.dump(groups, gf, indent=2)
     logger.info(f"Groups for '{dataset_name}' saved to {groups_file}.")
 
+    # Return for GUI
+    return {
+        "images_train":       index_data.get("images_train", []),
+        "images_test":        index_data.get("images_test",  []),
+        "mask_files":         index_data.get("mask_files",   []),
+        "groups":             groups.get("subdatasets", []) if isinstance(groups, dict) else groups,
+        "unannotated_groups": index_data.get("unannotated_groups", [])
+    }
 
 def index_all_datasets():
     """
@@ -396,7 +453,6 @@ def index_all_datasets():
             index_dataset(dataset_name, metadata)
         except Exception as e:
             logger.error(f"Error indexing dataset '{dataset_name}': {e}")
-
 
 if __name__ == "__main__":
     index_all_datasets()

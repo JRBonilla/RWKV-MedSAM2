@@ -13,31 +13,59 @@ if not logger.handlers:
     global_handler.setFormatter(global_formatter)
     logger.addHandler(global_handler)
 
+def set_indexing_log(index_dir, dataset_name):
+    """
+    Reconfigure the UnifiedMedicalDataset logger so that all regex matching code
+    now goes into:
+        {index_dir}/Logs/{dataset_name}_indexing.log
+
+    Args:
+        index_dir (str): The directory where the index JSON files and logs are stored.
+        dataset_name (str): The name of the dataset being processed.
+    """
+    # Remove any existing handlers
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    # Ensure the logs folder exists
+    logs_dir = os.path.join(index_dir, "Logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Add the new handler
+    handler = logging.FileHandler(os.path.join(logs_dir, f"{dataset_name}_indexing.log"))
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+
 class SubdatasetConfig:
     """
     A configuration class that holds regex patterns and folder naming information
     for a subdataset.
-
-    Attributes:
-        modality (str): The modality name (e.g., "ct", "mri) of the subdataset files. Always lowercase.
-        name (str or None): The subdataset name, or None if not applicable.
-        train_image (str): Regex pattern for train image files.
-        test_image (str): Regex pattern for test image files.
-        train_mask (str): Regex pattern for train mask files.
-        test_mask (str): Regex pattern for test mask files.
     """
-    def __init__(self, modality, name, train_image, test_image, train_mask, test_mask):
+    def __init__(self, modality, name, pipeline, train_image, test_image, train_mask, test_mask):
+        """
+        Args:
+            modality (str): modality (lowercase, e.g. "ct", "mri")
+            name (str or None): subdataset name
+            pipeline (str or None): one of "2D", "3D", "Video", or None for default
+            train_image (str): regex for training‐image filenames
+            test_image (str): regex for test‐image filenames
+            train_mask (str): regex for training‐mask filenames
+            test_mask (str): regex for test‐mask filenames
+        """
         self.modality = modality
         self.name = name
+        self.pipeline = pipeline  # NEW: store pipeline type
         self.train_image = train_image
         self.test_image = test_image
         self.train_mask = train_mask
         self.test_mask = test_mask
 
     def __repr__(self):
-        return (f"SubdatasetConfig(modality='{self.modality}', name='{self.name}', "
-                f"train_image='{self.train_image}', test_image='{self.test_image}', "
-                f"train_mask='{self.train_mask}', test_mask='{self.test_mask}')")
+        return (
+            f"SubdatasetConfig(modality='{self.modality}', name='{self.name}', pipeline='{self.pipeline}', "
+            f"train_image='{self.train_image}', test_image='{self.test_image}', "
+            f"train_mask='{self.train_mask}', test_mask='{self.test_mask}')"
+        )
 
 def normalize_path(path):
     """
@@ -85,6 +113,7 @@ def load_dataset_metadata(csv_path):
         grouping_regex = (str(row["Grouping Regex"]).strip() 
                           if "Grouping Regex" in df.columns and pd.notna(row["Grouping Regex"])
                           else None)
+        background_value = int(row["Background Value"]) if "Background Value" in df.columns and pd.notna(row["Background Value"]) else 0
 
         metadata[name] = {
             "modalities": [mod.strip() for mod in str(row["Modality"]).split(',')] if pd.notna(row["Modality"]) else [],
@@ -97,6 +126,7 @@ def load_dataset_metadata(csv_path):
             "mask_key": mask_key,
             "grouping_strategy": grouping_strategy,
             "grouping_regex": grouping_regex,
+            "background_value": background_value,
             "preprocessed": preprocessed_flag
         }
         for dataset, meta in metadata.items():
@@ -104,56 +134,6 @@ def load_dataset_metadata(csv_path):
                 if isinstance(value, str) and value == "":
                     meta[key] = None
     return metadata
-
-def copy_file(src, dst):
-    """
-    Copy a file from src to dst.
-    
-    Args:
-        src (str): Source file path.
-        dst (str): Destination file path.
-    
-    Returns:
-        tuple: (src, dst, error or None)
-    """
-    try:
-        shutil.copy2(src, dst)
-        return (src, dst, None)
-    except Exception as e:
-        return (src, dst, e)
-    
-def copy_group_files(image_paths, mask_paths, img_out_dir, mask_out_dir, composite_id, logger):
-    """
-    Copy a group of image and mask files sequentially with enumerated naming.
-    
-    This ensures that multiple images for a single entry do not overwrite each other.
-    
-    Args:
-        image_paths (list): List of image file paths.
-        mask_paths (list): List of mask file paths.
-        img_out_dir (str): Output directory for images.
-        mask_out_dir (str): Output directory for masks.
-        composite_id (str): Composite identifier used for naming.
-        logger (Logger): Logger for logging operations.
-    """
-    for i, image_path in enumerate(image_paths):
-        out_img_ext = get_extension(os.path.basename(image_path))
-        out_img_name = f"{composite_id}_Image_{i}{out_img_ext}"
-        out_img_path = normalize_path(os.path.join(img_out_dir, out_img_name))
-        src, dst, err = copy_file(image_path, out_img_path)
-        if err:
-            logger.error(f"Error copying image {src} to {dst}: {err}")
-        else:
-            logger.info(f"Copied image {src} to {dst}")
-    for i, mask_path in enumerate(mask_paths):
-        out_mask_ext = get_extension(os.path.basename(mask_path))
-        out_mask_name = f"{composite_id}_Mask_{i}{out_mask_ext}"
-        out_mask_path = normalize_path(os.path.join(mask_out_dir, out_mask_name))
-        src, dst, err = copy_file(mask_path, out_mask_path)
-        if err:
-            logger.error(f"Error copying mask {src} to {dst}: {err}")
-        else:
-            logger.info(f"Copied mask {src} to {dst}")
 
 def resolve_folder(root_folder, folder_item):
     """
@@ -255,7 +235,7 @@ def get_composite_identifier(entry):
     Returns:
         str: The composite identifier.
     """
-    parts = [entry["identifier"]]
+    parts = [entry["split"], entry["identifier"]]
     if entry.get("additional"):
         for key in sorted(entry["additional"]):
             parts.append(entry["additional"][key])
@@ -426,7 +406,7 @@ def get_regex_configs(grouping_regex, metadata):
                   i.e. using subdataset declarations.
     
     In Format 2, each configuration is expected to have the following structure:
-      [Modality: Name] {images: <train_image>[, <test_image>]; masks: <train_mask>[, <test_mask>]}
+      [Modality: Name: Pipeline] {images: <train_image>[, <test_image>]; masks: <train_mask>[, <test_mask>]}
     
     This implementation uses a manual parser to properly handle inner commas (e.g. in numeric ranges)
     and nested parentheses within the regex parts.
@@ -455,16 +435,28 @@ def get_regex_configs(grouping_regex, metadata):
             end_header = grouping_regex.find(']', start_header)
             if end_header == -1:
                 break
+
+            # Extract the text between '[' and ']', e.g. "CT: Lungs: 2D"
             header = grouping_regex[start_header+1:end_header].strip()
-            # Expect header as "Modality: Name"
-            if ':' in header:
-                modality, name = header.split(':', 1)
-                modality = modality.strip()
-                name = name.strip()
-            else:
-                modality = header
-                name = ''
-            # Find the body between '{' and the matching '}'
+            
+            # Split into up to three parts: modality, name, (optional) pipeline
+            header_parts = [p.strip() for p in header.split(':')]
+            modality = header_parts[0]
+            name = None
+            pipeline = None
+
+            if len(header_parts) >= 2:
+                name = header_parts[1]
+            if len(header_parts) >= 3:
+                pipeline = header_parts[2]
+                # Optional: Validate that pipeline is one of the allowed values
+                if pipeline not in ("2D", "3D", "Video"):
+                    raise ValueError(
+                        f"Invalid pipeline '{pipeline}' in header '[{header}]'. "
+                        f"Expected one of '2D', '3D', 'Video'."
+                    )
+
+            # Now find the body between '{' and the matching '}' after end_header
             start_body = grouping_regex.find('{', end_header)
             if start_body == -1:
                 break
@@ -478,11 +470,12 @@ def get_regex_configs(grouping_regex, metadata):
                     counter -= 1
                 i += 1
             if counter != 0:
-                # Unmatched braces. Break out.
+                # Unmatched braces: abort parsing
                 break
-            body = grouping_regex[start_body+1:i-1].strip()
-            # Body should be in the form:
-            # images: <train_image>[, <test_image>]; masks: <train_mask>[, <test_mask>]
+            body = grouping_regex[start_body+1 : i-1].strip()
+
+            # Body format (example):
+            #   images: <train_image>[, <test_image>]; masks: <train_mask>[, <test_mask>]
             if ';' in body:
                 images_part, masks_part = body.split(';', 1)
             else:
@@ -490,12 +483,13 @@ def get_regex_configs(grouping_regex, metadata):
                 masks_part = ''
             images_part = images_part.strip()
             masks_part = masks_part.strip()
+
             if images_part.lower().startswith("images:"):
                 images_part = images_part[len("images:"):].strip()
             if masks_part.lower().startswith("masks:"):
                 masks_part = masks_part[len("masks:"):].strip()
-            
-            # Helper function: split a string on the first comma that is not inside any parentheses.
+
+            # Helper: split on the first comma not inside parentheses
             def split_outside_parens(s):
                 paren = 0
                 for idx, ch in enumerate(s):
@@ -504,7 +498,6 @@ def get_regex_configs(grouping_regex, metadata):
                     elif ch == ')':
                         paren = max(paren - 1, 0)
                     elif ch == ',' and paren == 0:
-                        # Return both parts: before and after the comma.
                         return s[:idx].strip(), s[idx+1:].strip()
                 return s.strip(), None
 
@@ -515,19 +508,30 @@ def get_regex_configs(grouping_regex, metadata):
             train_mask, test_mask = split_outside_parens(masks_part)
             if not test_mask:
                 test_mask = train_mask
-            
-            # Import SubdatasetConfig here (assuming it is defined in helpers).
+
+            # Import SubdatasetConfig (which now expects modality, name, pipeline, train_image, ...)
             from helpers import SubdatasetConfig
-            configs.append(SubdatasetConfig(modality, name, train_image, test_image, train_mask, test_mask))
-            
-            # Move to the next block. Look for a comma after the current block
+            configs.append(
+                SubdatasetConfig(
+                    modality.strip().lower(),
+                    name if name else None,
+                    pipeline,          # ← new argument
+                    train_image,
+                    test_image,
+                    train_mask,
+                    test_mask
+                )
+            )
+
+            # Advance past this block: move ‘pos’ to just after the ‘}’
             pos = i
-            # Optionally, skip over a comma (and any whitespace) that separates blocks.
+            # Skip trailing commas or whitespace between blocks
             while pos < n and grouping_regex[pos] in [',', ' ']:
                 pos += 1
+
         return configs
 
-    # Format 1: A single set of patterns.
+    # Format 1: A single set of patterns (no [ ] header)
     else:
         parts = grouping_regex.split(";")
         train_image = None
@@ -544,10 +548,23 @@ def get_regex_configs(grouping_regex, metadata):
                 patterns = part[len("masks:"):].split(",")
                 train_mask = patterns[0].strip() if patterns[0].strip() else None
                 test_mask = patterns[1].strip() if len(patterns) > 1 and patterns[1].strip() else train_mask
-        # Get modality from metadata (using the first listed modality) and name remains None.
+
+        # If there's no header, default to the first modality listed in metadata
         modality = (metadata.get("modalities") or ["default"])[0]
         from helpers import SubdatasetConfig
-        return [SubdatasetConfig(modality, None, train_image, test_image, train_mask, test_mask)]
+        # In Format 1, we never provided a pipeline, so pass pipeline=None
+        return [
+            SubdatasetConfig(
+                modality.lower(),
+                None,
+                None,           # pipeline = None (no header)
+                train_image,
+                test_image,
+                train_mask,
+                test_mask
+            )
+        ]
+
 
 def match_subdataset_regex(path, grouping_strategy, subdataset_configs, is_image, split, base_dir):
     """
