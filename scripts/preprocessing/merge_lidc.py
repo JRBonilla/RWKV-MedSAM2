@@ -9,9 +9,9 @@ import copy
 # images_base       = r"F:\Datasets\LIDC-IDRI\manifest-1600709154662"
 # annotations_base  = r"F:\Datasets\LIDC-IDRI\DICOM-LIDC-IDRI-Nodules\manifest-1585232716547"
 # output_base       = r"F:\Datasets\LIDC-IDRI\Merged-LIDC-IDRI"
-images_base       = r"/data/research/LIDC-IDRI/manifest-1600709154662"
-annotations_base  = r"/data/research/LIDC-IDRI/DICOM-LIDC-IDRI-Nodules/manifest-1585232716547"
-output_base       = r"/data/research/LIDC-IDRI/Merged-LIDC-IDRI"
+images_base       = r"manifest-1600709154662"
+annotations_base  = r"DICOM-LIDC-IDRI-Nodules/manifest-1585232716547"
+output_base       = r"Merged-LIDC-IDRI"
 
 def get_segmentation_dicom_file(seg_folder):
     """
@@ -98,35 +98,36 @@ if __name__ == "__main__":
     
     # Process each segmentation entry
     for _, row in tqdm(seg_df.iterrows(), total=len(seg_df), desc="Processing segmentations"):
-        subject_id     = row["Subject ID"]
-        study_uid      = row["Study UID"]
-        folder_location= row["File Location"].lstrip(".\\")
-        seg_folder     = os.path.join(annotations_base, folder_location)
+        # Get segmentation DICOM file path
+        subject_id      = row["Subject ID"]
+        study_uid       = row["Study UID"]
+        raw_loc         = row["File Location"].lstrip(".\\/") # Normalize Windows-style File Location
+        raw_loc         = raw_loc.replace("\\", os.sep) # Convert backslashes to OS separator before normalization
+        folder_location = os.path.normpath(raw_loc)
+        seg_folder      = os.path.join(annotations_base, folder_location)
+
+        # Get segmentation DICOM file
         seg_dicom_file = get_segmentation_dicom_file(seg_folder)
         if seg_dicom_file is None:
             continue
         
-        # Prepare output directories
-        subject_dir = os.path.join(output_base, subject_id, study_uid)
-        images_dest = os.path.join(subject_dir, "Images")
-        masks_dest  = os.path.join(subject_dir, "Masks")
-        os.makedirs(images_dest, exist_ok=True)
-        os.makedirs(masks_dest,  exist_ok=True)
-        
         # Copy CT files
         for _, ct_row in ct_df[ct_df["Subject ID"] == subject_id].iterrows():
-            ct_folder_loc = ct_row["File Location"].lstrip(".\\")
+            raw_ct = ct_row["File Location"].lstrip(".\\/")
+            raw_ct = raw_ct.replace("\\", os.sep)
+            ct_folder_loc = os.path.normpath(raw_ct)
             ct_folder     = os.path.join(images_base, ct_folder_loc)
+            if not os.path.isdir(ct_folder):
+                print(f"No CT folder found: {ct_folder}")
+                continue
             for root, _, files in os.walk(ct_folder):
                 for f in files:
-                    if not f.lower().endswith(".dcm"):
-                        continue
+                    if not f.lower().endswith(".dcm"): continue
                     src = os.path.join(root, f)
                     try:
                         ds_ct = pydicom.dcmread(src, stop_before_pixels=True, force=True)
                         uid   = ds_ct.SOPInstanceUID
-                        if uid in ct_files_copied:
-                            continue
+                        if uid in ct_files_copied: continue
                         dst = os.path.join(images_dest, f"{uid}.dcm")
                         shutil.copy2(src, dst)
                         ct_files_copied[uid] = True
