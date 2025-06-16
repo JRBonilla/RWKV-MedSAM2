@@ -18,6 +18,8 @@ BASE_UNPROC = "/data/research/"
 BASE_PROC   = "/data/Preprocessed/"
 INDEX_DIR   = "/data/DatasetIndexes/Groups"
 
+MAX_GROUPS = 0
+
 class UnifiedMedicalDataset:
     """
     A class to create a Unified Medical Dataset based on pre-built groups JSON files.
@@ -182,7 +184,7 @@ class UnifiedMedicalDataset:
                                        entry["split"])
         
             # If composite_id starts with the split name, drop that prefix so
-            # we don’t end up with “train/train/…”
+            # we don’t end up with "train/train/..."
             id_subfolders = composite_id.split("_")
             if id_subfolders and id_subfolders[0] == entry["split"]:
                 id_subfolders = id_subfolders[1:]
@@ -237,8 +239,8 @@ class UnifiedMedicalDataset:
                         "identifier":  new_id,
                         "short_id":    self.preprocessor._short_id(new_id),
                         "images":      entry["images"],
-                        "masks":       entry["masks"],  # original raw-mask paths
-                        "proc_images": [img_nif],          # put the NIfTI path here
+                        "masks":       entry["masks"],  # Original raw-mask paths
+                        "proc_images": [img_nif],       # Processed NIfTIs
                         "proc_masks":  preprocessing_metadata.get("mask_niftis", []),
                         "preprocessing_metadata": {
                             "resize_shape": preprocessing_metadata.get("resize_shape"),
@@ -398,6 +400,6 @@ class DatasetLoader:
 if __name__ == "__main__":
     csv_path = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
     loader = DatasetLoader(csv_path)
-    loader.process_all(max_groups=2)
+    loader.process_all(max_groups=MAX_GROUPS)
     export_path = normalize_path(os.path.join(BASE_PROC, "datasets.pkl"))
     loader.export(export_path)
