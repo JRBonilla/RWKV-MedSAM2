@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import logging
 import datetime
@@ -438,22 +439,38 @@ def index_dataset(dataset_name, metadata):
         "unannotated_groups": index_data.get("unannotated_groups", [])
     }
 
-def index_all_datasets():
-    """
-    Load dataset metadata from the CSV file and index each dataset.
-
-    The function reads the CSV (using load_dataset_metadata), then iterates over each dataset and calls index_dataset.
-    """
-    CSV_PATH = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
-    logger.info(f"Loading dataset metadata from {CSV_PATH}...")
-    datasets_metadata = load_dataset_metadata(CSV_PATH)
-    logger.info(f"Found metadata for {len(datasets_metadata)} dataset(s).")
-    for dataset_name, metadata in datasets_metadata.items():
-        try:
-            index_dataset(dataset_name, metadata)
-        except Exception as e:
-            logger.error(f"Error indexing dataset '{dataset_name}': {e}")
 
 if __name__ == "__main__":
-    index_all_datasets()
+    # Command-line Arg Parsing
+    parser = argparse.ArgumentParser(description="Index one or all datasets")
+    parser.add_argument(
+        '-d', '--dataset',
+        help="Name of the specific dataset to index"
+    )
+    parser.add_argument(
+        '-a', '--all',
+        action='store_true',
+        help="Index all datasets (mutually exclusive with --dataset)"
+    )
+    args = parser.parse_args()
+
+    # Load metadata
+    CSV_PATH = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
+    datasets_metadata = load_dataset_metadata(CSV_PATH)
+
+    # Run indexing
+    if args.dataset:
+        if args.dataset not in datasets_metadata:
+            logger.error(f"Dataset '{args.dataset}' not found in {CSV_PATH}.")
+            sys.exit(1)
+        index_dataset(args.dataset, datasets_metadata[args.dataset])
+    elif args.all:
+        for name, meta in datasets_metadata.items():
+            try:
+                index_dataset(name, meta)
+            except Exception as e:
+                logger.error(f"Error indexing dataset '{name}': {e}")
+    else:
+        parser.error("You must specify either --dataset or --all")
+
     logger.info("Indexing complete.")
