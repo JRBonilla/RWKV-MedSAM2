@@ -15,6 +15,7 @@ import gzip
 from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
 # Configuration
@@ -33,7 +34,7 @@ if not main_logger.handlers:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(PREPROCESSING_LOG_DIR, exist_ok=True)
     log_file_path = os.path.join(PREPROCESSING_LOG_DIR, f"preprocessor_{timestamp}.log")
-    fh = logging.FileHandler(log_file_path)
+    fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     main_logger.addHandler(fh)
 
