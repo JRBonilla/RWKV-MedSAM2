@@ -1,9 +1,12 @@
 import os
-import pickle
-import pandas as pd
+import sys
+import argparse
 import json
 import logging
 import random
+import pickle
+import pandas as pd
+from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
 from preprocessor import Preprocessor
 from collections import defaultdict
@@ -18,11 +21,9 @@ BASE_UNPROC = "/data/research/"
 BASE_PROC   = "/data/Preprocessed/"
 INDEX_DIR   = "/data/DatasetIndexes/Groups"
 
-MAX_GROUPS = 0
-
-class UnifiedMedicalDataset:
+class SegmentationDataset:
     """
-    A class to create a Unified Medical Dataset based on pre-built groups JSON files.
+    A class to create a Segmentation Dataset based on pre-built groups JSON files.
     
     This class loads the lean groups JSON file that contains nested subdataset structure,
     flattens it into individual groups, and then copies the images and masks into the
@@ -278,16 +279,16 @@ class UnifiedMedicalDataset:
 
         return grouping_metadata
 
-class DatasetLoader:
+class DatasetManager:
     """
-    Loader class to manage processing of multiple unified medical datasets.
+    Loader class to manage processing of multiple Segmentation Datasets.
     
-    Loads dataset metadata from a CSV file, instantiates UnifiedMedicalDataset objects,
+    Loads dataset metadata from a CSV file, instantiates SegmentationDataset objects,
     processes each dataset, and updates the CSV file with new metadata.
     """
     def __init__(self, csv_path):
         """
-        Initialize the DatasetLoader.
+        Initialize the DatasetManager.
 
         Args:
             csv_path (str): Path to the CSV file containing dataset metadata.
@@ -297,7 +298,7 @@ class DatasetLoader:
         self.metadata = load_dataset_metadata(csv_path)
         self.datasets = []
         for name, meta in self.metadata.items():
-            self.datasets.append(UnifiedMedicalDataset(name, meta))
+            self.datasets.append(SegmentationDataset(name, meta))
 
     def process_all(self, max_groups=0):
         """
@@ -307,54 +308,75 @@ class DatasetLoader:
             max_groups (int): Optional maximum number of groups per split (train/test) to process.
         """
         for dataset in tqdm(self.datasets, desc="Processing all datasets"):
-            # Skip PAIP2019. Temporary: Takes too long.
-            if dataset.dataset_name == "PAIP2019":
-                continue
+            self.process_dataset(dataset.dataset_name, max_groups=max_groups)
 
-            dataset_logger = logging.getLogger(f"UnifiedMedicalDataset.{dataset.dataset_name}")
-            dataset_logger.setLevel(logging.INFO)
+        self.update_csv()
 
-            # Ensure a dedicated log directory and file for this dataset
-            dataset_log_dir = os.path.join(BASE_PROC, dataset.dataset_name, ".preprocessing_logs")
-            os.makedirs(dataset_log_dir, exist_ok=True)
-            dataset_log_path = os.path.join(dataset_log_dir, f"{dataset.dataset_name}.log")
+    def process_dataset(self, dataset_name, max_groups=0):
+        """
+        Process a single dataset by reorganizing files based on its groups JSON file.
+
+        Args:
+            dataset_name (str): Name of the dataset to process.
+            max_groups (int, optional): Optional maximum number of groups per split (train/test) to process.
+
+        Raises:
+            ValueError: If the dataset name is not found in the metadata.
+        """
+        # Find the dataset object
+        dataset = next((ds for ds in self.datasets if ds.dataset_name == dataset_name), None)
+        if not dataset:
+            raise ValueError(f"Dataset '{dataset_name}' not found in metadata")
+
+        # Create and configure a per-dataset logger
+        dataset_logger = logging.getLogger(f"SegmentationDataset.{dataset_name}")
+        dataset_logger.setLevel(logging.INFO)
+        log_dir = os.path.join(BASE_PROC, dataset_name, ".preprocessing_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"{dataset_name}.log")
             if not dataset_logger.handlers:
-                fh = logging.FileHandler(dataset_log_path)
-                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-                dataset_logger.addHandler(fh)
-
-            # Check if this dataset contains CT modality and attempt to load global CT statistics
-            meta = dataset.metadata
-            global_ct_stats = None
-            if any(m.lower() == "ct" for m in meta.get("modalities", [])):
-                stats_path = os.path.join(INDEX_DIR, "CTStats", f"{dataset.dataset_name}_ct_stats.json")
-                try:
-                    with open(stats_path, "r") as sf:
-                        ct_stats = json.load(sf)
-                    global_ct_stats = (ct_stats["mean"], ct_stats["std"])
-                    dataset_logger.info(
-                        f"Loaded CT stats: mean={global_ct_stats[0]:.4f}, std={global_ct_stats[1]:.4f}"
-                    )
-                except Exception as e:
-                    dataset_logger.warning(f"Could not load CT stats from {stats_path}: {e}")
-
-                preprocessor = Preprocessor(
-                    target_size=(512, 512),
-                    dataset_logger=dataset_logger,
-                    global_ct_stats=global_ct_stats,
-                    dataset_name=dataset.dataset_name,
-                    background_value=meta.get("background_value", 0)
+                fh = RotatingFileHandler(
+                    log_path,
+                    maxBytes=400 * 1024 * 1024,    # Rotate after 400 MB
+                    backupCount=5                  # Keep 5 old log files
                 )
-            else:
-                preprocessor = Preprocessor(
-                    target_size=(512, 512),
-                    dataset_logger=dataset_logger,
-                    dataset_name=dataset.dataset_name,
-                    background_value=meta.get("background_value", 0)
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+            dataset_logger.addHandler(fh)
+
+        # Load global CT stats if applicable
+        meta = dataset.metadata
+        global_ct_stats = None
+        if any(m.lower() == "ct" for m in meta.get("modalities", [])):
+            stats_path = os.path.join(INDEX_DIR, "CTStats", f"{dataset_name}_ct_stats.json")
+            try:
+                with open(stats_path, "r") as sf:
+                    stats = json.load(sf)
+                global_ct_stats = (stats["mean"], stats["std"])
+                dataset_logger.info(
+                    f"Loaded CT stats: mean={global_ct_stats[0]:.4f}, std={global_ct_stats[1]:.4f}"
                 )
+            except Exception as e:
+                dataset_logger.warning(f"Could not load CT stats from {stats_path}: {e}")
 
-            dataset.process(preprocessor, max_groups=max_groups)
+            preprocessor = Preprocessor(
+                target_size=(512, 512),
+                dataset_logger=dataset_logger,
+                global_ct_stats=global_ct_stats,
+                dataset_name=dataset_name,
+                background_value=meta.get("background_value", 0)
+            )
+        else:
+            preprocessor = Preprocessor(
+                target_size=(512, 512),
+                dataset_logger=dataset_logger,
+                dataset_name=dataset_name,
+                background_value=meta.get("background_value", 0)
+            )
 
+        # Run the preprocessing for this one dataset
+        dataset.process(preprocessor, max_groups=max_groups)
+
+        # Update the CSV metadata to reflect any changes
         self.update_csv()
 
     def update_csv(self):
@@ -372,34 +394,72 @@ class DatasetLoader:
 
     def export(self, export_path):
         """
-        Export the DatasetLoader instance to a pickle file for later reuse.
+        Export the DatasetManager instance to a pickle file for later reuse.
 
         Args:
             export_path (str): Path to the export pickle file.
         """
         with open(normalize_path(export_path), 'wb') as f:
             pickle.dump(self, f)
-        print(f"Dataset loader exported to {export_path}.")
+        print(f"Dataset manager exported to {export_path}.")
 
     @classmethod
     def load_from_file(cls, export_path):
         """
-        Load a DatasetLoader instance from a pickle file.
+        Load a DatasetManager instance from a pickle file.
 
         Args:
             export_path (str): Path to the pickle file.
 
         Returns:
-            DatasetLoader: The loaded DatasetLoader instance.
+            DatasetManager: The loaded DatasetManager instance.
         """
         with open(normalize_path(export_path), 'rb') as f:
-            loader = pickle.load(f)
-        print(f"Dataset loader loaded from {export_path}.")
-        return loader
+            manager = pickle.load(f)
+        print(f"Dataset manager loaded from {export_path}.")
+        return manager
 
 if __name__ == "__main__":
+    # Command-line Arg Parsing
+    parser = argparse.ArgumentParser(description="Process one or all segmentation datasets")
+    parser.add_argument(
+        '-preprocess',
+        action='store_true',
+        help="Run preprocessing on one or all datasets"
+    )
+    parser.add_argument(
+        '-d', '--dataset',
+        help="Name of the specific dataset to process"
+    )
+    parser.add_argument(
+        '-a', '--all',
+        action='store_true',
+        help="Process all datasets (mutually exclusive with --dataset)"
+    )
+    parser.add_argument(
+        '-m', '--max-groups',
+        type=int,
+        default=0,
+        help="Maximum number of groups per split (train/test) to process"
+    )
+    args = parser.parse_args()
+
+    # Require the preprocess flag
+    if not args.preprocess:
+        parser.error("Missing required argument: -preprocess")
+
     csv_path = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
-    loader = DatasetLoader(csv_path)
-    loader.process_all(max_groups=MAX_GROUPS)
-    export_path = normalize_path(os.path.join(BASE_PROC, "datasets.pkl"))
-    loader.export(export_path)
+    manager = DatasetManager(csv_path)
+
+    # Run processing
+    if args.dataset:
+        if args.dataset not in manager.datasets_metadata:
+            print(f"Dataset '{args.dataset}' not found in {csv_path}.")
+            sys.exit(1)
+        manager.process_dataset(args.dataset, max_groups=args.max_groups)
+    elif args.all:
+        manager.process_all(max_groups=args.max_groups)
+    else:
+        print("Please specify either --dataset/-d or --all/-a.")
+
+    manager.export(normalize_path(os.path.join(BASE_PROC, "dataset_manager.pkl")))

@@ -7,7 +7,7 @@ from tqdm import tqdm
 def decode_rle(rle, height, width):
     """
     Decode a run-length encoded (RLE) string into a binary mask.
-    If `rle` is empty or NaN, returns an all-zero mask.
+    If 'rle' is empty or NaN, returns an all-zero mask.
     """
     if pd.isna(rle) or rle.strip() == "":
         return np.zeros((height, width), dtype=np.uint8)
@@ -22,16 +22,13 @@ def decode_rle(rle, height, width):
     return mask_flat.reshape((height, width))
 
 def main():
-    # csv_path = "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert.csv"
-    csv_path = "/data/jrbonill/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert.csv"
+    csv_path = "./CheXpert.csv"
     print("Loading CSV file, please wait...")
     df = pd.read_csv(csv_path)
     print("CSV file loaded successfully.")
 
-    # base_output_train = "F:/Datasets/CheXpert/preprocessed_chexpert/train"
-    # base_output_test = "F:/Datasets/CheXpert/preprocessed_chexpert/test"
-    base_output_train = "/data/jrbonill/data/research/CheXpert/preprocessed_chexpert/train"
-    base_output_test  = "/data/jrbonill/data/research/CheXpert/preprocessed_chexpert/test"
+    base_output_train = "./preprocessed_chexpert/train"
+    base_output_test = "./preprocessed_chexpert/test"
     os.makedirs(base_output_train, exist_ok=True)
     os.makedirs(base_output_test, exist_ok=True)
 

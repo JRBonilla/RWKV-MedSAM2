@@ -5,7 +5,7 @@ import shutil
 import logging
 
 # Global logger: logs to "processing_errors.log"
-logger = logging.getLogger("UnifiedMedicalDatasetLogger")
+logger = logging.getLogger("SegmentationDatasetLogger")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     global_handler = logging.FileHandler("processing_errors.log")
@@ -15,7 +15,7 @@ if not logger.handlers:
 
 def set_indexing_log(index_dir, dataset_name):
     """
-    Reconfigure the UnifiedMedicalDataset logger so that all regex matching code
+    Reconfigure the SegmentationDataset logger so that all regex matching code
     now goes into:
         {index_dir}/Logs/{dataset_name}_indexing.log
 
