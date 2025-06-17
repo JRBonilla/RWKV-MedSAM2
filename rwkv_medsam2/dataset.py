@@ -334,12 +334,12 @@ class DatasetManager:
         log_dir = os.path.join(BASE_PROC, dataset_name, ".preprocessing_logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{dataset_name}.log")
-            if not dataset_logger.handlers:
-                fh = RotatingFileHandler(
-                    log_path,
-                    maxBytes=400 * 1024 * 1024,    # Rotate after 400 MB
-                    backupCount=5                  # Keep 5 old log files
-                )
+        if not dataset_logger.handlers:
+            fh = RotatingFileHandler(
+                log_path,
+                maxBytes=400 * 1024 * 1024,    # Rotate after 400 MB
+                backupCount=5                  # Keep 5 old log files
+            )
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
             dataset_logger.addHandler(fh)
 
