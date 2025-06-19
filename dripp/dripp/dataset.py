@@ -300,14 +300,27 @@ class DatasetManager:
         for name, meta in self.metadata.items():
             self.datasets.append(SegmentationDataset(name, meta))
 
-    def process_all(self, max_groups=0):
+    def process_all(self, start_at=None, max_groups=0):
         """
         Process all datasets by reorganizing files based on their groups JSON files.
+        If start_at is given, skip everything up to (but not including) that dataset.
 
         Args:
+            start_at (str, optional): Name of dataset to resume from.
             max_groups (int): Optional maximum number of groups per split (train/test) to process.
         """
-        for dataset in tqdm(self.datasets, desc="Processing all datasets"):
+        # Determine start index
+        idx = 0
+        if start_at:
+            idx = next((i for i, ds in enumerate(self.datasets)
+                        if ds.dataset_name == start_at), None)
+            if idx is None:
+                raise ValueError(f"Dataset '{start_at}' not found; cannot resume from it.")
+
+        for dataset in tqdm(
+            self.datasets[idx:],
+            desc=(f"Processing all datasets from '{start_at}'" if start_at else "Processing all datasets")
+        ):
             self.process_dataset(dataset.dataset_name, max_groups=max_groups)
 
         self.update_csv()
@@ -433,8 +446,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '-a', '--all',
-        action='store_true',
-        help="Process all datasets (mutually exclusive with --dataset)"
+        nargs='?',            # Allow optional value
+        const='',             # When provided without a value, args.all == ''
+        metavar='START_AT',
+        help="Process all datasets; optionally resume at START_AT"
     )
     parser.add_argument(
         '-m', '--max-groups',
@@ -457,8 +472,10 @@ if __name__ == "__main__":
             print(f"Dataset '{args.dataset}' not found in {csv_path}.")
             sys.exit(1)
         manager.process_dataset(args.dataset, max_groups=args.max_groups)
-    elif args.all:
-        manager.process_all(max_groups=args.max_groups)
+    elif args.all is not None:
+        # If args.all == '' then no start name provided, so resume from beginning
+        start = args.all or None
+        manager.process_all(start_at=start, max_groups=args.max_groups)
     else:
         print("Please specify either --dataset/-d or --all/-a.")
 
