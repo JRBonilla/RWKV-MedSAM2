@@ -510,7 +510,6 @@ def get_regex_configs(grouping_regex, metadata):
                 test_mask = train_mask
 
             # Import SubdatasetConfig (which now expects modality, name, pipeline, train_image, ...)
-            from helpers import SubdatasetConfig
             configs.append(
                 SubdatasetConfig(
                     modality.strip().lower(),
@@ -551,7 +550,6 @@ def get_regex_configs(grouping_regex, metadata):
 
         # If there's no header, default to the first modality listed in metadata
         modality = (metadata.get("modalities") or ["default"])[0]
-        from helpers import SubdatasetConfig
         # In Format 1, we never provided a pipeline, so pass pipeline=None
         return [
             SubdatasetConfig(
