@@ -319,7 +319,9 @@ class DatasetManager:
 
         for dataset in tqdm(
             self.datasets[idx:],
-            desc=(f"Processing all datasets from '{start_at}'" if start_at else "Processing all datasets")
+            desc=(f"Processing all datasets from '{start_at}'" if start_at else "Processing all datasets"),
+            total=len(self.datasets),
+            initial=idx
         ):
             self.process_dataset(dataset.dataset_name, max_groups=max_groups)
 
