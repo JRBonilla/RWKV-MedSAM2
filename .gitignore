@@ -3,3 +3,5 @@ images/
 *.pt
 rwkv-medsam2.tar
 *.log
+dripp/dripp.egg-info
+__pycache__

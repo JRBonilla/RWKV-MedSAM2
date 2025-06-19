@@ -6,7 +6,7 @@ import datetime
 import random
 from tqdm import tqdm
 
-from helpers import (
+from .helpers import (
     normalize_path,
     collect_files,
     resolve_folder,

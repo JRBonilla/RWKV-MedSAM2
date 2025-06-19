@@ -30,7 +30,8 @@ REQUIRED_PACKAGES = [
     'iopath>=0.1.10',
     'pillow>=9.4.0',
     "ninja>=1.11.0",
-    "sam2>=1.1.0"
+    "sam2>=1.1.0",
+    "dripp>=0.1.0"
 ]
 
 # Build the SAM2 CUDA extension

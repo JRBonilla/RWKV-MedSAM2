@@ -8,10 +8,10 @@ import pickle
 import pandas as pd
 from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
-from preprocessor import Preprocessor
+from .preprocessor import Preprocessor
 from collections import defaultdict
 
-from helpers import *
+from .helpers import *
 
 # Base directories
 # BASE_UNPROC = "F:/Datasets/"

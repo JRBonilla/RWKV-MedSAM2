@@ -1,21 +1,21 @@
 import os
-import numpy as np
+import gzip
 import cv2
-from scipy.ndimage import label
-import nibabel as nib
-from PIL import Image
+import scipy.io
 import pydicom
 import logging
-from helpers import get_extension
 import hashlib
-import scipy.io
 import datetime
+import numpy as np
+import nibabel as nib
 import SimpleITK as sitk
-import gzip
-from collections import defaultdict
+from PIL import Image
 from tqdm import tqdm
 from pathlib import Path
+from scipy.ndimage import label
+from collections import defaultdict
 from logging.handlers import RotatingFileHandler
+from .helpers import get_extension
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
 # Configuration
