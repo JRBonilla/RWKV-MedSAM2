@@ -208,7 +208,7 @@ class Preprocessor:
         valid_mask_stems = set()
 
         # 1) Mask loop
-        for i, msk_path in enumerate(tqdm(mask_files, desc=f"[{composite_id}] Processing 2D masks...")):
+        for i, msk_path in enumerate(tqdm(mask_files, desc=f"[{sub_name}: {composite_id}] Processing 2D masks...")):
             self.dataset_logger.info(f"Loading mask {msk_path}")
             mask_arr, header = self.load_mask(msk_path)
 
@@ -234,7 +234,7 @@ class Preprocessor:
                         continue
 
                     for j, comp in enumerate(filtered):
-                        self._save_mask(comp, '2d', z, j, f"{composite_id}_slice{z}", mask_out_dir)
+                        self._save_mask(comp, '2d', z, j, f"{composite_id}", mask_out_dir, Path(msk_path).stem)
                         del comp
                     del filtered, comps, resized_mask, cropped_mask
                 del vol
@@ -263,13 +263,19 @@ class Preprocessor:
                     elif sub_name == 'MA':
                         valid_mask_stems.add(Path(msk_path).stem)
 
-                for j, comp in enumerate(filtered):
-                    self._save_mask(comp, '2d', i, j, composite_id, mask_out_dir)
-                    del comp
+                if self.dataset_name == 'QUBIQ2021' and sub_name=='brain-tumor':
+                    for img_slice in range(4):
+                        for j, comp in enumerate(filtered):
+                            self._save_mask(comp, '2d', img_slice, j, composite_id, mask_out_dir, Path(msk_path).stem)
+                            del comp
+                else:
+                    for j, comp in enumerate(filtered):
+                        self._save_mask(comp, '2d', i, j, composite_id, mask_out_dir)
+                        del comp
                 del filtered, comps, resized_mask, cropped_mask, mask_arr
 
         # 2) Image loop
-        for i, img_path in enumerate(tqdm(image_files, desc=f"[{composite_id}] Processing 2D images...")):
+        for i, img_path in enumerate(tqdm(image_files, desc=f"[{sub_name}: {composite_id}] Processing 2D images...")):
             # For PAIP2019, skip images without valid masks
             if self.dataset_name == 'PAIP2019' or self.dataset_name == 'e_optha':
                 stem = Path(img_path).stem
@@ -292,7 +298,7 @@ class Preprocessor:
                     resized_img = self._resize(norm_img, is_mask=False)
                     final_img = self._ensure_three_channels(resized_img)
 
-                    self._save_image(final_img, '2d', z, f"{composite_id}_slice{z}", img_out_dir)
+                    self._save_image(final_img, '2d', z, f"{composite_id}", img_out_dir)
                     del final_img, resized_img, norm_img, cropped_img
                 del vol
 
@@ -520,7 +526,7 @@ class Preprocessor:
             image_paths.append(img_path)
 
         # 4) Process each resampled mask: crop, resize, split components or labels, save
-        for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{composite_id}] Processing 3D mask slices")):
+        for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{sub_name}: {composite_id}] Processing 3D mask slices")):
             # (a) Convert to numpy and crop
             mask_array = sitk.GetArrayFromImage(msk_itk_res).astype(np.int32)
             mask_crop = mask_array[z0:z1, y0:y1, x0:x1]
@@ -677,7 +683,7 @@ class Preprocessor:
 
         # 4) Process each frame
         num_frames = len(frames)
-        for idx, frame in enumerate(tqdm(frames, desc=f'[{composite_id}] Processing frames')):
+        for idx, frame in enumerate(tqdm(frames, desc=f'[{sub_name}: {composite_id}] Processing frames')):
             keep_frame = True
 
             # 4a) Process mask and decide whether to keep frame
@@ -1007,7 +1013,7 @@ class Preprocessor:
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 
-    def _save_mask(self, mask, mode, idx, comp_idx, composite_id, out_dir):
+    def _save_mask(self, mask, mode, idx, comp_idx, composite_id, out_dir, mask_tag=None):
         """
         Save a processed mask (2D component, video frame, or 3D volume) to disk.
 
@@ -1020,6 +1026,7 @@ class Preprocessor:
             comp_idx (int): Index of the mask component (unused for '3d').
             composite_id (str): Base filename (for '3d') or identifier used to generate filenames.
             out_dir (str): Output directory.
+            mask_tag (str, optional): Optional tag to append to the filename.
         Returns:
             str: Full path to the saved file (for '3d') or last saved PNG path (for 2D/video).
         """
@@ -1040,7 +1047,11 @@ class Preprocessor:
             '2d':    ('img',   3),
             'video': ('frame', 4),
         }[mode]
-        filename = f"{sid}_{token}_{idx:0{pad}d}_mask_{comp_idx}.png"
+        # Inject mask tag if provided
+        if mask_tag is not None:
+            filename = f"{sid}_{mask_tag}_{token}_{idx:0{pad}d}_mask_{comp_idx}.png"
+        else:
+            filename = f"{sid}_{token}_{idx:0{pad}d}_mask_{comp_idx}.png"
         path = os.path.join(out_dir, filename)
         cv2.imwrite(path, self._to_uint8(mask))
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
