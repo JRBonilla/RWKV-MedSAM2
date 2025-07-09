@@ -27,12 +27,12 @@ def fill_holes(color_mask):
     Returns:
         np.ndarray: Mask with holes filled.
     """
-    inv = cv2.bitwise_not(binary_mask)
-    h, w = binary_mask.shape
+    inv = cv2.bitwise_not(color_mask)
+    h, w = color_mask.shape
     flood = np.zeros((h+2, w+2), np.uint8)
     cv2.floodFill(inv, flood, (0, 0), 255)
     holes = cv2.bitwise_not(inv)
-    return cv2.bitwise_or(binary_mask, holes)
+    return cv2.bitwise_or(color_mask, holes)
 
 def process_image(input_path: str, output_path: str,
                   target_colors: list[np.ndarray], tol: float) -> None:
