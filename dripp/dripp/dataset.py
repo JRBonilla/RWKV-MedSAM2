@@ -51,6 +51,7 @@ class SegmentationDataset:
             os.makedirs(normalize_path(os.path.join(self.output_dir, mod)), exist_ok=True)
         os.makedirs(normalize_path(os.path.join(self.output_dir, ".preprocessing_logs")), exist_ok=True)
         self.processed_pairs = {"train": 0, "test": 0}
+        self.mask_classes = parse_mask_classes(self.metadata.get("mask_classes"))
 
     def process(self, preprocessor: Preprocessor, max_groups=0):
         """
@@ -207,7 +208,8 @@ class SegmentationDataset:
                     sub_modality,
                     img_out_dir,
                     mask_out_dir,
-                    composite_id
+                    composite_id,
+                    self.mask_classes
                 )
             except Exception as e:
                 logger.error(f"Error preprocessing group {key}: {e}", exc_info=True)
@@ -219,11 +221,16 @@ class SegmentationDataset:
                 for fn in os.listdir(img_out_dir)
                 if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
             )
-            proc_masks = sorted(
+            mask_files = sorted(
                 os.path.join(mask_out_dir, fn)
                 for fn in os.listdir(mask_out_dir)
                 if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
             )
+            # Pair each mask path with its corresponding class
+            proc_masks = [
+                {"path": p, "class": extract_mask_class(p)}
+                for p in mask_files
+            ]
 
             # Drop this group if no masks were produced
             if not proc_masks:
@@ -236,19 +243,34 @@ class SegmentationDataset:
                     and len(preprocessing_metadata["image_niftis"]) > 1):
                 for idx, img_nif in enumerate(preprocessing_metadata["image_niftis"]):
                     new_id = f"{composite_id}_modality{idx}"
+                    mask_nifti_paths = preprocessing_metadata.get("mask_niftis", [])
+                    proc_masks = [{"path": p, "class": extract_mask_class(p)} for p in mask_nifti_paths]
                     split_entry = {
-                        "identifier":  new_id,
-                        "short_id":    self.preprocessor._short_id(new_id),
-                        "images":      entry["images"],
-                        "masks":       entry["masks"],  # Original raw-mask paths
-                        "proc_images": [img_nif],       # Processed NIfTIs
-                        "proc_masks":  preprocessing_metadata.get("mask_niftis", []),
+                        "identifier":       new_id,
+                        "short_id":         self.preprocessor._short_id(new_id),
+                        "images":           entry["images"],
+                        "masks":            entry["masks"],  # Original raw-mask paths
+                        "proc_images":      [img_nif],       # Processed NIfTIs
+                        "proc_masks":       proc_masks,
                         "preprocessing_metadata": {
                             "resize_shape": preprocessing_metadata.get("resize_shape"),
                             "volume_shape": preprocessing_metadata.get("volume_shape")
                         }
                     }
                     grouping_metadata.append(split_entry)
+            elif self.dataset_name == "QUBIQ2021" and sub_name == "brain-tumor":
+                for idx, img in enumerate(proc_imgs):
+                    new_id = f"{composite_id}_modality{idx}"
+                    entry_dict = {
+                        "identifier":       new_id,
+                        "short_id":         self.preprocessor._short_id(new_id),
+                        "images":           entry["images"],
+                        "masks":            entry["masks"],  # Original raw-mask paths
+                        "proc_images":      [img],       # Processed image
+                        "proc_masks":       proc_masks,
+                        "preprocessing_metadata": {}
+                    }
+                    grouping_metadata.append(entry_dict)
             else:
                 entry_dict = {
                     "identifier":             composite_id,

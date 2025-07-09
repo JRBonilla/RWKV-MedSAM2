@@ -3,6 +3,8 @@ import pandas as pd
 import re
 import shutil
 import logging
+import numpy as np
+from typing import Dict, List
 
 # Global logger: logs to "processing_errors.log"
 logger = logging.getLogger("SegmentationDatasetLogger")
@@ -12,6 +14,14 @@ if not logger.handlers:
     global_formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
     global_handler.setFormatter(global_formatter)
     logger.addHandler(global_handler)
+
+# Compile regexes once at module load
+# Regex for extracting the class name from a filename
+# Class names are always surrounded by %
+_CLASS_RE = re.compile(r'%([^%]+)%')
+# Regex for extracting the range or single value from a class rule
+_RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
+_DIGIT_RE = re.compile(r"^\d+$")
 
 def set_indexing_log(index_dir, dataset_name):
     """
@@ -113,6 +123,12 @@ def load_dataset_metadata(csv_path):
         grouping_regex = (str(row["Grouping Regex"]).strip() 
                           if "Grouping Regex" in df.columns and pd.notna(row["Grouping Regex"])
                           else None)
+        mask_classes = (str(row["Mask Classes"]).strip()
+                        if "Mask Classes" in df.columns and pd.notna(row["Mask Classes"])
+                        else None)
+        segmentation_tasks = (str(row["Segmentation Tasks"]).strip()
+                              if "Segmentation Tasks" in df.columns and pd.notna(row["Segmentation Tasks"])
+                              else None)
         background_value = int(row["Background Value"]) if "Background Value" in df.columns and pd.notna(row["Background Value"]) else 0
 
         metadata[name] = {
@@ -127,7 +143,9 @@ def load_dataset_metadata(csv_path):
             "grouping_strategy": grouping_strategy,
             "grouping_regex": grouping_regex,
             "background_value": background_value,
-            "preprocessed": preprocessed_flag
+            "preprocessed": preprocessed_flag,
+            "mask_classes": mask_classes,
+            "segmentation_tasks": segmentation_tasks
         }
         for dataset, meta in metadata.items():
             for key, value in meta.items():
@@ -228,18 +246,27 @@ def get_base_filename(filename):
 def get_composite_identifier(entry):
     """
     Build a composite identifier string from the main identifier and additional identifiers.
+    Includes a special marker for 'id2' if present so it can be parsed easily later.
     
     Args:
-        entry (dict): The entry containing 'identifier' and optional 'additional' keys.
+        entry (dict): The entry containing 'split', 'identifier', and optional 'additional' keys.
     
     Returns:
         str: The composite identifier.
     """
     parts = [entry["split"], entry["identifier"]]
-    if entry.get("additional"):
-        for key in sorted(entry["additional"]):
-            parts.append(entry["additional"][key])
+    # Extract additional identifiers (if any)
+    additional = entry.get("additional", {}) or {}
+    # If 'id2' exists, append it with special delimiters for easy parsing in preprocess
+    if "id2" in additional:
+        parts.append(f"__ID2__{additional['id2']}__")
+    # Append any other additional identifiers (excluding id2) in sorted order
+    for key in sorted(additional):
+        if key == "id2":
+            continue
+        parts.append(additional[key])
     return "_".join(parts)
+
 
 def collect_files(root_folder, folder_list, allowed_extensions, is_mask=False, mask_key=None, exclude_folders=None, use_folder_identifier=False):
     """
@@ -563,7 +590,6 @@ def get_regex_configs(grouping_regex, metadata):
             )
         ]
 
-
 def match_subdataset_regex(path, grouping_strategy, subdataset_configs, is_image, split, base_dir):
     """
     Iterate over a list of SubdatasetConfig objects and attempt to extract an identifier from the given file path.
@@ -596,3 +622,186 @@ def match_subdataset_regex(path, grouping_strategy, subdataset_configs, is_image
         if ident is not None:
             return ident, additional, config
     return None, None, None
+
+def parse_mask_classes(spec):
+    """
+    Parse a class-mapping specification string into a nested dict.
+
+    The spec can be in one of two forms:
+      - "[Subdataset] {a=1|b=2}, [Subdataset2] {c=3|d=4}"
+        returns {'Subdataset': {'a': '1', 'b': '2'},
+                 'Subdataset2': {'c': '3', 'd': '4'}}
+      - "a=1|b=2"
+        returns {'default': {'a': '1', 'b': '2'}}
+
+    Args:
+        spec (str): The specification string to parse. May be empty.
+
+    Returns:
+        dict or None:  
+          - A dict mapping each subdataset name to a {class_name: rule_str} dict.  
+          - Returns None if `spec` is empty or falsy.
+    """
+    out = {}
+    if not spec:
+        return None
+
+    spec = spec.strip()
+    if spec.startswith('['):
+        # Split [Subdataset] {a=1|b=2}, [Subdataset2] {...}
+        for sub, body in re.findall(r'\[([^\]]+)\]\s*\{([^}]+)\}', spec):
+            m = {}
+            for pair in body.split('|'):
+                key, value = pair.split('=', 1)
+                m[key.strip()] = value.strip()
+            out[sub.strip()] = m
+    else:
+        m = {}
+        for pair in spec.split('|'):
+            key, value = pair.split('=', 1)
+            m[key.strip()] = value.strip()
+        out['default'] = m
+    return out
+
+def parse_segmentation_tasks(spec):
+    """
+    Parse a segmentation-task specification string into a dict of tasks to classes.
+
+    The spec has the form:
+        "task1=class1,class2|task2=class3,class4"
+    and is split on '|' into tasks, and on ',' into class lists.
+
+    Args:
+        spec (str): Specification string; tasks separated by '|', with each task
+            in the form 'task_name=class1,class2,...'. May be empty or falsy.
+
+    Returns:
+        dict[str, list[str]] or None:
+            - A dict mapping each task_name to a list of class names.
+            - None if `spec` is empty or falsy.
+    """
+    out = {}
+    if not spec:
+        return None
+    for chunk in spec.split('|'):
+        task, classes = chunk.split('=', 1)
+        out[task.strip()] = [c.strip() for c in classes.split(',') if c.strip()]
+    return out
+
+def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette=None, logger=None, background_value=0):
+    """
+    Attempt to match a mask to a class based on rules:
+        - filename keywords
+        - hexadecimal palette colors
+        - numeric label ranges or exact values
+        - wildcard '*'
+
+    Args:
+        mask_path (str): The path to the mask file.
+        mask_arr (np.ndarray or None): The array containing the mask data, or None.
+        mask_classes (dict): Mapping subdataset_name -> {class_name: rule_str, ...}.
+        subdataset_name (str): The name of the subdataset to match against.
+        palette (dict, optional): Mapping from original color tuples (R,G,B) to label ints.
+        logger (logging.Logger, optional): Logger for debug/info messages.
+        background_value (int, optional): Background label value. Defaults to 0.
+
+    Returns:
+        str or None: The matched class name, or None if no match is found.
+    """
+    rules = mask_classes.get(subdataset_name, mask_classes.get('default', {}))
+
+    # 1) Filename keyword match (longest rules first)
+    for cls_name, rule in sorted(rules.items(), key=lambda kv: len(kv[1]), reverse=True):
+        if rule == "*":
+            logger.info(f"Wildcard matching: {mask_path}.")
+            return cls_name
+        # skip hex or numeric rules here
+        if rule.startswith("#") or _RANGE_RE.match(rule) or _DIGIT_RE.match(rule):
+            continue
+        if rule in mask_path:
+            logger.info(f"Keyword matching: {mask_path}. Rule: {rule}")
+            return cls_name
+
+    # If no array provided, we're done
+    if mask_arr is None:
+        logger.info(f"No match for {mask_path} (no array to inspect).")
+        return None
+
+    arr = mask_arr
+
+    # 2) Palette lookup (if provided)
+    if palette is not None:
+        logger.info(f"Palette matching: {mask_path}")
+        # Invert palette: label -> (R,G,B)
+        inv_palette = {lbl: col for col, lbl in palette.items()}
+        # Find unique non-zero labels via bincount
+        flat = arr.ravel()
+        counts = np.bincount(flat, minlength=background_value+1 if background_value > 0 else None)
+        unique_lbls = set(np.nonzero(counts)[0])
+        unique_lbls.discard(background_value)
+
+        for lbl in unique_lbls:
+            col = inv_palette.get(lbl)
+            if col is None:
+                continue
+            r, g, b = col
+            hex_val = f"#{r:02x}{g:02x}{b:02x}"
+            for cls_name, rule in rules.items():
+                if rule.startswith("#") and rule.lower() == hex_val:
+                    logger.info(f"Matched {mask_path} to {cls_name}. Rule: {rule}, Val: {hex_val}")
+                    return cls_name
+
+    # 3) Numeric matching: ranges and exact digits
+    if np.issubdtype(arr.dtype, np.integer):
+        # Get uniques via bincount
+        flat = arr.ravel()
+        counts = np.bincount(flat)
+        uniques = np.nonzero(counts)[0]
+        logger.info(f"Numeric matching: {mask_path}. Uniques: {uniques}")
+
+        for cls_name, rule in rules.items():
+            m = _RANGE_RE.match(rule)
+            if m:
+                lo, hi = map(int, m.groups())
+                if any(lo <= u <= hi for u in uniques):
+                    logger.info(f"Matched {mask_path} to {cls_name}. Rule: {rule}, range {lo}-{hi}")
+                    return cls_name
+
+            elif _DIGIT_RE.match(rule):
+                d = int(rule)
+                if d in uniques:
+                    logger.info(f"Matched {mask_path} to {cls_name}. Rule: {rule}, contains {d}")
+                    return cls_name
+
+    # Nothing matched
+    logger.info(f"No match for {mask_path}")
+    return None
+
+def match_tasks_for_class(cls_name, tasks_map):
+    """
+    Reverse lookup which segmentation task(s) include a given mask class.
+
+    Args:
+        cls_name (str): The name of the mask class
+        tasks_map (dict): A dictionary of {task_name: [class_name, ...], ...}
+
+    Returns:
+        list: A list of task names that include the given class. If none match,
+        returns an empty list.
+    """
+    return [task_id for task_id, class_list in tasks_map.items()
+            if cls_name in class_list]
+
+def extract_mask_class(path):
+    """
+    Extract the class name from a mask filename.
+
+    Args:
+        path (str): The path to the mask file
+
+    Returns:
+        str or None: The class name if found, or None
+    """
+    fn = os.path.basename(path)
+    m  = _CLASS_RE.search(fn)
+    return m.group(1) if m else None
