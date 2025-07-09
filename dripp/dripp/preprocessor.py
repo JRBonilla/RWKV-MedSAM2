@@ -341,44 +341,44 @@ class Preprocessor:
         )
         return metadata
 
-def preprocess_3d(self, sub_name, image_series, mask_series, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes):
-    """
-    Preprocess a batch of 3D volumes and their masks using a shared bounding box.
+    def preprocess_3d(self, sub_name, image_series, mask_series, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes):
+        """
+        Preprocess a batch of 3D volumes and their masks using a shared bounding box.
 
-    1. Load image volume(s) and mask volume(s):
-       - Supports single-file volumes, DICOM series, multi-modality inputs, CHAOS dataset labels, and DICOM-SEG.
-    2. Resample mask volumes to the space of the first image modality.
-    3. For each image modality:
-       - Crop to group_bbox
-       - Normalize intensities per slice
-       - Resize to target_size
-       - Save as NIfTI
-    4. For each resampled mask volume:
-       - Crop to group_bbox
-       - Resize slices using nearest-neighbor
-       - Split multi-class labels or pure binary volumes into connected components
-       - Save each component as its own NIfTI
+        1. Load image volume(s) and mask volume(s):
+        - Supports single-file volumes, DICOM series, multi-modality inputs, CHAOS dataset labels, and DICOM-SEG.
+        2. Resample mask volumes to the space of the first image modality.
+        3. For each image modality:
+        - Crop to group_bbox
+        - Normalize intensities per slice
+        - Resize to target_size
+        - Save as NIfTI
+        4. For each resampled mask volume:
+        - Crop to group_bbox
+        - Resize slices using nearest-neighbor
+        - Split multi-class labels or pure binary volumes into connected components
+        - Save each component as its own NIfTI
 
-    Args:
-        sub_name (str): Identifier for the subdataset.
-        image_series (str or list of str): Path(s) to the 3D image series.
-        mask_series (str or list of str): Path(s) to the corresponding mask series.
-        modality (str): Lowercase modality key for normalization, e.g. 'ct' or 'mri'.
-        img_out_dir (str): Directory to save preprocessed image NIfTIs.
-        mask_out_dir (str): Directory to save preprocessed mask NIfTIs.
-        composite_id (str): Unique identifier used for naming output files.
-        group_bbox (tuple): (z0, z1, y0, y1, x0, x1) bounding box coordinates.
-        mask_classes (list): List of mask class definitions for match_mask_class.
+        Args:
+            sub_name (str): Identifier for the subdataset.
+            image_series (str or list of str): Path(s) to the 3D image series.
+            mask_series (str or list of str): Path(s) to the corresponding mask series.
+            modality (str): Lowercase modality key for normalization, e.g. 'ct' or 'mri'.
+            img_out_dir (str): Directory to save preprocessed image NIfTIs.
+            mask_out_dir (str): Directory to save preprocessed mask NIfTIs.
+            composite_id (str): Unique identifier used for naming output files.
+            group_bbox (tuple): (z0, z1, y0, y1, x0, x1) bounding box coordinates.
+            mask_classes (list): List of mask class definitions for match_mask_class.
 
-    Returns:
-        dict: Metadata including:
-            - 'modality' (str): modality key used for normalization
-            - 'resize_shape' (tuple): target in-plane size
-            - 'volume_shape' (tuple): shape of the original volume array
-            - 'image_niftis' (list of str): paths to saved image NIfTI files
-            - 'mask_niftis' (list of str): paths to saved mask component NIfTI files
-            - 'bbox' (tuple): bounding box used for cropping
-    """
+        Returns:
+            dict: Metadata including:
+                - 'modality' (str): modality key used for normalization
+                - 'resize_shape' (tuple): target in-plane size
+                - 'volume_shape' (tuple): shape of the original volume array
+                - 'image_niftis' (list of str): paths to saved image NIfTI files
+                - 'mask_niftis' (list of str): paths to saved mask component NIfTI files
+                - 'bbox' (tuple): bounding box used for cropping
+        """
         self.main_logger.info(
             f"Starting 3D batch preprocessing: {len(image_series)} image slices, "
             f"{len(mask_series) if mask_series else 0} mask files, modality={modality}"
