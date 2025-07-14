@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
 from collections import defaultdict
 
+from . import config
 from .config import (
     BASE_UNPROC,
     BASE_PROC,
