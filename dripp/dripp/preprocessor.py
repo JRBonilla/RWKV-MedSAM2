@@ -71,7 +71,7 @@ class Preprocessor:
             dataset_name (str, optional): Name of the dataset. Defaults to None.
             background_value (int, optional): Background value for normalization. Defaults to 0.
         """
-        main_logger.info(f"Initializing Preprocessor: target_size={target_size}, ct_window={ct_window}, global_ct_stats={global_ct_stats}, min_mask_size={min_mask_size}")
+        main_logger.info(f"Initializing Preprocessor: target_size={target_size}, ct_window={ct_window}, global_ct_stats={global_ct_stats}, min_mask_size={min_mask_size}, gpu_enabled={GPU_ENABLED}")
         # Core configuration
         self.target_size = target_size
         self.ct_window = ct_window
