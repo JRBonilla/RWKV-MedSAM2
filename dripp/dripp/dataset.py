@@ -500,7 +500,7 @@ if __name__ == "__main__":
 
     # Run processing
     if args.dataset:
-        if args.dataset not in manager.datasets_metadata:
+        if args.dataset not in manager.metadata:
             print(f"Dataset '{args.dataset}' not found in {csv_path}.")
             sys.exit(1)
         manager.process_dataset(args.dataset, max_groups=args.max_groups)
