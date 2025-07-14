@@ -8,18 +8,17 @@ import pickle
 import pandas as pd
 from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
-from .preprocessor import Preprocessor
 from collections import defaultdict
 
+from .config import (
+    BASE_UNPROC,
+    BASE_PROC,
+    DEFAULT_LOG_LEVEL,
+    GROUPS_DIR as INDEX_DIR,
+    GPU_ENABLED
+)
+from .preprocessor import Preprocessor
 from .helpers import *
-
-# Base directories
-# BASE_UNPROC = "F:/Datasets/"
-# BASE_PROC   = "F:/Preprocessed/"
-# INDEX_DIR   = "F:/DatasetIndexes/Groups"
-BASE_UNPROC = "/data/research/"
-BASE_PROC   = "/data/Preprocessed/"
-INDEX_DIR   = "/data/DatasetIndexes/Groups"
 
 class SegmentationDataset:
     """
@@ -367,7 +366,7 @@ class DatasetManager:
 
         # Create and configure a per-dataset logger
         dataset_logger = logging.getLogger(f"SegmentationDataset.{dataset_name}")
-        dataset_logger.setLevel(logging.INFO)
+        dataset_logger.setLevel(DEFAULT_LOG_LEVEL)
         log_dir = os.path.join(BASE_PROC, dataset_name, ".preprocessing_logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{dataset_name}.log")
@@ -481,7 +480,15 @@ if __name__ == "__main__":
         default=0,
         help="Maximum number of groups per split (train/test) to process"
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Enable GPU acceleration for preprocessing."
+    )
     args = parser.parse_args()
+
+    # Override the config flag at runtime:
+    config.GPU_ENABLED = args.gpu
 
     # Require the preprocess flag
     if not args.preprocess:

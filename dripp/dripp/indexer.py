@@ -20,6 +20,7 @@ from .helpers import (
     parse_mask_classes,
     parse_segmentation_tasks
 )
+from .config import BASE_UNPROC, INDEX_DIR, VIDEO_EXTS, VOLUME_EXTS, DEFAULT_LOG_LEVEL
 
 # Accumulate tasks across all datasets
 # Each entry has the following format:
@@ -29,21 +30,9 @@ from .helpers import (
 # }
 GLOBAL_TASKS = {}
 
-# Define base directories
-# BASE_UNPROC = "F:/Datasets/"
-# INDEX_DIR   = "F:/DatasetIndexes"  # Directory where index JSON files and logs are stored
-BASE_UNPROC = "/data/research/"
-INDEX_DIR   = "/data/DatasetIndexes"  # Directory where index JSON files and logs are stored
-
-# If a pipeline isn't specified in the header, infer it from file-extension:
-VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg"} 
-VOLUME_EXTS = {
-    ".nii", ".nii.gz", ".nrrd", ".mhd", ".mha", ".img", ".hdr", ".dicom", ".dcm", ".npy"
-}
-
 # Configure logger: log to both console and a file named "indexing.log"
 logger = logging.getLogger("DatasetIndexer")
-logger.setLevel(logging.INFO)
+logger.setLevel(DEFAULT_LOG_LEVEL)
 if not logger.handlers:
     # Stream (console) handler.
     ch = logging.StreamHandler()

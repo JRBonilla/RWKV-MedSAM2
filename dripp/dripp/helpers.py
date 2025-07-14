@@ -4,24 +4,23 @@ import re
 import shutil
 import logging
 import numpy as np
+from .config import GPU_ENABLED
+if GPU_ENABLED:
+    import cupy as xp
+else:
+    xp = np
 from typing import Dict, List
+
+from .config import DEFAULT_LOG_LEVEL, _CLASS_RE, _RANGE_RE, _DIGIT_RE
 
 # Global logger: logs to "processing_errors.log"
 logger = logging.getLogger("SegmentationDatasetLogger")
-logger.setLevel(logging.INFO)
+logger.setLevel(DEFAULT_LOG_LEVEL)
 if not logger.handlers:
     global_handler = logging.FileHandler("processing_errors.log")
     global_formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
     global_handler.setFormatter(global_formatter)
     logger.addHandler(global_handler)
-
-# Compile regexes once at module load
-# Regex for extracting the class name from a filename
-# Class names are always surrounded by %
-_CLASS_RE = re.compile(r'%([^%]+)%')
-# Regex for extracting the range or single value from a class rule
-_RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
-_DIGIT_RE = re.compile(r"^\d+$")
 
 def set_indexing_log(index_dir, dataset_name):
     """
@@ -698,7 +697,7 @@ def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette
 
     Args:
         mask_path (str): The path to the mask file.
-        mask_arr (np.ndarray or None): The array containing the mask data, or None.
+        mask_arr (xp.ndarray or None): The array containing the mask data, or None.
         mask_classes (dict): Mapping subdataset_name -> {class_name: rule_str, ...}.
         subdataset_name (str): The name of the subdataset to match against.
         palette (dict, optional): Mapping from original color tuples (R,G,B) to label ints.
@@ -736,8 +735,8 @@ def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette
         inv_palette = {lbl: col for col, lbl in palette.items()}
         # Find unique non-zero labels via bincount
         flat = arr.ravel()
-        counts = np.bincount(flat, minlength=background_value+1 if background_value > 0 else None)
-        unique_lbls = set(np.nonzero(counts)[0])
+        counts = xp.bincount(flat, minlength=background_value+1 if background_value > 0 else None)
+        unique_lbls = set(xp.nonzero(counts)[0])
         unique_lbls.discard(background_value)
 
         for lbl in unique_lbls:
@@ -752,11 +751,11 @@ def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette
                     return cls_name
 
     # 3) Numeric matching: ranges and exact digits
-    if np.issubdtype(arr.dtype, np.integer):
+    if xp.issubdtype(arr.dtype, xp.integer):
         # Get uniques via bincount
         flat = arr.ravel()
-        counts = np.bincount(flat)
-        uniques = np.nonzero(counts)[0]
+        counts = xp.bincount(flat)
+        uniques = xp.nonzero(counts)[0]
         logger.info(f"Numeric matching: {mask_path}. Uniques: {uniques}")
 
         for cls_name, rule in rules.items():

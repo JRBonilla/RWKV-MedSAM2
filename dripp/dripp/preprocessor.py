@@ -8,24 +8,27 @@ import logging
 import hashlib
 import datetime
 import numpy as np
+from .config import GPU_ENABLED
+if GPU_ENABLED:
+    import cupy as xp
+else:
+    xp = np
 import nibabel as nib
 import SimpleITK as sitk
 from PIL import Image
 from tqdm import tqdm
 from pathlib import Path
-from scipy.ndimage import label
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
-from .helpers import get_extension, parse_mask_classes, parse_segmentation_tasks, match_mask_class
-sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
-# Configuration
-# PREPROCESSING_LOG_DIR = "F:/PreprocessingLogs"
-PREPROCESSING_LOG_DIR = "/data/PreprocessingLogs"
+from .helpers import get_extension, parse_mask_classes, parse_segmentation_tasks, match_mask_class
+from .config import PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE, MIN_COMPONENT_SIZE
+
+sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
 # Configure logger
 main_logger = logging.getLogger("Preprocessor")
-main_logger.setLevel(logging.INFO)
+main_logger.setLevel(DEFAULT_LOG_LEVEL)
 if not main_logger.handlers:
     ch = logging.StreamHandler()
     ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
@@ -55,7 +58,7 @@ class Preprocessor:
       - Ensure 3-channel output for grayscale inputs
       - Split multi-class masks into binary components and filter small regions
     """
-    def __init__(self, target_size=(1024, 1024), ct_window=None, global_ct_stats=None, min_mask_size=100, dataset_logger=None, dataset_name=None, background_value=0):
+    def __init__(self, target_size=DEFAULT_TARGET_SIZE, ct_window=None, global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE, dataset_logger=None, dataset_name=None, background_value=0):
         """
         Initialize the Preprocessor.
 
@@ -226,7 +229,7 @@ class Preprocessor:
             mask_arr, header, palette = self.load_mask(msk_path)
 
             # Handle 3D mask volumes
-            if isinstance(mask_arr, np.ndarray) and mask_arr.ndim == 3 and isinstance(header, sitk.Image):
+            if mask_arr.ndim == 3 and isinstance(header, sitk.Image):
                 vol = mask_arr
                 n_slices = vol.shape[0]
                 for z in range(n_slices):
@@ -238,8 +241,8 @@ class Preprocessor:
                     for lbl, binary in self._split_multiclass_mask(resized_mask):
                         for comp_bin in self._split_connected_components(binary):
                             # Re-label the component pixels with the original class label
-                            comp = (comp_bin > 0).astype(np.int32) * int(lbl)                        
-                            self.dataset_logger.info(f"Unique values in component: {np.unique(comp)}")
+                            comp = (comp_bin > 0).astype(xp.int32) * int(lbl)                        
+                            self.dataset_logger.info(f"Unique values in component: {xp.unique(comp)}")
                             comps.append(comp)
                     filtered = self._filter_small_components(comps)
 
@@ -263,8 +266,8 @@ class Preprocessor:
                 for lbl, binary in self._split_multiclass_mask(resized_mask):
                     for comp_bin in self._split_connected_components(binary):
                         # Re-label the component pixels with the original class label
-                        comp = (comp_bin > 0).astype(np.int32) * int(lbl)
-                        self.dataset_logger.info(f"Unique values in component: {np.unique(comp)}")
+                        comp = (comp_bin > 0).astype(xp.int32) * int(lbl)
+                        self.dataset_logger.info(f"Unique values in component: {xp.unique(comp)}")
                         comps.append(comp)
                 filtered = self._filter_small_components(comps)
 
@@ -306,7 +309,7 @@ class Preprocessor:
             image_arr, header = self.load_image(img_path)
 
             # Handle 3D image volumes
-            if isinstance(image_arr, np.ndarray) and image_arr.ndim == 3 and isinstance(header, sitk.Image):
+            if image_arr.ndim == 3 and isinstance(header, sitk.Image):
                 vol = image_arr
                 n_slices = vol.shape[0]
                 for z in range(n_slices):
@@ -399,11 +402,11 @@ class Preprocessor:
         mask_itk_list = []
 
         # Multi-modality case (img_vol is a list of numpy volumes, img_itk is a list of ITK images)
-        if isinstance(img_vol, list) and all(isinstance(v, np.ndarray) for v in img_vol):
+        if isinstance(img_vol, list) and all(isinstance(v, xp.ndarray) for v in img_vol):
             # Load mask as a single SimpleITK volume, matching the first modality's geometry
             msk_vol, msk_itk, _ = self.load_mask(mask_series)
             if msk_vol.ndim == 2:
-                msk_vol = msk_vol[np.newaxis, ...]
+                msk_vol = msk_vol[xp.newaxis, ...]
                 msk_itk = sitk.GetImageFromArray(msk_vol)
             mask_itk_list.append(msk_itk)
 
@@ -420,23 +423,24 @@ class Preprocessor:
             for mpath in mask_series:
                 raw, header = self.load_image(mpath)     # raw grayscale (0–255)
                 mask_slices.append(raw)
-            chaos_vol = np.stack(mask_slices, axis=0)
+            chaos_vol = xp.stack(mask_slices, axis=0)
 
-            # build a single global map
-            unique_vals = np.unique(chaos_vol)
+            # Build a single global map
+            unique_vals = xp.unique(chaos_vol)
             unique_vals = unique_vals[unique_vals != self.background_value]
-            uniq_sorted = np.sort(unique_vals)
-            global_map = {v: i+1 for i, v in enumerate(uniq_sorted)}
+            uniq_sorted = xp.sort(unique_vals)
+            global_map = {int(v): i+1 for i, v in enumerate(uniq_sorted)}
 
-            # now split & save
+            # Split & save
             for orig_val, lbl in global_map.items():
-                bin_vol = (chaos_vol == orig_val).astype(np.uint8)
-                itk_lbl = sitk.GetImageFromArray(bin_vol * lbl)
+                bin_vol = (chaos_vol == orig_val).astype(xp.uint8)
+                bin_np = xp.asnumpy(bin_vol * lbl)
+                itk_lbl = sitk.GetImageFromArray(bin_np)
                 itk_lbl.CopyInformation(img_itk)
                 mask_itk_list.append(itk_lbl)
 
             image_itk_list.append(img_itk)
-            image_array_list.append(sitk.GetArrayFromImage(img_itk))
+            image_array_list.append(xp.asarray(sitk.GetArrayFromImage(img_itk)))
 
         # Generic DICOM-series masks or single 3D file
         else:
@@ -460,7 +464,7 @@ class Preprocessor:
                     depth = len(ct_uids)
                     height = img_itk.GetHeight()
                     width  = img_itk.GetWidth()
-                    full_vol = np.zeros((depth, height, width), dtype=np.uint8)
+                    full_vol = xp.zeros((depth, height, width), dtype=xp.uint8)
 
                     # 3) Insert each SEG slice into its proper z-location
                     for mp in mask_series:
@@ -474,17 +478,17 @@ class Preprocessor:
                         seg_arr = sitk.GetArrayFromImage(seg_itk)
                         if seg_arr.ndim == 3 and seg_arr.shape[0] == 1:
                             seg_arr = seg_arr[0]
-                        full_vol[z_idx] = seg_arr.astype(np.uint8)
+                        full_vol[z_idx] = seg_arr.astype(xp.uint8)
 
                     # 4) Wrap back into ITK and copy CT metadata safely 
-                    msk_itk = sitk.GetImageFromArray(full_vol)
+                    msk_itk = sitk.GetImageFromArray(xp.asnumpy(full_vol))
                     msk_itk.CopyInformation(img_itk)
                 else:
                     # Fallback for non-SEG DICOM masks
                     msk_vol, msk_itk, _ = self.load_mask(mask_series)
                     if msk_vol.ndim == 2:
-                        msk_vol = msk_vol[np.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(msk_vol)
+                        msk_vol = msk_vol[xp.newaxis, ...]
+                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol))
                     msk_itk.CopyInformation(img_itk)
                 mask_itk_list.append(msk_itk)
             else:
@@ -492,8 +496,8 @@ class Preprocessor:
                 for mpath in mask_series:
                     msk_vol, msk_itk, _ = self.load_mask(mpath)
                     if msk_vol.ndim == 2:
-                        msk_vol = msk_vol[np.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(msk_vol)
+                        msk_vol = msk_vol[xp.newaxis, ...]
+                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol))
                     mask_itk_list.append(msk_itk)
 
             image_itk_list.append(img_itk)
@@ -525,7 +529,7 @@ class Preprocessor:
                 resized_img = self._resize(norm_img, is_mask=False)
                 processed_img_slices.append(resized_img)
 
-            img_processed_vol = np.stack(processed_img_slices, axis=0)
+            img_processed_vol = xp.stack(processed_img_slices, axis=0)
 
             image_nifti = sitk.GetImageFromArray(img_processed_vol)
             new_spacing_img = (
@@ -548,7 +552,7 @@ class Preprocessor:
         # 4) Process each resampled mask: crop, resize, split components or labels, save
         for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 3D masks")):
             # (a) Convert to numpy and crop
-            mask_array = sitk.GetArrayFromImage(msk_itk_res).astype(np.int32)
+            mask_array = sitk.GetArrayFromImage(msk_itk_res).astype(xp.int32)
             mask_crop = mask_array[z0:z1, y0:y1, x0:x1]
 
             # (b) Resize each slice (nearest-neighbor for masks)
@@ -559,12 +563,12 @@ class Preprocessor:
                 processed_mask_slices.append(resized_mask)
 
             # Keep it as int32 so that labels >1 survive resizing
-            mask_processed_vol = np.stack(processed_mask_slices, axis=0).astype(np.int32)
+            mask_processed_vol = xp.stack(processed_mask_slices, axis=0).astype(xp.int32)
 
             # (c) Build a SimpleITK image from the resized mask (either uint8 or int32 may be used;
             # casting to uint8 here is necessary for ConnectedComponent to work as it must be binary,
             # while mask_processed_vol remains int32 for label checking):
-            mask_nifti_raw = sitk.GetImageFromArray(mask_processed_vol.astype(np.uint8))
+            mask_nifti_raw = sitk.GetImageFromArray(xp.asnumpy(mask_processed_vol.astype(xp.uint8)))
             mask_nifti_raw.SetSpacing(new_spacing_img)
             mask_nifti_raw.SetOrigin(new_origin_img)
             mask_nifti_raw.SetDirection(orig_dir)
@@ -572,7 +576,7 @@ class Preprocessor:
             # (d) Check which labels survived resizing
             # Figure out which "label‐volumes" you need to split:
             label_items = []  # Tuples of (vol_array, label_value, mask_ref_for_class)
-            unique_labels = np.unique(mask_processed_vol)
+            unique_labels = xp.unique(mask_processed_vol)
 
             # Multi-class: one volume per original label
             if not (len(unique_labels) == 2 and set(unique_labels) == {0, 1}):
@@ -580,27 +584,27 @@ class Preprocessor:
                 for lbl in unique_labels:
                     if lbl == 0:
                         continue
-                    vol = (mask_processed_vol == lbl).astype(np.int32) * int(lbl)
+                    vol = (mask_processed_vol == lbl).astype(xp.int32) * int(lbl)
                     label_items.append((vol, int(lbl), mask_series[0]))
 
             # Pure binary + multi-file: each file is one mask
             elif isinstance(mask_series, (list, tuple)) and len(mask_series) > 1 and get_extension(mask_series[0]) in ('.nii', '.nii.gz'):
                 self.dataset_logger.info(f"Binary mask #{idx} in multi-file series")
-                bin_vol = (mask_processed_vol != self.background_value).astype(np.int32)
+                bin_vol = (mask_processed_vol != self.background_value).astype(xp.int32)
                 label_items.append((bin_vol * (idx+1), idx+1, mask_series[idx]))
 
             # Pure binary, single file
             else:
-                if np.array_equal(unique_labels, [0]):
+                if xp.array_equal(unique_labels, [0]):
                     self.dataset_logger.warning("No foreground — skipping.")
                     continue
                 self.dataset_logger.info(f"Pure binary mask detected in mask index {idx}")
-                bin_vol = (mask_processed_vol != self.background_value).astype(np.int32)
+                bin_vol = (mask_processed_vol != self.background_value).astype(xp.int32)
                 label_items.append((bin_vol, 1, mask_series[0]))
 
             # 2) Run one connected-component + save routine over all items
             for vol_array, label_val, mask_ref in label_items:
-                itk_lbl = sitk.GetImageFromArray(vol_array.astype(np.uint8))
+                itk_lbl = sitk.GetImageFromArray(xp.asnumpy(vol_array.astype(xp.uint8)))
                 itk_lbl.CopyInformation(mask_nifti_raw)
 
                 self.dataset_logger.info("Splitting connected components…")
@@ -637,7 +641,7 @@ class Preprocessor:
         return {
             "modality":     modality,
             "resize_shape": self.target_size,
-            "volume_shape": image_array_list[0].shape if isinstance(image_array_list[0], np.ndarray) else None,
+            "volume_shape": image_array_list[0].shape if isinstance(image_array_list[0], xp.ndarray) else None,
             "image_niftis": image_paths,
             "mask_niftis":  mask_paths,
             "bbox":         group_bbox,
@@ -695,7 +699,7 @@ class Preprocessor:
         frame_h, frame_w = frames[0].shape[:2]
         if mask_frames.shape[1:] != (frame_h, frame_w):
             mask_frames = [
-                cv2.resize(m.astype(np.uint8), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                cv2.resize(xp.asnumpy(m.astype(xp.uint8)), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
                 for m in mask_frames
             ]
 
@@ -775,7 +779,7 @@ class Preprocessor:
 
         Returns:
             tuple:
-                data (np.ndarray or list of np.ndarray): Image data array(s).
+                data (xp.ndarray or list of xp.ndarray): Image data array(s).
                 header (SimpleITK.Image or list of SimpleITK.Image or dict): 
                     - For DICOM/volume inputs: a SimpleITK.Image or list of images.
                     - For multi-modality splits: a list of SimpleITK.Image objects.
@@ -811,16 +815,18 @@ class Preprocessor:
                 img_itk = reader.Execute()
             # 2) Any numpy file
             elif ext == '.npy':
-                data = np.load(paths[0])
-                img_itk = sitk.GetImageFromArray(data)
+                data_np = np.load(paths[0])
+                img_itk = sitk.GetImageFromArray(data_np) # SITK expects a NumPy array
+                data = xp.asarray(data_np)
                 return data, img_itk
             # 3) Any single-file volume (NIfTI, NRRD, MHD, or single-slice DICOM)
             elif ext in self.volume_exts:
                 img_itk = sitk.ReadImage(paths[0])
-                data = sitk.GetArrayFromImage(img_itk)
+                data_np = sitk.GetArrayFromImage(img_itk)
+                data = xp.asarray(data_np)
 
                 # If we have a multi-modality volume (e.g., shape (Z, Y, X, M)), split into M 3D volumes
-                if isinstance(data, np.ndarray) and data.ndim == 4:
+                if data.ndim == 4:
                     self.dataset_logger.info(f"Splitting 4D volume into 3D volumes")
                     vols = []
                     its = []
@@ -831,7 +837,8 @@ class Preprocessor:
                         extract_size = [size[0], size[1], size[2], 0]
                         extract_index = [0, 0, 0, m]
                         itk3d = sitk.Extract(img_itk, extract_size, extract_index)
-                        vol3d = sitk.GetArrayFromImage(itk3d)
+                        vol3d_np = sitk.GetArrayFromImage(itk3d)
+                        vol3d = xp.array(vol3d_np)
                         vols.append(vol3d)
                         its.append(itk3d)
                     return vols, its
@@ -843,12 +850,13 @@ class Preprocessor:
                 opener = gzip.open if paths[0].lower().endswith('.gz') else open
                 with opener(paths[0], 'rb') as f:
                     pil_img = Image.open(f)
-                    data = np.array(pil_img)
+                    data = xp.asarray(pil_img)
                     header = pil_img.info
                 return data, header
 
             # Convert SimpleITK volume to numpy
-            data = sitk.GetArrayFromImage(img_itk)  # shape (Z, H, W) for volumes
+            data_np = sitk.GetArrayFromImage(img_itk)  # shape (Z, H, W) for volumes
+            data = xp.asarray(data_np)
             header = img_itk
             return data, header
         except Exception as e:
@@ -873,7 +881,7 @@ class Preprocessor:
 
         Returns:
             tuple:
-                mask_array (np.ndarray): 2D or 3D mask array with dtype int32
+                mask_array (xp.ndarray): 2D or 3D mask array with dtype int32
                 header (SimpleITK.Image or dict): Header or metadata returned by load_image, or empty dict for .mat
                 palette (dict or None): Mapping from original pixel values to label IDs for collapsed masks, or None if not applicable
         """
@@ -881,28 +889,31 @@ class Preprocessor:
         if isinstance(mask_path, (list, tuple)):
             self.dataset_logger.info(f"Loading mask series: {mask_path}")
             raw, header = self.load_image(mask_path)
-            return np.rint(raw).astype(np.int32), header, None
+            mask = xp.rint(raw).astype(xp.int32)
+            return mask, header, None
 
         self.dataset_logger.info(f"Loading mask: {mask_path!r}")
         ext = get_extension(mask_path).lower()
 
         if ext == '.npy':
-            raw = np.load(mask_path)
-            msk_itk = sitk.GetImageFromArray(raw.astype(np.int32))
-            return np.rint(raw).astype(np.int32), msk_itk, None
+            raw_np = np.load(mask_path)
+            msk_itk = sitk.GetImageFromArray(raw_np.astype(np.int32))
+            mask = xp.asarray(raw_np)
+            mask = xp.rint(mask).astype(xp.int32)
+            return mask, msk_itk, None
 
         # .mat volume
         if ext == '.mat':
             mat = scipy.io.loadmat(mask_path)
             keys = [k for k in mat if not k.startswith('__')]
             key = 'predicted' if 'predicted' in keys else 'inst_map' if 'inst_map' in keys else keys[0]
-            data = np.rint(mat[key]).astype(np.int32)
+            mask = xp.rint(mat[key]).astype(xp.int32)
             self.dataset_logger.info(f"  -> .mat key='{key}', shape={data.shape}")
-            return data, {}, None
+            return mask, {}, None
 
         # All other formats via load_image
         raw, header = self.load_image(mask_path)
-        raw = np.rint(raw).astype(np.int32)
+        raw = xp.rint(raw).astype(xp.int32)
 
         # True volumes: return as-is
         if ext in self.volume_exts:
@@ -919,7 +930,7 @@ class Preprocessor:
 
         # 2) Fallback for any other multi-channel (e.g. unusual C>4) -> binary
         if raw.ndim == 3:
-            lbl = np.any(raw != self.background_value, axis=2).astype(np.int32)
+            lbl = xp.any(raw != self.background_value, axis=2).astype(xp.int32)
             self.dataset_logger.info(f"  -> multi-channel any-nonzero -> shape={lbl.shape}")
             return lbl, header, None
 
@@ -935,7 +946,7 @@ class Preprocessor:
 
         Returns:
             tuple:
-                frames (List[np.ndarray]): List of HxWx3 RGB frames.
+                frames (List[xp.ndarray]): List of HxWx3 RGB frames.
                 fps (float): Frames per second of the video.
         """
         self.dataset_logger.info(f"Opening video: {video_path}")
@@ -950,8 +961,18 @@ class Preprocessor:
             if not ret:
                 break
             # Convert BGR (OpenCV default) to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
+            if GPU_ENABLED and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                # 1) Upload BGR frame to GPU
+                gmat = cv2.cuda_GpuMat()
+                gmat.upload(frame)
+                # 2) Convert to RGB
+                gres = cv2.cuda.cvtColor(gmat, cv2.COLOR_BGR2RGB)
+                # 3) Download from GPU
+                frame = gres.download()
+                frames.append(xp.asarray(frame))
+            else:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(xp.asarray(frame))
 
         cap.release()
         self.dataset_logger.info(f"Loaded {len(frames)} frames at {fps} fps")
@@ -962,18 +983,18 @@ class Preprocessor:
         Scale [min,max] -> [0,255] and cast to uint8, with NaN/Inf -> 0.
 
         Args:
-            arr (np.ndarray): Input array.
+            arr (xp.ndarray): Input array.
 
         Returns:
-            np.ndarray: Scaled and cast array.
+            xp.ndarray: Scaled and cast array.
         """
-        a, b = np.nanmin(arr), np.nanmax(arr)
+        a, b = xp.nanmin(arr), xp.nanmax(arr)
         if b > a:
             scaled = (arr - a) / (b - a)
         else:
             scaled = arr * 0
-        scaled = np.nan_to_num(scaled, nan=0, posinf=0, neginf=0)
-        return (scaled * 255).astype(np.uint8)
+        scaled = xp.nan_to_num(scaled, nan=0, posinf=0, neginf=0)
+        return (scaled * 255).astype(xp.uint8)
     
     def _short_id(self, composite_id):
         """
@@ -1014,7 +1035,8 @@ class Preprocessor:
             if isinstance(img, sitk.Image):
                 sitk.WriteImage(img, path)
             else:
-                sitk.WriteImage(sitk.GetImageFromArray(img), path)
+                img_np = xp.asnumpy(img)
+                sitk.WriteImage(sitk.GetImageFromArray(img_np), path)
             self.dataset_logger.info(f"Saved 3D NIfTI: {filename} to {out_dir}")
             return path
 
@@ -1029,7 +1051,9 @@ class Preprocessor:
         else:
             filename = f"{sid}_{token}{idx:0{pad}d}.png"
         path = os.path.join(out_dir, filename)
-        cv2.imwrite(path, self._to_uint8(img))
+        arr8 = self._to_uint8(img)
+        arr8 = xp.asnumpy(arr8) if GPU_ENABLED else arr8
+        cv2.imwrite(path, arr8)
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 
@@ -1065,7 +1089,8 @@ class Preprocessor:
             if isinstance(mask, sitk.Image):
                 sitk.WriteImage(mask, path)
             else:
-                sitk.WriteImage(sitk.GetImageFromArray(mask.astype(np.int32)), path)
+                mask_np = xp.asnumpy(mask.astype(xp.int32))
+                sitk.WriteImage(sitk.GetImageFromArray(mask_np), path)
             self.dataset_logger.info(f"Saved 3D Mask NIfTI: {filename} to {out_dir}")
             return path
 
@@ -1081,7 +1106,9 @@ class Preprocessor:
         else:
             filename = f"{sid}_{token}{img_idx:0{pad}d}_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}.png"
         path = os.path.join(out_dir, filename)
-        cv2.imwrite(path, self._to_uint8(mask))
+        arr8 = self._to_uint8(mask)
+        arr8 = xp.asnumpy(arr8) if GPU_ENABLED else arr8
+        cv2.imwrite(path, arr8)
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 
@@ -1115,48 +1142,48 @@ class Preprocessor:
 
         # 1) 3D volume case (including multi-modality split): NIfTI/NRRD/MHD or multi-file DICOM
         if pipeline == "3D":
-            # Load_image may return (np.ndarray, itk) or (List[np.ndarray], List[itk])
+            # Load_image may return (xp.ndarray, itk) or (List[xp.ndarray], List[itk])
             vol_data, vol_header = self.load_image(image_paths)
 
             # If load_image returned a list of 3D volumes (i.e., original was multi-modality),
             # collapse foreground across all modalities.
             if isinstance(vol_data, list):
                 # Stack per-modality volumes and compute foreground mask
-                stacked = np.stack([vol != self.background_value for vol in vol_data], axis=0)  # (M, Z, Y, X)
-                fg_all = np.any(stacked, axis=0)  # (Z, Y, X)
+                stacked = xp.stack([vol != self.background_value for vol in vol_data], axis=0)  # (M, Z, Y, X)
+                fg_all = xp.any(stacked, axis=0)  # (Z, Y, X)
                 vol_shape = fg_all.shape  # (Z, Y, X)
-                if not np.any(fg_all):
+                if not xp.any(fg_all):
                     Z, Y, X = vol_shape
                     self.dataset_logger.warning("No foreground found in multi-modality volume; using full extent")
                     return (0, Z, 0, Y, 0, X)
-                zs, ys, xs = np.where(fg_all)
+                zs, ys, xs = xp.where(fg_all)
 
             else:
                 # vol_data is a single 3D or 2D array
                 vol = vol_data
                 # If a 2D slice was loaded as 2D, treat it as single-slice volume
                 if vol.ndim == 2:
-                    vol = vol[np.newaxis, ...]
+                    vol = vol[xp.newaxis, ...]
                 # Now vol.ndim is either 3 or (rarely) 4 if load_image didn't split it
                 if vol.ndim == 4:
                     # Collapse across modality axis
-                    fg_all = np.any(vol != self.background_value, axis=0)
+                    fg_all = xp.any(vol != self.background_value, axis=0)
                     vol_shape = fg_all.shape
-                    if not np.any(fg_all):
+                    if not xp.any(fg_all):
                         Z, Y, X = vol_shape
                         self.dataset_logger.warning("No foreground found in 4D volume; using full extent")
                         return (0, Z, 0, Y, 0, X)
-                    zs, ys, xs = np.where(fg_all)
+                    zs, ys, xs = xp.where(fg_all)
 
                 else:
                     # vol.ndim == 3 here
                     vol_shape = vol.shape
                     fg = (vol != self.background_value)
-                    if not np.any(fg):
+                    if not xp.any(fg):
                         Z, Y, X = vol_shape
                         self.dataset_logger.warning("No foreground found in volume; using full extent")
                         return (0, Z, 0, Y, 0, X)
-                    zs, ys, xs = np.where(fg)
+                    zs, ys, xs = xp.where(fg)
 
             # Compute the bounding indices
             z0, z1 = int(zs.min()), int(zs.max()) + 1
@@ -1164,7 +1191,7 @@ class Preprocessor:
             x0, x1 = int(xs.min()), int(xs.max()) + 1
 
             # Calculate crop significance
-            orig_vol = np.prod(vol_shape)
+            orig_vol = xp.prod(vol_shape)
             crop_vol = (z1 - z0) * (y1 - y0) * (x1 - x0)
             self.is_significant_crop = ((orig_vol - crop_vol) / orig_vol) >= 0.25
 
@@ -1195,15 +1222,15 @@ class Preprocessor:
                     H, W, C = data.shape
                     # If color image (HxWx3 or HxWx4), collapse on the channel axis
                     if C in (3, 4) and max(data.shape[:2]) != C:
-                        fg_mask = np.any(data != self.background_value, axis=2)
+                        fg_mask = xp.any(data != self.background_value, axis=2)
                     else:
                         # If it's actually a small 3D volume ZxHxW, collapse over Z
-                        fg_mask = np.any(data != self.background_value, axis=0)
+                        fg_mask = xp.any(data != self.background_value, axis=0)
                 else:
                     # data is already 2D (HxW)
                     fg_mask = (data != self.background_value)
 
-                ys_local, xs_local = np.nonzero(fg_mask)
+                ys_local, xs_local = xp.nonzero(fg_mask)
                 if ys_local.size == 0:
                     continue
 
@@ -1277,11 +1304,11 @@ class Preprocessor:
         Crop a 2D image, volume slice, or mask array to the specified bounding box.
 
         Args:
-            arr (np.ndarray): Array of shape (H, W) or (H, W, C).
+            arr (xp.ndarray): Array of shape (H, W) or (H, W, C).
             bbox (tuple): (min_row, max_row, min_col, max_col) to crop.
 
         Returns:
-            np.ndarray: Cropped array of the same dimensionality as input.
+            xp.ndarray: Cropped array of the same dimensionality as input.
         """
         self.dataset_logger.info(f"Cropping array with bbox={bbox}")
         r0, r1, c0, c1 = bbox
@@ -1307,15 +1334,15 @@ class Preprocessor:
             - Z-score over full image
 
         Args:
-            image (np.ndarray): Input image array (any dtype, 2D).
+            image (xp.ndarray): Input image array (any dtype, 2D).
             modality (str): Lowercase modality key ('ct', 'mri', etc.).
             use_central_region (bool): If True, normalize over central region.
 
         Returns:
-            np.ndarray: Normalized image (float32).
+            xp.ndarray: Normalized image (float32).
         """
         self.dataset_logger.info(f"Normalizing intensity image with modality={modality}")
-        img = image.astype(np.float32)
+        img = image.astype(xp.float32)
 
         if modality == 'ct':
             # CT-specific path
@@ -1324,23 +1351,23 @@ class Preprocessor:
                 window_width, window_level = self.ct_window
                 lower = window_level - window_width // 2.0
                 upper = window_level + window_width // 2.0
-                img = np.clip(img, lower, upper)
+                img = xp.clip(img, lower, upper)
 
             # Foreground mask for clipping
             fg_mask = img > self.background_value
 
             # Percentile-based clipping on foreground
-            if np.any(fg_mask):
-                lower = np.percentile(img[fg_mask], 0.5)
-                upper = np.percentile(img[fg_mask], 99.5)
-                img = np.clip(img, lower, upper)
+            if xp.any(fg_mask):
+                lower = xp.percentile(img[fg_mask], 0.5)
+                upper = xp.percentile(img[fg_mask], 99.5)
+                img = xp.clip(img, lower, upper)
 
             # Global z-score normalization (fallback to per-image if None)
             if self.global_ct_mean is not None and self.global_ct_std is not None:
                 mean = self.global_ct_mean
                 std = self.global_ct_std
             else:
-                if np.any(fg_mask):
+                if xp.any(fg_mask):
                     mean = img[fg_mask].mean()
                     std = img[fg_mask].std()
                 else:
@@ -1354,22 +1381,22 @@ class Preprocessor:
             fg_mask = img > self.background_value
 
             # 2) Percentile-based clipping on foreground only
-            if np.any(fg_mask):
-                lower = np.percentile(img[fg_mask], 0.5)
-                upper = np.percentile(img[fg_mask], 99.5)
-                img = np.clip(img, lower, upper)
+            if xp.any(fg_mask):
+                lower = xp.percentile(img[fg_mask], 0.5)
+                upper = xp.percentile(img[fg_mask], 99.5)
+                img = xp.clip(img, lower, upper)
 
             # 3) Decide which pixels to use for mean/std
             if use_central_region:
                 # Only consider non-zero after the crop for mean/std
                 region_mask = img > self.background_value
-                if np.any(region_mask):
+                if xp.any(region_mask):
                     vals = img[region_mask]
                 else:
                     vals = img.flatten()
             else:
                 # Use all foreground pixels for mean/std
-                if np.any(fg_mask):
+                if xp.any(fg_mask):
                     vals = img[fg_mask]
                 else:
                     vals = img.flatten()
@@ -1382,9 +1409,9 @@ class Preprocessor:
         else:
             # Unknown modality
             # Global percentile clipping
-            lower = np.percentile(img, 0.5)
-            upper = np.percentile(img, 99.5)
-            img = np.clip(img, lower, upper)
+            lower = xp.percentile(img, 0.5)
+            upper = xp.percentile(img, 99.5)
+            img = xp.clip(img, lower, upper)
 
             # Compute mean and std
             mean = img.mean()
@@ -1393,26 +1420,26 @@ class Preprocessor:
             result = self._calculate_zscore(img, mean, std)
 
         self.dataset_logger.info(f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}")
-        return result.astype(np.float32)
+        return result.astype(xp.float32)
 
     def _calculate_zscore(self, img, mean, std):
         """
         Zero-centers or z-scores img, then replaces any NaN/Inf with 0.
 
         Args:
-            img (np.ndarray): Input image array (any dtype, 2D).
+            img (xp.ndarray): Input image array (any dtype, 2D).
             mean (float): Mean value.
             std (float): Standard deviation.
 
         Returns:
-            np.ndarray: Normalized image (float32).
+            xp.ndarray: Normalized image (float32).
         """
         if std <= 0:
             result = img - mean
         else:
             result = (img - mean) / std
 
-        return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+        return xp.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _resize(self, data, is_mask=False):
         """
@@ -1422,34 +1449,47 @@ class Preprocessor:
         For mask data (is_mask=True): use nearest-neighbor interpolation to preserve label values.
 
         Parameters:
-            data (np.ndarray): Input array of shape (H, W) or (H, W, C).
+            data (xp.ndarray): Input array of shape (H, W) or (H, W, C).
             is_mask (bool): Flag indicating whether this is a mask (use nearest-neighbor).
 
         Returns:
-            np.ndarray: Resized array of shape (target_height, target_width) or
+            xp.ndarray: Resized array of shape (target_height, target_width) or
                         (target_height, target_width, C) matching input channels.
         """
         self.dataset_logger.info(f"Resizing to {self.target_size}")
         interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
         target_h, target_w = self.target_size
 
-        # If 2D or single-channel, this also works:
-        return cv2.resize(data, (target_w, target_h), interpolation=interp)
+        # Resize
+        if GPU_ENABLED and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            # 1) Move xp array to CPU NumPy for cv2.cuda
+            host_np = xp.asnumpy(data)
+            # 2) Upload to GPU
+            gmat = cv2.cuda_GpuMat()
+            gmat.upload(host_np)
+            # 3) Resize
+            gres = cv2.cuda.resize(gmat, (target_w, target_h), interpolation=interp)
+            # 4) Download from GPU
+            resized_np = gres.download()
+        host_np = xp.asnumpy(data) if GPU_ENABLED else data # cv2 expects numpy
+        resized_np = cv2.resize(host_np, (target_w, target_h), interpolation=interp)
+
+        return xp.asarray(resized_np)
 
     def _ensure_three_channels(self, img):
         """
         Ensure an image has three channels by replicating or trimming as needed.
 
         Parameters:
-            img (np.ndarray): Input image array, either
+            img (xp.ndarray): Input image array, either
                               2D (H, W) or 3D (H, W, C).
 
         Returns:
-            np.ndarray: 3D image array of shape (H, W, 3).
+            xp.ndarray: 3D image array of shape (H, W, 3).
         """
         if img.ndim == 2:
             # Single-channel: replicate to RGB
-            return np.stack([img, img, img], axis=2)
+            return xp.stack([img, img, img], axis=2)
         elif img.ndim == 3:
             h, w, c = img.shape
             if c == 3:
@@ -1457,7 +1497,7 @@ class Preprocessor:
                 return img
             elif c == 1:
                 # One channel: replicate that channel
-                return np.concatenate([img, img, img], axis=2)
+                return xp.concatenate([img, img, img], axis=2)
             else:
                 # More than 3 channels: take first three
                 return img[:, :, :3]
@@ -1469,20 +1509,20 @@ class Preprocessor:
         Split a multi-class segmentation mask into binary masks for each class.
 
         Args:
-            mask (np.ndarray): Integer mask array where 0 = background and
+            mask (xp.ndarray): Integer mask array where 0 = background and
                             positive integers represent distinct classes.
 
         Returns:
-            List[Tuple[int, np.ndarray]]: List of (label, binary_mask) for each class label > 0.
+            List[Tuple[int, xp.ndarray]]: List of (label, binary_mask) for each class label > 0.
         """
         self.dataset_logger.info("Splitting multi-class mask")
 
-        labels = np.unique(mask)
+        labels = xp.unique(mask)
         fg_labels = [lbl for lbl in labels if lbl != self.background_value]
 
         out = []
         for lbl in fg_labels:
-            binary = (mask == lbl).astype(np.uint8)
+            binary = (mask == lbl).astype(xp.uint8)
             out.append((lbl, binary))
         return out
 
@@ -1491,24 +1531,27 @@ class Preprocessor:
         Split a binary mask into its connected components.
 
         Args:
-            binary_mask (np.ndarray): 2D array of 0/1 values.
+            binary_mask (xp.ndarray): 2D array of 0/1 values.
 
         Returns:
-            List[np.ndarray]: List of binary masks, one per connected component.
+            List[xp.ndarray]: List of binary masks, one per connected component.
         """
         self.dataset_logger.info("Splitting connected components")
 
         # Ensure binary
-        mask = (binary_mask > 0).astype(np.uint8)
+        if GPU_ENABLED:
+            mask_np = xp.asnumpy(binary_mask > 0).astype(np.uint8)
+        else:
+            mask_np = (binary_mask > 0).astype(np.uint8)
 
         # Label connected components
-        num_labels, labels_im = cv2.connectedComponents(mask, connectivity=8)
+        num_labels, labels_im = cv2.connectedComponents(mask_np, connectivity=8)
 
         # Create masks for each component
         components = []
         for lbl in range(1, num_labels):
             comp_mask = (labels_im == lbl).astype(np.uint8)
-            components.append(comp_mask)
+            components.append(xp.asarray(comp_mask))
 
         self.dataset_logger.info(f"Split into {len(components)} connected components")
         return components
@@ -1518,10 +1561,10 @@ class Preprocessor:
         Remove connected-component masks smaller than the minimum area threshold.
 
         Args:
-            mask_list (List[np.ndarray]): List of binary mask arrays.
+            mask_list (List[xp.ndarray]): List of binary mask arrays.
 
         Returns:
-            List[np.ndarray]: Filtered list where each mask has area >= min_mask_size.
+            List[xp.ndarray]: Filtered list where each mask has area >= min_mask_size.
         """
         self.dataset_logger.info("Filtering small components")
 
@@ -1542,7 +1585,7 @@ class Preprocessor:
         - For single-channel masks, returns True if any label > 1 exists.
 
         Args:
-            mask_array (np.ndarray): Input mask array.
+            mask_array (xp.ndarray): Input mask array.
 
         Returns:
             bool: True if the mask has multiple foreground classes, False otherwise.
@@ -1551,14 +1594,14 @@ class Preprocessor:
         if mask_array.ndim == 3:
             # RGB(A) mask: check unique colours
             pixels = mask_array.reshape(-1, 3)
-            unique = np.unique(pixels, axis=0)
+            unique = xp.unique(pixels, axis=0)
             # Discard pure black background
             bg = [self.background_value] * 3
-            non_background = unique[~np.all(unique == bg, axis=1)]
+            non_background = unique[~xp.all(unique == bg, axis=1)]
             return len(non_background) > 1
         else:
             # Single-channel: any value beyond binary?
-            return np.any(mask_array > 1)
+            return xp.any(mask_array > 1)
         
     def _collapse_mask_to_labels(self, raw_mask, background_value=0):
         """
@@ -1569,24 +1612,24 @@ class Preprocessor:
         pixel values are mapped to positive labels.
 
         Args:
-            raw_mask (np.ndarray): A 2D array of shape (H, W) or a 3D array of
+            raw_mask (xp.ndarray): A 2D array of shape (H, W) or a 3D array of
                 shape (H, W, 3) or (H, W, 4) representing the mask.
             background_value (int, optional): Pixel value to treat as background.
                 Defaults to 0.
 
         Returns:
             tuple:
-                label_map (np.ndarray): A 2D int32 array of shape (H, W) where each
+                label_map (xp.ndarray): A 2D int32 array of shape (H, W) where each
                     value is the assigned label (0..N).
                 palette (dict): Mapping from original color tuples (R, G, B) or
                     intensity tuples (v, v, v) to assigned label integers.
         """
         # 1) Handle true-color inputs
         if raw_mask.ndim == 3 and raw_mask.shape[2] in (3,4):
-            rgb = raw_mask[..., :3].astype(np.uint8)
+            rgb = raw_mask[..., :3].astype(xp.uint8)
             h, w, _ = rgb.shape
             flat = rgb.reshape(-1, 3)
-            unique_cols = np.unique(flat, axis=0)
+            unique_cols = xp.unique(flat, axis=0)
 
             bg = (background_value,)*3
             palette = { bg: 0 }
@@ -1599,9 +1642,9 @@ class Preprocessor:
                 next_lbl += 1
 
             # Build label_map
-            label_map = np.zeros((h, w), dtype=np.int32)
+            label_map = xp.zeros((h, w), dtype=xp.int32)
             for color, lbl in palette.items():
-                mask = np.all(rgb == color, axis=-1)
+                mask = xp.all(rgb == color, axis=-1)
                 label_map[mask] = lbl
 
             return label_map, palette
@@ -1609,12 +1652,13 @@ class Preprocessor:
         # 2) Handle single-channel inputs
         elif raw_mask.ndim == 2:
             self.dataset_logger.info(f"Collapsing mask to labels. Background value: {background_value}")
-            unique_vals = np.unique(raw_mask)
+            unique_vals = xp.unique(raw_mask)
             # Multiclass
-            if len(unique_vals) > 2 or (unique_vals == np.array([0, background_value])).all():
+            bg_check = xp.array([0, background_value], dtype=raw_mask.dtype)
+            if len(unique_vals) > 2 or (unique_vals == bg_check).all():
                 # Map background_value->0, others->1,2,…
                 palette = {}
-                label_map = np.zeros_like(raw_mask, dtype=np.int32)
+                label_map = xp.zeros_like(raw_mask, dtype=xp.int32)
                 next_lbl = 1
                 for v in unique_vals:
                     if v == background_value:
@@ -1633,7 +1677,7 @@ class Preprocessor:
                     (background_value,)*3: 0,
                     (fg_val,)*3: 1
                 }
-                label_map = (raw_mask != background_value).astype(np.int32)
+                label_map = (raw_mask != background_value).astype(xp.int32)
 
             return label_map, palette
 
