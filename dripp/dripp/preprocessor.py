@@ -434,7 +434,7 @@ class Preprocessor:
             # Split & save
             for orig_val, lbl in global_map.items():
                 bin_vol = (chaos_vol == orig_val).astype(xp.uint8)
-                bin_np = xp.asnumpy(bin_vol * lbl)
+                bin_np = xp.asnumpy(bin_vol * lbl) if GPU_ENABLED else xp.array(bin_vol * lbl)
                 itk_lbl = sitk.GetImageFromArray(bin_np)
                 itk_lbl.CopyInformation(img_itk)
                 mask_itk_list.append(itk_lbl)
@@ -481,14 +481,14 @@ class Preprocessor:
                         full_vol[z_idx] = seg_arr.astype(xp.uint8)
 
                     # 4) Wrap back into ITK and copy CT metadata safely 
-                    msk_itk = sitk.GetImageFromArray(xp.asnumpy(full_vol))
+                    msk_itk = sitk.GetImageFromArray(xp.asnumpy(full_vol) if GPU_ENABLED else full_vol)
                     msk_itk.CopyInformation(img_itk)
                 else:
                     # Fallback for non-SEG DICOM masks
                     msk_vol, msk_itk, _ = self.load_mask(mask_series)
                     if msk_vol.ndim == 2:
                         msk_vol = msk_vol[xp.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol))
+                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol) if GPU_ENABLED else msk_vol)
                     msk_itk.CopyInformation(img_itk)
                 mask_itk_list.append(msk_itk)
             else:
@@ -497,7 +497,7 @@ class Preprocessor:
                     msk_vol, msk_itk, _ = self.load_mask(mpath)
                     if msk_vol.ndim == 2:
                         msk_vol = msk_vol[xp.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol))
+                        msk_itk = sitk.GetImageFromArray(xp.asnumpy(msk_vol) if GPU_ENABLED else msk_vol)
                     mask_itk_list.append(msk_itk)
 
             image_itk_list.append(img_itk)
@@ -568,7 +568,7 @@ class Preprocessor:
             # (c) Build a SimpleITK image from the resized mask (either uint8 or int32 may be used;
             # casting to uint8 here is necessary for ConnectedComponent to work as it must be binary,
             # while mask_processed_vol remains int32 for label checking):
-            mask_nifti_raw = sitk.GetImageFromArray(xp.asnumpy(mask_processed_vol.astype(xp.uint8)))
+            mask_nifti_raw = sitk.GetImageFromArray(xp.asnumpy(mask_processed_vol.astype(xp.uint8)) if GPU_ENABLED else mask_processed_vol.astype(xp.uint8))
             mask_nifti_raw.SetSpacing(new_spacing_img)
             mask_nifti_raw.SetOrigin(new_origin_img)
             mask_nifti_raw.SetDirection(orig_dir)
@@ -604,7 +604,7 @@ class Preprocessor:
 
             # 2) Run one connected-component + save routine over all items
             for vol_array, label_val, mask_ref in label_items:
-                itk_lbl = sitk.GetImageFromArray(xp.asnumpy(vol_array.astype(xp.uint8)))
+                itk_lbl = sitk.GetImageFromArray(xp.asnumpy(vol_array.astype(xp.uint8)) if GPU_ENABLED else vol_array.astype(xp.uint8))
                 itk_lbl.CopyInformation(mask_nifti_raw)
 
                 self.dataset_logger.info("Splitting connected components…")
@@ -699,7 +699,7 @@ class Preprocessor:
         frame_h, frame_w = frames[0].shape[:2]
         if mask_frames.shape[1:] != (frame_h, frame_w):
             mask_frames = [
-                cv2.resize(xp.asnumpy(m.astype(xp.uint8)), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                cv2.resize(xp.asnumpy(m.astype(xp.uint8)) if GPU_ENABLED else m.astype(xp.uint8), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
                 for m in mask_frames
             ]
 
@@ -1035,7 +1035,7 @@ class Preprocessor:
             if isinstance(img, sitk.Image):
                 sitk.WriteImage(img, path)
             else:
-                img_np = xp.asnumpy(img)
+                img_np = xp.asnumpy(img) if GPU_ENABLED else img
                 sitk.WriteImage(sitk.GetImageFromArray(img_np), path)
             self.dataset_logger.info(f"Saved 3D NIfTI: {filename} to {out_dir}")
             return path
@@ -1471,8 +1471,9 @@ class Preprocessor:
             gres = cv2.cuda.resize(gmat, (target_w, target_h), interpolation=interp)
             # 4) Download from GPU
             resized_np = gres.download()
-        host_np = xp.asnumpy(data) if GPU_ENABLED else data # cv2 expects numpy
-        resized_np = cv2.resize(host_np, (target_w, target_h), interpolation=interp)
+        else:
+            host_np = xp.asnumpy(data) if GPU_ENABLED else data # cv2 expects numpy
+            resized_np = cv2.resize(host_np, (target_w, target_h), interpolation=interp)
 
         return xp.asarray(resized_np)
 
