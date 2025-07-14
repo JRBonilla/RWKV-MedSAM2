@@ -412,12 +412,12 @@ class Preprocessor:
             msk_vol, msk_itk, _ = self.load_mask(mask_series)
             if msk_vol.ndim == 2:
                 msk_vol = msk_vol[self.xp.newaxis, ...]
-                msk_itk = sitk.GetImageFromArray(msk_vol)
+                msk_itk = sitk.GetImageFromArray(self.xp.asnumpy(msk_vol))
             mask_itk_list.append(msk_itk)
 
             # Build image_itk_list and image_array_list from each modality
             for m_idx, mod_numpy in enumerate(img_vol):
-                mod_itk = sitk.GetImageFromArray(mod_numpy)
+                mod_itk = sitk.GetImageFromArray(self.xp.asnumpy(mod_numpy))
                 mod_itk.CopyInformation(img_itk[m_idx])
                 image_itk_list.append(mod_itk)
                 image_array_list.append(mod_numpy)
@@ -536,7 +536,7 @@ class Preprocessor:
 
             img_processed_vol = self.xp.stack(processed_img_slices, axis=0)
 
-            image_nifti = sitk.GetImageFromArray(img_processed_vol)
+            image_nifti = sitk.GetImageFromArray(self.xp.asnumpy(img_processed_vol) if config.GPU_ENABLED else img_processed_vol)
             new_spacing_img = (
                 orig_sp[0] * (x1 - x0) / self.target_size[0],
                 orig_sp[1] * (y1 - y0) / self.target_size[1],
