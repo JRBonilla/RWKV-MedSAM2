@@ -1,4 +1,5 @@
 import os
+import math
 import gzip
 import cv2
 import re
@@ -1195,7 +1196,7 @@ class Preprocessor:
             x0, x1 = int(xs.min()), int(xs.max()) + 1
 
             # Calculate crop significance
-            orig_vol = self.xp.prod(vol_shape)
+            orig_vol = math.prod(vol_shape)
             crop_vol = (z1 - z0) * (y1 - y0) * (x1 - x0)
             self.is_significant_crop = ((orig_vol - crop_vol) / orig_vol) >= 0.25
 
