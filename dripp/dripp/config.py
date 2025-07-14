@@ -8,17 +8,17 @@ import re
 #------------------------------------------------------------------------------
 # Base directories for indexing and processed outputs
 #------------------------------------------------------------------------------
-# PREPROCESSING_LOG_DIR = "/data/PreprocessingLogs"
-# BASE_UNPROC           = "/data/research/"
-# BASE_PROC             = "/data/Preprocessed/"
-# GROUPS_DIR            = "/data/DatasetIndexes/Groups"
-# INDEX_DIR             = "/data/DatasetIndexes"
+PREPROCESSING_LOG_DIR = "/data/PreprocessingLogs"
+BASE_UNPROC           = "/data/research/"
+BASE_PROC             = "/data/Preprocessed/"
+GROUPS_DIR            = "/data/DatasetIndexes/Groups"
+INDEX_DIR             = "/data/DatasetIndexes"
 
-PREPROCESSING_LOG_DIR = "F:/PreprocessingLogs"
-BASE_UNPROC           = "F:/Datasets/"
-BASE_PROC             = "F:/Preprocessed/"
-GROUPS_DIR            = "F:/DatasetIndexes/Groups"
-INDEX_DIR             = "F:/DatasetIndexes"
+# PREPROCESSING_LOG_DIR = "F:/PreprocessingLogs"
+# BASE_UNPROC           = "F:/Datasets/"
+# BASE_PROC             = "F:/Preprocessed/"
+# GROUPS_DIR            = "F:/DatasetIndexes/Groups"
+# INDEX_DIR             = "F:/DatasetIndexes"
 CSV_FILENAME          = "datasets.csv"
 
 #-------------------------------------------------------------------------------
