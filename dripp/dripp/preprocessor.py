@@ -427,7 +427,7 @@ class Preprocessor:
             mask_slices = []
             for mpath in mask_series:
                 raw, header = self.load_image(mpath)     # raw grayscale (0–255)
-                mask_slices.append(raw)
+                mask_slices.append(self.xp.asarray(raw))
             chaos_vol = self.xp.stack(mask_slices, axis=0)
 
             # Build a single global map
@@ -438,7 +438,7 @@ class Preprocessor:
 
             # Split & save
             for orig_val, lbl in global_map.items():
-                bin_vol = (chaos_vol == orig_val).astype(self.xp.uint8)
+                bin_vol = self.xp.asarray(chaos_vol == orig_val).astype(self.xp.uint8)
                 bin_np = self.xp.asnumpy(bin_vol * lbl) if config.GPU_ENABLED else self.xp.array(bin_vol * lbl)
                 itk_lbl = sitk.GetImageFromArray(bin_np)
                 itk_lbl.CopyInformation(img_itk)
@@ -993,6 +993,7 @@ class Preprocessor:
         Returns:
             self.xp.ndarray: Scaled and cast array.
         """
+        arr = self.xp.asarray(arr)
         a, b = self.xp.nanmin(arr), self.xp.nanmax(arr)
         if b > a:
             scaled = (arr - a) / (b - a)
@@ -1154,7 +1155,10 @@ class Preprocessor:
             # collapse foreground across all modalities.
             if isinstance(vol_data, list):
                 # Stack per-modality volumes and compute foreground mask
-                stacked = self.xp.stack([vol != self.background_value for vol in vol_data], axis=0)  # (M, Z, Y, X)
+                stacked = self.xp.stack([
+                    self.xp.asarray(vol != self.background_value)
+                    for vol in vol_data
+                ], axis=0)  # (M, Z, Y, X)
                 fg_all = self.xp.any(stacked, axis=0)  # (Z, Y, X)
                 vol_shape = fg_all.shape  # (Z, Y, X)
                 if not self.xp.any(fg_all):
@@ -1165,7 +1169,7 @@ class Preprocessor:
 
             else:
                 # vol_data is a single 3D or 2D array
-                vol = vol_data
+                vol = self.xp.asarray(vol_data)
                 # If a 2D slice was loaded as 2D, treat it as single-slice volume
                 if vol.ndim == 2:
                     vol = vol[self.xp.newaxis, ...]
@@ -1183,7 +1187,7 @@ class Preprocessor:
                 else:
                     # vol.ndim == 3 here
                     vol_shape = vol.shape
-                    fg = (vol != self.background_value)
+                    fg = self.xp.asarray(vol != self.background_value)
                     if not self.xp.any(fg):
                         Z, Y, X = vol_shape
                         self.dataset_logger.warning("No foreground found in volume; using full extent")
@@ -1222,6 +1226,7 @@ class Preprocessor:
                 data_list = [img]
 
             for data in data_list:
+                data = self.xp.asarray(data)
                 # Compute a 2D foreground mask for this tile/frame
                 if data.ndim == 3:
                     H, W, C = data.shape
@@ -1347,7 +1352,7 @@ class Preprocessor:
             self.xp.ndarray: Normalized image (float32).
         """
         self.dataset_logger.info(f"Normalizing intensity image with modality={modality}")
-        img = image.astype(self.xp.float32)
+        img = self.xp.asarray(image).astype(self.xp.float32)
 
         if modality == 'ct':
             # CT-specific path
