@@ -1,5 +1,34 @@
 # @package _global_
 
+# ---- DRIPP config -------------------------------------------------------------------
+dripp:
+  output_dir: "/data/Preprocessed"
+  tasks_file: "/data/DatasetIndexes/Tasks/datasets_tasks.json"
+
+# ---- Sequence sampler config -----------------------------------------------------------------
+sampler:
+  seq_len: 8        # Number of frames per training sample
+  max_random: 2     # Maximum number of random frames to drop
+
+# ---- Training config ----------------------------------------------------------------
+training:
+  device: "cuda"    # Device
+  batch_size: 4     # Batch size
+  num_workers: 8    # Number of dataloader workers
+  lr: 1e-4          # Learning rate
+  epochs: 20        # Number of epochs
+
+# ---- Memory bank config -------------------------------------------------------------
+memory_bank:
+  capacity: 16      # Number of previous embeddings to store
+
+# ---- Prompt config ------------------------------------------------------------------
+prompt:
+  max_per_seq: 2    # Maximum number of prompt frames per sequence
+  mask_prob: 0.5    # Probability of generating a full mask
+  click_prob: 0.25  # Probability of generating a positive click
+
+# ---- Model config -------------------------------------------------------------------
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
 
@@ -112,7 +141,7 @@ model:
   # 4) Additional Model Settings
   # ---------------------------
   num_maskmem: 7
-  image_size: 1024
+  image_size: 512
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0
   use_mask_input_as_output_without_sam: true
