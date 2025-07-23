@@ -1,5 +1,7 @@
 # @package _global_
 
+_config_path: "/RWKV-MedSAM2/ext/sam2/configs/sam2.1/sam2.1_vcr.yaml"
+
 # ---- DRIPP config -------------------------------------------------------------------
 dripp:
   output_dir: "/data/Preprocessed"
@@ -16,11 +18,16 @@ training:
   batch_size: 4     # Batch size
   num_workers: 8    # Number of dataloader workers
   lr: 1e-4          # Learning rate
+  warmup_epochs: 5  # Number of warmup epochs
+  seed: 42          # Random seed
+  val_frac: 0.1     # Validation fraction
+  dist_weight: 1.0  # Weight for distillation loss
   epochs: 20        # Number of epochs
 
 # ---- Memory bank config -------------------------------------------------------------
 memory_bank:
   capacity: 16      # Number of previous embeddings to store
+  c_thresh: 0.5     # Confidence threshold
 
 # ---- Prompt config ------------------------------------------------------------------
 prompt:
@@ -31,6 +38,7 @@ prompt:
 # ---- Model config -------------------------------------------------------------------
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
+  ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 
   # ---------------------------
   # 1) Image Encoder
@@ -136,6 +144,12 @@ model:
         layer_scale_init_value: 1e-6
         use_dwconv: true
       num_layers: 2
+
+      # ---------------------------
+      # 4) Teacher settings
+      # ---------------------------
+      teacher:
+        ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
 
   # ---------------------------
   # 4) Additional Model Settings
