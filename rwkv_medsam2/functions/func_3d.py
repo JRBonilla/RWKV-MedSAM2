@@ -177,22 +177,27 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     # Return all losses
     return batch_loss.item(), prompt_loss.item(), non_prompt_loss.item() if non_prompt_loss is not None else None
 
-def validate_step_3d(student, batch, config):
+def validate_step_3d(student, batch, config, return_logits=False):
     """
     Single validation step for 3D (video) data.
 
     Args:
-        student (SAM2VideoPredictor): the student model.
-        batch (dict): a batch dict containing:
+        student (SAM2VideoPredictor): The student model.
+        batch (dict): A batch dict containing:
             'image':   Tensor[1,T,C,H,W]
             'mask':    Tensor[1,T,1,H',W']
             'pt_list': list[T] of Tensor[n,2] or None
             'p_label': list[T] of Tensor[n] or None
             'bbox':    list[T] of Tensor[4] or None
-        config (DictConfig): config with .training.device, .training.out_size, .prompt.max_per_seq
+        config (DictConfig): Config with .training.device, .training.out_size, .prompt.max_per_seq
+        return_logits (bool): Whether to return the predicted logits.
 
     Returns:
-        dict: average metrics {'iou', 'dice', 'hd95'} over all frames.
+        if return_logits:
+            dict: Average metrics {'iou', 'dice', 'hd95'} over all frames.
+            torch.Tensor: Predicted logits for each frame.
+        else:
+            dict: Average metrics {'iou', 'dice', 'hd95'} over all frames.
     """
     device      = config.training.device
     out_size    = config.training.out_size
@@ -251,6 +256,14 @@ def validate_step_3d(student, batch, config):
     mask_seq = batch['mask'][0].to(device).squeeze(1)  # [T, H',W']
     ious, dices, hd95s = [], [], []
 
+    # Assemble raw logits volume and upsample each frame for visualization
+    raw_logits_vol = torch.stack([preds[t] for t in sorted(preds.keys())], dim=0) # [T, Hf, Wf]
+    logits_up = F.interpolate(
+        raw_logits_vol.unsqueeze(1), # [T,1,Hf,Wf]
+        size=(out_size, out_size),
+        mode='bilinear', align_corners=False
+    ).squeeze(1) # [T,H,W]
+
     for t in range(T):
         logit = preds[t].unsqueeze(0).unsqueeze(0)  # [1,1,Hf,Wf]
         prob  = torch.sigmoid(F.interpolate(
@@ -265,12 +278,19 @@ def validate_step_3d(student, batch, config):
             mode='nearest'
         ).long().squeeze(0).squeeze(0)
 
-        ious.append( compute_iou(pred_mask, gt_mask) )
-        dices.append( compute_dice(pred_mask, gt_mask) )
-        hd95s.append( compute_hd95(pred_mask, gt_mask) )
+        # Compute metrics
+        ious.append(compute_iou(pred_mask, gt_mask) )
+        dices.append(compute_dice(pred_mask, gt_mask) )
+        hd95s.append(compute_hd95(pred_mask, gt_mask) )
 
-    return {
+    # 5) Compute average metrics
+    metrics = {
         'iou':  sum(ious)  / T,
         'dice': sum(dices)/ T,
         'hd95': sum(hd95s)/ T,
     }
+
+    if return_logits:
+        return metrics, logits_up.cpu() # [T,H,W]
+    else:
+        return metrics

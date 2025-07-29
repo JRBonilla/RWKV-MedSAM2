@@ -16,7 +16,6 @@ import logging
 
 import cupy as cp  # type: ignore
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -37,6 +36,7 @@ from .functions.func_2d import train_step_2d, validate_step_2d
 from .functions.func_3d import train_step_3d, validate_step_3d
 
 from .dataset import SegmentationSequenceDataset, BalancedTaskSampler, SequenceTransform
+from .utils.vis import visualize_predictions_2d, visualize_nifti_predictions
 
 def load_config(config_path):
     """
@@ -475,7 +475,9 @@ def train_epoch(student, teacher, train_loader, optimizers, scheduler, config, s
 def validate_epoch(student, val_loader, config):
     """
     Run one full validation epoch, calling validate_step_2d or validate_step_3d
-    on each batch and averaging the per‐batch metrics.
+    on each batch and averaging the per-batch metrics.
+
+    Visualizes a single sample from the first batch for both 2D and 3D.
 
     Args:
         student (SAM2VideoPredictor): the student model in eval mode
@@ -497,12 +499,29 @@ def validate_epoch(student, val_loader, config):
 
     # Run validation
     with torch.no_grad():
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
             # Select validation step based on data dimension
             if dim == 2:
-                metrics = validate_step_2d(student, batch, config)
+                # Only visualize first batch
+                if batch_idx == 0:
+                    metrics, logits = validate_step_2d(student, batch, config, return_logits=True)
+                    # Visualize single sample
+                    img = batch['image'][0, 0]
+                    msk = batch['mask'][0, 0]
+                    pred = logits[0]
+                    visualize_predictions_2d(img, msk, pred)
+                else:
+                    metrics = validate_step_2d(student, batch, config)
             else:
-                metrics = validate_step_3d(student, batch, config)
+                # Only visualize first batch
+                if batch_idx == 0:
+                    metrics, logits = validate_step_3d(student, batch, config, return_logits=True)
+                    # Image mask paths from dataset
+                    img_path  = batch['image'][0]
+                    msk_paths = batch['mask'][0]
+                    visualize_nifti_predictions(img_path, msk_paths, logits)
+                else:
+                    metrics = validate_step_3d(student, batch, config)
 
             # Accumulate metrics
             total['iou']  += metrics['iou']

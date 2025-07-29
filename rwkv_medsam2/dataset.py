@@ -65,11 +65,11 @@ class SegmentationSequenceDataset(Dataset):
                 bbox_list.append(prompt['bbox'])    # Tensor[4]
 
         return {
-            'image': imgs,              # Tensor[T,C,H,W]
-            'mask': masks.unsqueeze(1), # Tensor[T,1,H,W]
-            'pt_list': pt_list,         # List[T] of Tensor[n,2] or None
-            'p_label': label_list,      # List[T] of Tensor[n] or None
-            'bbox': bbox_list           # List[T] of Tensor[4] or None
+            'image':   imgs,               # Tensor[T,C,H,W]
+            'mask':    masks.unsqueeze(1), # Tensor[T,1,H,W]
+            'pt_list': pt_list,            # List[T] of Tensor[n,2] or None
+            'p_label': label_list,         # List[T] of Tensor[n] or None
+            'bbox':    bbox_list           # List[T] of Tensor[4] or None
         }
 
     def get_data_dimension(self):

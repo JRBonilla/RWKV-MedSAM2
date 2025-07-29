@@ -189,17 +189,22 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
     return loss.item()
 
-def validate_step_2d(student, batch, config):
+def validate_step_2d(student, batch, config, return_logits=False):
     """
     Single validation step for 2D data.
 
     Args:
-        student (SAM2VideoPredictor): the student model.
-        batch (dict): batch dict with keys 'image', 'mask', 'pt_list', 'p_label'.
-        config (DictConfig): config with .training.device and .training.out_size.
+        student (SAM2VideoPredictor): The student model.
+        batch (dict): Batch dict with keys 'image', 'mask', 'pt_list', 'p_label'.
+        config (DictConfig): Config with .training.device and .training.out_size.
+        return_logits (bool): Whether to return the predicted logits. Default is False.
 
     Returns:
-        dict: average metrics {'iou', 'dice', 'hd95'} for the batch.
+        if return_logits is True:
+            dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
+            torch.Tensor: Predicted logits for the batch.
+        else:
+            dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
     """
     device   = config.training.device
     out_size = config.training.out_size
@@ -256,8 +261,12 @@ def validate_step_2d(student, batch, config):
             high_res_features=hires_feats
         )
 
-        probs = torch.sigmoid(F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False))
-        preds = (probs > 0.5).long().squeeze(1).cpu()  # [B,H,W]
+        # a) Up-sample the raw logits to output size
+        logits_up = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B,1,H,W]
+
+        # b) Compute probabilities and hard predictions for metrics
+        probs = torch.sigmoid(logits_up) # [B,1,H,W]
+        preds = (probs > 0.5).long().squeeze(1).cpu()
         masks = F.interpolate(masks.float().cpu(), size=(out_size, out_size), mode='nearest').long().squeeze(1)  # [B,H,W]
 
     # 4) Metrics
@@ -267,8 +276,15 @@ def validate_step_2d(student, batch, config):
         dice_list.append(compute_dice(preds[i], masks[i]))
         hd95_list.append(compute_hd95(preds[i], masks[i]))
 
-    return {
+    # Compute averages of all metrics
+    metrics = {
         'iou':  sum(iou_list)  / batch_size,
         'dice': sum(dice_list) / batch_size,
         'hd95': sum(hd95_list) / batch_size,
     }
+
+    if return_logits:
+        # Return up-sampled raw logits (on CPU) so validate_epoch can visualize them
+        return metrics, logits_up.squeeze(1).cpu() # [B,H,W]
+    else:
+        return metrics
