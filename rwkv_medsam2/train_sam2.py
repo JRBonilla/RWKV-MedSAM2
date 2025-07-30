@@ -190,17 +190,15 @@ def get_pairings(out_dir, split="train"):
     all_pairs = []
     for ds in datasets:
         ds_dir = os.path.join(out_dir, ds)
-        grp_file = os.path.join(ds_dir, 'groupings.json')
+        grp_file = os.path.join(ds_dir, f'{ds}_groups.json')
         if not os.path.isfile(grp_file):
             print(f"Could not find groupings.json for dataset {ds}")
             continue
         with open(grp_file) as f:
             entries = json.load(f)
         for entry in entries:
-            entry_ident = entry.get('identifier')
-            entry_split = entry_ident.split('_')[0]
             # Skip entries that don't match the split
-            if entry_split != split:
+            if entry.get('split') != split:
                 continue
 
             imgs = entry.get('proc_images', [])
