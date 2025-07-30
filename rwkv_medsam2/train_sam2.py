@@ -248,8 +248,7 @@ def get_pairings(out_dir, split="train"):
                         'mask_classes': entry.get('mask_classes', {}),
                         'pairs': pairs
                     })
-            else:
-                print(f"Could not find image {img_p} for mask {mpath['path']} in dataset {ds} (split {split})")
+    print(f"Found {len(all_pairs)} pairs for {ds} '{split}' split")
     return all_pairs
 
 def get_data_loaders(config):
