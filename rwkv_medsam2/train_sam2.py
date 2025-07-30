@@ -180,18 +180,26 @@ def get_pairings(out_dir, split="train"):
         list: A list of lists, where each inner list contains pairs of image and
               mask paths.
     """
+    try:
+        datasets = sorted(os.listdir(out_dir))
+    except:
+        raise RuntimeError(f"Could not find output directory {out_dir}")
+    print(f"Found {len(datasets)} datasets in {out_dir}")
+
     _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
     all_pairs = []
-    for ds in sorted(os.listdir(out_dir)):
+    for ds in datasets:
         ds_dir = os.path.join(out_dir, ds)
         grp_file = os.path.join(ds_dir, 'groupings.json')
         if not os.path.isfile(grp_file):
+            print(f"Could not find groupings.json for dataset {ds}")
             continue
         with open(grp_file) as f:
             entries = json.load(f)
         for entry in entries:
             # Skip entries that don't match the split
             if entry.get('split') != split:
+                print(f"Skipping entry in {grp_file} with split {entry.get('split')} != {split}")
                 continue
 
             imgs = entry.get('proc_images', [])
@@ -249,25 +257,32 @@ def get_data_loaders(config):
         val_loader (torch.utils.data.DataLoader): The validation data loader.
     """
     # 1) Load all DRIPP pairings
-    all_pairings = get_pairings(config.dripp.output_dir, split='train')
+    train_pairings = get_pairings(config.dripp.output_dir, split='train')
+    test_pairings  = get_pairings(config.dripp.output_dir, split='test')
 
     # 2) Split into train/val by config.training.val_frac
     random.seed(config.training.seed)
-    random.shuffle(all_pairings)
-    n_val       = int(len(all_pairings) * config.training.val_frac)
-    val_pairs   = all_pairings[:n_val]
-    train_pairs = all_pairings[n_val:]
+    random.shuffle(train_pairings)
+    n_val       = int(len(train_pairings) * config.training.val_frac)
+    val_pairs   = train_pairings[:n_val]
+    train_pairs = train_pairings[n_val:]
+    test_pairs  = test_pairings
 
     # 3) Instantiate map-style datasets (with augment only on train)
     train_ds = SegmentationSequenceDataset(pairings=train_pairs, transform=SequenceTransform())
     val_ds   = SegmentationSequenceDataset(pairings=val_pairs, transform=None)
+    test_ds  = SegmentationSequenceDataset(pairings=test_pairs, transform=None)
 
-    # 4) Build a BalancedTaskSampler over the train set
+    # 4) Build a BalancedTaskSampler over the train and test set
     tasks_map = json.load(open(config.dripp.tasks_file))
     train_sampler = BalancedTaskSampler(
         pairings=train_pairs,
         tasks_map=tasks_map,
         seed=config.training.seed
+    )
+    test_sampler = BalancedTaskSampler(
+        pairings=test_pairs,
+        tasks_map=tasks_map
     )
 
     # 5) Return train_loader (with sampler) and val_loader (no sampler, no shuffle)
@@ -285,12 +300,20 @@ def get_data_loaders(config):
         num_workers=config.training.num_workers,
         pin_memory=True
     )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=config.training.batch_size,
+        sampler=test_sampler,
+        num_workers=config.training.num_workers,
+        pin_memory=True
+    )
 
-    # Expose data dimensions for both train and val
+    # Expose data dimensions for train, val, and test
     train_loader.data_dimension = train_ds.data_dimension
-    val_loader.data_dimension = val_ds.data_dimension
+    val_loader.data_dimension   = val_ds.data_dimension
+    test_loader.data_dimension  = test_ds.data_dimension
 
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader
 
 def build_student_predictor(config):
     """
@@ -562,7 +585,7 @@ def main(config_path, resume, multi_gpu, amp):
     logger  = setup_logger(log_cfg)
 
     # 2) Data loaders
-    train_loader, val_loader = get_data_loaders(config)
+    train_loader, val_loader, test_loader = get_data_loaders(config)
 
     # 3) Models
     student = build_student_predictor(config)
