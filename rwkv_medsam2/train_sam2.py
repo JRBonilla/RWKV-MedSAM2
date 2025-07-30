@@ -341,7 +341,7 @@ def build_student_predictor(config):
     """
     video_predictor = build_sam2_video_predictor(
         config_file=config._config_path,
-        ckpt_path=config.model.get('ckpt_path', None),
+        ckpt_path=None,
         device=config.training.device,
         mode='train',
         apply_postprocessing=True,
