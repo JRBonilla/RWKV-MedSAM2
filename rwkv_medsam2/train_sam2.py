@@ -222,7 +222,7 @@ def get_pairings(out_dir, split="train"):
                     idx_map[int(m.group(1))] = img_path
             pairs = []
             for mpath in msks:
-                m = _idx_pattern.search(os.path.basename(mpath))
+                m = _idx_pattern.search(os.path.basename(mpath['path']))
                 if not m:
                     continue
                 img_p = idx_map.get(int(m.group(1)))
