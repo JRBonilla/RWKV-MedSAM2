@@ -169,15 +169,6 @@ model:
         use_dwconv: true
       num_layers: 2
 
-  # --------------------------
-  # 5) Mask Decoder
-  # --------------------------
-  decoder:
-    # Spatial resolutions of the feature‐maps fed into the mask‐decoder
-    feat_sizes:
-      - [64, 64]
-      - [64, 64]
-
   # ---------------------------
   # 6) Additional Model Settings
   # ---------------------------
@@ -205,3 +196,10 @@ model:
   multimask_max_pt_num: 1
   use_mlp_for_obj_ptr_proj: true
   compile_image_encoder: false
+
+# ---- Mask Decoder config -------------------------------------------------------------
+decoder:
+  # Spatial resolutions of the feature‐maps fed into the mask‐decoder
+  feat_sizes:
+    - [64, 64]
+    - [64, 64]

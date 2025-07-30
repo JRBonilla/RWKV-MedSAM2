@@ -30,7 +30,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     """
     # Device and config setup
     device     = config.training.device
-    feat_sizes = config.model.decoder.feat_sizes  # [H, W]
+    feat_sizes = config.decoder.feat_sizes  # [H, W]
     out_size   = config.training.out_size
     pos_weight = config.training.pos_weight
     alpha      = config.training.alpha
@@ -243,7 +243,7 @@ def validate_step_2d(student, batch, config, return_logits=False):
         vision_feats[-1] = vision_feats[-1] + torch.zeros_like(vision_feats[-1])
         vision_pos[-1]   = vision_pos[-1]   + torch.zeros_like(vision_pos[-1])
 
-        feat_sizes = config.model.decoder.feat_sizes
+        feat_sizes = config.decoder.feat_sizes
         feats = [
             feat.permute(1,2,0).view(batch_size, -1, *sz)
             for feat, sz in zip(vision_feats[::-1], feat_sizes[::-1])
