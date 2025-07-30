@@ -227,7 +227,7 @@ def get_pairings(out_dir, split="train"):
                     continue
                 img_p = idx_map.get(int(m.group(1)))
                 if img_p:
-                    pairs.append((img_p, mpath))
+                    pairs.append((img_p, mpath['path']))
             if pairs:
                 # Sort the pairs to ensure temporal order
                 pairs.sort(key=lambda x: int(_idx_pattern.search(os.path.basename(x[0])).group(1)))
