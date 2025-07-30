@@ -1,6 +1,6 @@
 # @package _global_
 
-_config_path: "/RWKV-MedSAM2/ext/sam2/configs/sam2.1/sam2.1_vcr.yaml"
+_config_path: "sam2.1/sam2.1_vcr.yaml"
 
 # ---- DRIPP config -------------------------------------------------------------------
 dripp:
