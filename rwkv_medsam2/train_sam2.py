@@ -197,9 +197,10 @@ def get_pairings(out_dir, split="train"):
         with open(grp_file) as f:
             entries = json.load(f)
         for entry in entries:
+            entry_ident = entry.get('identifier')
+            entry_split = entry_ident.split('_')[0]
             # Skip entries that don't match the split
-            if entry.get('split') != split:
-                print(f"Skipping entry in {grp_file} with split {entry.get('split')} != {split}")
+            if entry_split != split:
                 continue
 
             imgs = entry.get('proc_images', [])
@@ -237,6 +238,8 @@ def get_pairings(out_dir, split="train"):
                         'mask_classes': entry.get('mask_classes', {}),
                         'pairs': pairs
                     })
+            else:
+                print(f"Could not find image {m.group(1)} for mask {mpath} in dataset {ds} (split {split})")
     return all_pairs
 
 def get_data_loaders(config):
@@ -247,7 +250,8 @@ def get_data_loaders(config):
     2) Split into train/val by config.training.val_frac.
     3) Instantiate map-style datasets (with augment only on train).
     4) Build a BalancedTaskSampler over the train set.
-    5) Return train_loader (with sampler) and val_loader (no sampler, no shuffle).
+    5) Return train_loader (with sampler), val_loader (no sampler, no shuffle)
+       and test_loader (no sampler, no shuffle).
 
     Args:
         config (dict): The configuration dictionary.
@@ -255,10 +259,11 @@ def get_data_loaders(config):
     Returns:
         train_loader (torch.utils.data.DataLoader): The train data loader.
         val_loader (torch.utils.data.DataLoader): The validation data loader.
+        test_loader (torch.utils.data.DataLoader): The test data loader.
     """
     # 1) Load all DRIPP pairings
     train_pairings = get_pairings(config.dripp.output_dir, split='train')
-    test_pairings  = get_pairings(config.dripp.output_dir, split='test')
+    test_pairs  = get_pairings(config.dripp.output_dir, split='test')
 
     # 2) Split into train/val by config.training.val_frac
     random.seed(config.training.seed)
@@ -266,12 +271,11 @@ def get_data_loaders(config):
     n_val       = int(len(train_pairings) * config.training.val_frac)
     val_pairs   = train_pairings[:n_val]
     train_pairs = train_pairings[n_val:]
-    test_pairs  = test_pairings
 
     # 3) Instantiate map-style datasets (with augment only on train)
     train_ds = SegmentationSequenceDataset(pairings=train_pairs, transform=SequenceTransform())
-    val_ds   = SegmentationSequenceDataset(pairings=val_pairs, transform=None)
-    test_ds  = SegmentationSequenceDataset(pairings=test_pairs, transform=None)
+    val_ds   = SegmentationSequenceDataset(pairings=val_pairs,   transform=None)
+    test_ds  = SegmentationSequenceDataset(pairings=test_pairs,  transform=None)
 
     # 4) Build a BalancedTaskSampler over the train and test set
     tasks_map = json.load(open(config.dripp.tasks_file))
@@ -285,7 +289,7 @@ def get_data_loaders(config):
         tasks_map=tasks_map
     )
 
-    # 5) Return train_loader (with sampler) and val_loader (no sampler, no shuffle)
+    # 5) Return train_loader (with sampler), val_loader (no sampler, no shuffle), and test_loader (no sampler)
     train_loader = DataLoader(
         train_ds,
         batch_size=config.training.batch_size,
