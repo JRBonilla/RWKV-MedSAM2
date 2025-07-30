@@ -361,7 +361,7 @@ def build_teacher_predictor(config):
         video_predictor (SAM2VideoPredictor): The teacher video predictor.
     """
     video_predictor = build_sam2_video_predictor(
-        config_file=config._config_path,
+        config_file=config.teacher._config_path,
         ckpt_path=config.teacher.ckpt_path,
         device=config.training.device,
         mode='eval',
