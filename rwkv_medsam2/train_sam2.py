@@ -235,9 +235,9 @@ def get_pairings(out_dir, split="train"):
                     for img_p, m_p in pairs:
                         all_pairs.append({
                             'dataset':      ds,
-                            'subdataset':   entry.['subdataset_name'],
-                            'tasks':        entry.['tasks'],
-                            'mask_classes': entry.['mask_classes'],
+                            'subdataset':   entry['subdataset_name'],
+                            'tasks':        entry['tasks'],
+                            'mask_classes': entry['mask_classes'],
                             'pairs':        [(img_p, m_p)]
                         })
                 else:
