@@ -192,10 +192,12 @@ def get_pairings(out_dir, split="train"):
         ds_dir = os.path.join(out_dir, ds)
         grp_file = os.path.join(ds_dir, f'{ds}_groups.json')
         if not os.path.isfile(grp_file):
-            print(f"Could not find groupings.json for dataset {ds}")
+            print(f"Could not find {ds}_groups.json in {ds_dir}")
             continue
         with open(grp_file) as f:
             entries = json.load(f)
+        print(f"Found {len(entries)} entries in {grp_file}. Data type: {type(entries)}")
+        print(f"First entry: {entries[0]}")
         for entry in entries:
             # Skip entries that don't match the split
             if entry.get('split') != split:
