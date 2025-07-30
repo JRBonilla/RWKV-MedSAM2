@@ -197,7 +197,7 @@ def get_pairings(out_dir, split="train"):
         with open(grp_file) as f:
             entries = json.load(f)
         print(f"Found {len(entries)} entries in {grp_file}. Data type: {type(entries)}")
-        print(f"First entry: {entries[0]}")
+        print(entries)
         for entry in entries:
             # Skip entries that don't match the split
             if entry.get('split') != split:
