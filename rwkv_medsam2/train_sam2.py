@@ -189,15 +189,25 @@ def get_pairings(out_dir, split="train"):
     _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
     all_pairs = []
     for ds in datasets:
+        # Check if dataset grouping json exists
         ds_dir = os.path.join(out_dir, ds)
         grp_file = os.path.join(ds_dir, f'{ds}_groups.json')
         if not os.path.isfile(grp_file):
             print(f"Could not find {ds}_groups.json in {ds_dir}")
             continue
-        with open(grp_file) as f:
-            entries = json.load(f)
-        print(f"Found {len(entries)} entries in {grp_file}. Data type: {type(entries)}")
-        print(entries)
+
+        # Parse the groups file
+        raw_data = json.load(open(grp_file, 'r'))
+        entries  = []
+        for sub in raw_data.get("subdatasets", []):
+            for entry in sub.get(split, []):
+                # Carry over subdataset name
+                if "subdataset_name" not in entry:
+                    entry["subdataset_name"] = sub.get("name", "default")
+                entries.append(entry)
+        print(f"Found {len(entries)} '{split}' entries in {grp_file}")
+
+        # Pair each mask with its corresponding image
         for entry in entries:
             # Skip entries that don't match the split
             if entry.get('split') != split:
