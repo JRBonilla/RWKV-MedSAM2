@@ -201,9 +201,9 @@ def get_pairings(out_dir, split="train"):
         entries  = []
         for sub in raw_data.get("subdatasets", []):
             for entry in sub.get(split, []):
-                # Carry over subdataset name
-                if "subdataset_name" not in entry:
-                    entry["subdataset_name"] = sub.get("name", "default")
+                entry["subdataset_name"] = sub.get("name", "default")
+                entry["tasks"]           = sub.get("tasks", [])
+                entry["mask_classes"]    = sub.get("mask_classes", [])
                 entries.append(entry)
         print(f"Found {len(entries)} '{split}' entries in {grp_file}")
 
@@ -234,19 +234,19 @@ def get_pairings(out_dir, split="train"):
                 if len(pairs) > 1 and get_extension(pairs[0][0]) == '.png':
                     for img_p, m_p in pairs:
                         all_pairs.append({
-                            'dataset': ds,
-                            'subdataset': entry.get('subdataset_name'),
-                            'tasks': entry.get('tasks', []),
-                            'mask_classes': entry.get('mask_classes', {}),
-                            'pairs': [(img_p, m_p)] # Single frame 2D
+                            'dataset':      ds,
+                            'subdataset':   entry.['subdataset_name'],
+                            'tasks':        entry.['tasks'],
+                            'mask_classes': entry.['mask_classes'],
+                            'pairs':        [(img_p, m_p)]
                         })
                 else:
                     all_pairs.append({
-                        'dataset': ds,
-                        'subdataset': entry.get('subdataset_name'),
-                        'tasks': entry.get('tasks', []),
-                        'mask_classes': entry.get('mask_classes', {}),
-                        'pairs': pairs
+                        'dataset':      ds,
+                        'subdataset':   entry['subdataset_name'],
+                        'tasks':        entry['tasks'],
+                        'mask_classes': entry['mask_classes'],
+                        'pairs':        pairs
                     })
     print(f"Found {len(all_pairs)} pairs for {ds} '{split}' split")
     return all_pairs
