@@ -249,7 +249,7 @@ def get_pairings(out_dir, split="train"):
                         'pairs': pairs
                     })
             else:
-                print(f"Could not find image {img_p} for mask {mpath} in dataset {ds} (split {split})")
+                print(f"Could not find image {img_p} for mask {mpath['path']} in dataset {ds} (split {split})")
     return all_pairs
 
 def get_data_loaders(config):
