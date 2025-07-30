@@ -186,11 +186,12 @@ class BalancedTaskSampler(Sampler):
 
         # Precompute valid indices per task
         for task_id, info in self.tasks_map.items():
+            task_classes = set(info['classes'])
             valid_idxs = []
             for idx, pair in enumerate(self.pairings):
                 ds, sd = pair['dataset'], pair.get('subdataset')
                 if ds in info['datasets'] and sd in info['datasets'][ds]:
-                    if set(pair.get('mask_classes', {}).keys()) & info['classes']:
+                    if set(pair.get('mask_classes', {}).keys()) & task_classes:
                         valid_idxs.append(idx)
             if valid_idxs:
                 self.by_task[task_id] = valid_idxs

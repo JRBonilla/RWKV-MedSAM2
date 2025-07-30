@@ -272,7 +272,7 @@ def get_data_loaders(config):
     """
     # 1) Load all DRIPP pairings
     train_pairings = get_pairings(config.dripp.output_dir, split='train')
-    test_pairs  = get_pairings(config.dripp.output_dir, split='test')
+    test_pairs     = get_pairings(config.dripp.output_dir, split='test')
 
     # 2) Split into train/val by config.training.val_frac
     random.seed(config.training.seed)
