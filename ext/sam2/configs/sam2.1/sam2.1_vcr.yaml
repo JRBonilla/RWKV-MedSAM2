@@ -54,6 +54,12 @@ logging:
 # ---- Checkpoint config --------------------------------------------------------------
 ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 
+
+# ---- Teacher settings ---------------------------------------------------------------
+teacher:
+  ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
+
+
 # ---- Model config -------------------------------------------------------------------
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
@@ -162,12 +168,6 @@ model:
         layer_scale_init_value: 1e-6
         use_dwconv: true
       num_layers: 2
-
-  # ---------------------------
-  # 4) Teacher settings
-  # ---------------------------
-  teacher:
-    ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
 
   # --------------------------
   # 5) Mask Decoder

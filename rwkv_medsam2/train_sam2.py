@@ -362,7 +362,7 @@ def build_teacher_predictor(config):
     """
     video_predictor = build_sam2_video_predictor(
         config_file=config._config_path,
-        ckpt_path=config.model.teacher.ckpt_path,
+        ckpt_path=config.teacher.ckpt_path,
         device=config.training.device,
         mode='eval',
         apply_postprocessing=True,
