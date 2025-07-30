@@ -203,7 +203,7 @@ def get_pairings(out_dir, split="train"):
             for entry in sub.get(split, []):
                 entry["subdataset_name"] = sub.get("name", "default")
                 entry["tasks"]           = sub.get("tasks", [])
-                entry["mask_classes"]    = sub.get("mask_classes", [])
+                entry["mask_classes"]    = sub.get("classes", [])
                 entries.append(entry)
         print(f"Found {len(entries)} '{split}' entries in {grp_file}")
 
