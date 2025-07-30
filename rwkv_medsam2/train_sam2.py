@@ -295,7 +295,8 @@ def get_data_loaders(config):
     )
     test_sampler = BalancedTaskSampler(
         pairings=test_pairs,
-        tasks_map=tasks_map
+        tasks_map=tasks_map,
+        seed=config.training.seed
     )
 
     # 5) Return train_loader (with sampler), val_loader (no sampler, no shuffle), and test_loader (no sampler)
