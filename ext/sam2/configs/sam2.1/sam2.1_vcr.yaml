@@ -51,10 +51,12 @@ logging:
   interval: 5
   backups: 7
 
+# ---- Checkpoint config --------------------------------------------------------------
+ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
+
 # ---- Model config -------------------------------------------------------------------
 model:
   _target_: sam2.modeling.sam2_base.SAM2Base
-  ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 
   # ---------------------------
   # 1) Image Encoder
