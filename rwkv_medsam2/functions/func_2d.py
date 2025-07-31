@@ -108,12 +108,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        hires_feats = feats
-
-        transformer_dim = student.sam_prompt_encoder.embed_dim  # 256
-        proj = torch.nn.Conv2d(64, transformer_dim, 1).to(image_embed.device)
-        image_embed = proj(image_embed)
-        hires_feats  = [proj(f) for f in hires_feats]
+        hires_feats = feats[:-1]
 
         # Upsample + channel-match dense prompt embedding to match image embeddings 
         _, C_img, H_feat, W_feat = image_embed.shape
@@ -163,7 +158,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 for f, size in zip(teacher_feats[::-1], feat_sizes[::-1])
             ][::-1]
             teacher_embed = t_feats[-1]
-            teacher_hires_feats = t_feats
+            teacher_hires_feats = t_feats[:-1]
 
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
