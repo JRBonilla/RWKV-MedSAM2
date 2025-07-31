@@ -57,7 +57,7 @@ ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 
 # ---- Teacher settings ---------------------------------------------------------------
 teacher:
-  _config_path: "sam2/sam2_hiera_s.yaml"
+  _config_path: "sam2/sam2_hiera_t.yaml"
   ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
 
 # ---- Model config -------------------------------------------------------------------
