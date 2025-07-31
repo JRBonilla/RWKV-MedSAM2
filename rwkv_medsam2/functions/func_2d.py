@@ -59,7 +59,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     # 3) Encode prompts
     sparse_embs, _ = student.sam_prompt_encoder(
         points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-        boxes=None, masks=None, batch_size=batch_size
+        boxes=None, masks=None
     )
     dense_embs = student.sam_prompt_encoder.get_dense_pe()
 
@@ -232,7 +232,7 @@ def validate_step_2d(student, batch, config, return_logits=False):
     with torch.no_grad():
         sparse_embs, _ = student.sam_prompt_encoder(
             points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-            boxes=None, masks=None, batch_size=batch_size
+            boxes=None, masks=None
         )
         dense_embs = student.sam_prompt_encoder.get_dense_pe()
 
