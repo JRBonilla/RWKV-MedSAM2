@@ -75,7 +75,7 @@ class SegmentationSequenceDataset(Dataset):
     def get_data_dimension(self):
         img0 = normalize_path(self.pairings[0]['pairs'][0][0])
         ext = get_extension(img0)
-        dim = 3 if len(self.pairings[0]['pairs']) == 1 and ext in {'.nii', '.nii.gz'} else 2
+        dim = 3 if ext in {'.nii', '.nii.gz'} else 2
         print(f"Dimension: {dim}, Extension: {ext}")
         return dim
 
