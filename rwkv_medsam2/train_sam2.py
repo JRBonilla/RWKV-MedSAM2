@@ -299,6 +299,11 @@ def get_data_loaders(config):
         val_groups[key]   = pairs[:n_val]
         train_groups[key] = pairs[n_val:]
 
+    # Remove empty groups
+    train_groups = {k: v for k, v in train_groups.items() if v}
+    val_groups   = {k: v for k, v in val_groups.items()   if v}
+    test_groups  = {k: v for k, v in test_groups.items()  if v}
+
     # 4) Load DRIPP tasks map
     tasks_map = json.load(open(config.dripp.tasks_file, 'r'))
 
