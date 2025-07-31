@@ -110,22 +110,21 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
-        # Upsample + channel-match dense prompt embedding to match image embeddings 
-        _, C_img, H_feat, W_feat = image_embed.shape
-        # 1) Spatial resize
+        # 1) Spatially resize dense prompt PE to H_feat x W_feat
         if dense_embs.shape[-2:] != (H_feat, W_feat):
             dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-        # 2) Channel-match: slice or pad the prompt channels to equal the image channels
-        C_dense = dense_embs.size(1)
-        if C_dense > C_img:
-            dense_embs = dense_embs[:, :C_img, :, :]
-        elif C_dense < C_img:
+
+        # 2) Make image_embed match the transformer_dim (C_dense == 256)
+        C_dense = dense_embs.size(1)  # 256
+        if C_img > C_dense:
+            image_embed = image_embed[:, :C_dense, :, :]
+        elif C_img < C_dense:
             pad = torch.zeros(
-                (1, C_img - C_dense, H_feat, W_feat),
-                dtype=dense_embs.dtype,
-                device=dense_embs.device
+                (batch_size, C_dense - C_img, H_feat, W_feat),
+                dtype=image_embed.dtype,
+                device=image_embed.device
             )
-            dense_embs = torch.cat([dense_embs, pad], dim=1)
+            image_embed = torch.cat([image_embed, pad], dim=1)
 
         # —— DEBUGGING ——
         print(f"DEBUG: image_embed shape = {image_embed.shape}")
