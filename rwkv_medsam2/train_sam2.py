@@ -14,6 +14,8 @@ import math
 import random
 import logging
 
+from collections import defaultdict
+
 import cupy as cp  # type: ignore
 import torch
 from torch.utils.data import DataLoader
@@ -253,81 +255,75 @@ def get_pairings(out_dir, split="train"):
 
 def get_data_loaders(config):
     """
-    Create train and validation data loaders.
+    Given a config object, this function will create a set of train, val, and test
+    data loaders using the DRIPP pairings. The function works as follows:
 
-    1) Load all DRIPP pairings.
-    2) Split into train/val by config.training.val_frac.
-    3) Instantiate map-style datasets (with augment only on train).
-    4) Build a BalancedTaskSampler over the train set.
-    5) Return train_loader (with sampler), val_loader (no sampler, no shuffle)
-       and test_loader (no sampler, no shuffle).
+    1) Load all DRIPP pairings for the train and test splits.
+    2) Group each set of pairings by (dataset, subdataset).
+    3) Split each train group into train/val using the val_frac parameter.
+    4) Load the DRIPP tasks map.
+    5) Build a dataset + loader for each group.
 
     Args:
-        config (dict): The configuration dictionary.
-
+        config: A config object with the following attributes:
+            - dripp.output_dir: The output directory for the DRIPP pairings.
+            - training.seed: The seed to use for shuffling the train and val sets.
+            - training.val_frac: The fraction of the train set to use for validation.
+            - training.batch_size: The batch size to use for all data loaders.
+            - training.num_workers: The number of workers to use for all data loaders.
     Returns:
-        train_loader (torch.utils.data.DataLoader): The train data loader.
-        val_loader (torch.utils.data.DataLoader): The validation data loader.
-        test_loader (torch.utils.data.DataLoader): The test data loader.
+        tuple: A tuple of (train_loaders, val_loaders, test_loaders), where each
+               loader is a dict mapping (dataset, subdataset) to a DataLoader instance.
     """
-    # 1) Load all DRIPP pairings
     train_pairings = get_pairings(config.dripp.output_dir, split='train')
+    # 1) Load all DRIPP pairings
     test_pairs     = get_pairings(config.dripp.output_dir, split='test')
 
-    # 2) Split into train/val by config.training.val_frac
-    random.seed(config.training.seed)
-    random.shuffle(train_pairings)
-    n_val       = int(len(train_pairings) * config.training.val_frac)
-    val_pairs   = train_pairings[:n_val]
-    train_pairs = train_pairings[n_val:]
+    # 2) Group by (dataset, subdataset).
+    train_groups = defaultdict(list)
+    for pair in train_pairings:
+        key = (p['dataset'], p.get('subdataset', ''))
+        train_groups[key].append(pair)
 
-    # 3) Instantiate map-style datasets (with augment only on train)
-    train_ds = SegmentationSequenceDataset(pairings=train_pairs, transform=SequenceTransform())
-    val_ds   = SegmentationSequenceDataset(pairings=val_pairs,   transform=None)
-    test_ds  = SegmentationSequenceDataset(pairings=test_pairs,  transform=None)
+    test_groups = defaultdict(list)
+    for pair in test_pairs:
+        key = (p['dataset'], p.get('subdataset', ''))
+        test_groups[key].append(pair)
 
-    # 4) Build a BalancedTaskSampler over the train and test set
-    tasks_map = json.load(open(config.dripp.tasks_file))
-    train_sampler = BalancedTaskSampler(
-        pairings=train_pairs,
-        tasks_map=tasks_map,
-        seed=config.training.seed
-    )
-    test_sampler = BalancedTaskSampler(
-        pairings=test_pairs,
-        tasks_map=tasks_map,
-        seed=config.training.seed
-    )
+    # 3) Split each train group into train/val
+    val_groups = {}
+    for key, pairs in train_groups.items():
+        random.seed(config.training.seed)
+        random.shuffle(pairs)
+        n_val = int(len(pairs) * config.training.val_frac)
+        val_groups[key]   = pairs[:n_val]
+        train_groups[key] = pairs[n_val:]
 
-    # 5) Return train_loader (with sampler), val_loader (no sampler, no shuffle), and test_loader (no sampler)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.training.batch_size,
-        sampler=train_sampler,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=config.training.batch_size,
-        sampler=test_sampler,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
+    # 4) Load DRIPP tasks map
+    tasks_map = json.load(open(config.dripp.tasks_map, 'r'))
 
-    # Expose data dimensions for train, val, and test
-    train_loader.data_dimension = train_ds.data_dimension
-    val_loader.data_dimension   = val_ds.data_dimension
-    test_loader.data_dimension  = test_ds.data_dimension
+    # 5) Build dataset + loader for each group
+    train_loaders = {}
+    val_loaders   = {}
+    test_loaders  = {}
 
-    return train_loader, val_loader, test_loader
+    for key, pairs in train_groups.items():
+        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
+        sampler = BalancedTaskSampler(pairs, tasks_map, config.training.seed)
+        loader = DataLoader(ds, batch_size=config.training.batch_size, sampler=sampler, num_workers=config.training.num_workers, pin_memory=True)
+        train_loaders[key] = loader
+
+    for key, pairs in val_groups.items():
+        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
+        loader = DataLoader(ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
+        val_loaders[key] = loader
+
+    for key, pairs in test_groups.items():
+        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
+        loader = DataLoader(ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
+        test_loaders[key] = loader
+
+    return train_loaders, val_loaders, test_loaders
 
 def build_student_predictor(config):
     """
@@ -599,15 +595,22 @@ def main(config_path, resume, multi_gpu, amp):
     logger  = setup_logger(log_cfg)
 
     # 2) Data loaders
-    train_loader, val_loader, test_loader = get_data_loaders(config)
+    train_loaders, val_loaders, test_loaders = get_data_loaders(config)
 
     # 3) Models
     student = build_student_predictor(config)
     teacher = build_teacher_predictor(config)
 
     # 4) optimizer + scheduler + scaler
-    dim = train_loader.dataset.data_dimension
-    optimizers, scheduler = setup_optimizer_and_scheduler(student.model, config, dim)
+    # 2D optimizer + scheduler
+    opt2d_cfg = setup_optimizer_and_scheduler(student, config, data_dimension=2)
+    optimizer2d, sched2d = opt2d_cfg['optimizers'][0], opt2d_cfg['scheduler']
+
+    # 3D optimizer + scheduler
+    opt3d_cfg = setup_optimizer_and_scheduler(student, config, data_dimension=3)
+    mask_decoder_opt, memory_opt = opt3d_cfg['optimizers']
+    sched3d = opt3d_cfg['scheduler']
+
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # Unpack optimizers
@@ -619,55 +622,50 @@ def main(config_path, resume, multi_gpu, amp):
     # 5) Multi-GPU setup
     if multi_gpu and torch.cuda.device_count() > 1:
         logger.info(f"Using {torch.cuda.device_count()} GPUs")
-        student.model = torch.nn.DataParallel(student.model)
-        teacher.model = torch.nn.DataParallel(teacher.model)
+        student = torch.nn.DataParallel(student)
+        teacher = torch.nn.DataParallel(teacher)
 
     # 6) Load from checkpoint if resuming
     ckpt_mgr = CheckpointManager(config.training.output_dir)
     start_ep = 0
     if resume:
-        start_ep, opt1_state, opt2_state, sched_state = ckpt_mgr.load(resume, student.model)
-        if dim == 2:
-            optimizer2d.load_state_dict(opt1_state)
-        else:
-            mask_decoder_opt.load_state_dict(opt1_state)
-            memory_opt.load_state_dict(opt2_state)
-        scheduler.load_state_dict(sched_state)
+        start_ep, opt1_state, opt2_state, sched_state = ckpt_mgr.load(resume, student)
+        # load checkpoint weights into both 2D and 3D optimizers/schedulers
+        optimizer2d.load_state_dict(opt1_state)
+        mask_decoder_opt.load_state_dict(opt1_state)
+        memory_opt.load_state_dict(opt2_state)
+        sched2d.load_state_dict(sched_state)
+        sched3d.load_state_dict(sched_state)
         logger.info(f"Resumed from epoch {start_ep}")
 
-    # 7) Training loop
+    # 7) Training and validation loops over each sub-dataset
     train_loss, val_metrics = None, None
     for epoch in range(start_ep, int(config.training.epochs)):
-        train_loss = train_epoch(student, teacher, train_loader, optimizers, scheduler, config, scaler, epoch, logger)
-        
-        # 8) Validation
-        if epoch % config.training.val_freq == 0 or epoch == int(config.training.epochs) - 1:
-            val_metrics = validate_epoch(student, val_loader, config)
-            # 9) Save latest and best checkpoint (check for 2D vs 3D)
+        # Train: Iterate through all 2D and 3D loaders
+        for key, loader in train_loaders.items():
+            dim = loader.dataset.data_dimension
             if dim == 2:
-                ckpt_mgr.save_latest(student.model, optimizer2d, optimizer2d, scheduler, epoch)
-                ckpt_mgr.save_best(  student.model, optimizer2d, optimizer2d, scheduler, epoch, val_metrics["iou"])
+                train_loss[key] = train_epoch(student, teacher, loader, [optimizer2d], sched2d, config, scaler, epoch, logger)
             else:
-                ckpt_mgr.save_latest(student.model, mask_decoder_opt, memory_opt, scheduler, epoch)
-                ckpt_mgr.save_best(  student.model, mask_decoder_opt, memory_opt, scheduler, epoch, val_metrics["iou"])
+                train_loss[key] = train_epoch(student, teacher, loader, [mask_decoder_opt, memory_opt], sched3d, config, scaler, epoch, logger)
 
-        # 10) Logging
-        # Training metrics
-        if train_loss["avg_prompt_loss"] is None and train_loss["avg_non_prompt_loss"] is None:
-            logger.info(f"Epoch {epoch} summary:"
-                        f"train_batch_loss: {train_loss['avg_batch_loss']:.4f}")
-        else:
-            logger.info(f"Epoch {epoch} summary:"
-                        f"train_batch_loss: {train_loss['avg_batch_loss']:.4f}, "
-                        f"train_prompt_loss: {train_loss['avg_prompt_loss']:.4f}, "
-                        f"train_non_prompt_loss: {train_loss['avg_non_prompt_loss']:.4f}")
+        # Step both schedulers once per epoch
+        sched2d.step()
+        sched3d.step()
 
-        # Validation metrics
-        if val_metrics is not None:
-            logger.info(f"Epoch {epoch} validation summary:"
-                        f"iou: {val_metrics['iou']:.4f}, "
-                        f"dice: {val_metrics['dice']:.4f}, "
-                        f"hd95: {val_metrics['hd95']:.4f}")
+        # Validation: Evaluate each loader at the configured frequency
+        if epoch % config.training.val_freq == 0 or epoch == int(config.training.epochs) - 1:
+            for key, loader in val_loaders.items():
+                dim = loader.dataset.data_dimension
+                val_metrics[key] = validate_epoch(student, loader, config)
+
+                # Save per-modality checkpoints
+                if dim == 2:
+                    ckpt_mgr.save_latest(student, optimizer2d, optimizer2d, sched2d, epoch)
+                    ckpt_mgr.save_best(  student, optimizer2d, optimizer2d, sched2d, epoch, val_metrics[key]['iou'])
+                else:
+                    ckpt_mgr.save_latest(student, mask_decoder_opt, memory_opt, sched3d, epoch)
+                    ckpt_mgr.save_best(  student, mask_decoder_opt, memory_opt, sched3d, epoch, val_metrics[key]['iou'])
 
     logger.info("Training complete.")
 
