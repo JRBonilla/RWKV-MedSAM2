@@ -169,6 +169,13 @@ model:
         use_dwconv: true
       num_layers: 2
 
+    # 4) Mask decoder
+    mask_decoder:
+      hidden_dim: 256
+      transformer:
+        dim_model: 256
+        kv_in_dim: 256
+
   # ---------------------------
   # 6) Additional Model Settings
   # ---------------------------
