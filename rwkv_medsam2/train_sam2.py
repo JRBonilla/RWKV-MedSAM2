@@ -91,7 +91,7 @@ def setup_logger(log_cfg):
     logger.setLevel(getattr(logging, log_cfg.level.upper()))
 
     # Stream (console) handler
-    ch = logger.StreamHandler()
+    ch = logging.StreamHandler()
     ch.setLevel(getattr(logging, log_cfg.level.upper()))
 
     # File handler
