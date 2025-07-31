@@ -104,7 +104,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         # 6) Decode mask
         feats = [
-            feat.permute(1,2,0).reshape(batch_size, -1, *size)
+            feat.permute(1,2,0).view(batch_size, -1, *size)
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
@@ -152,14 +152,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         with torch.no_grad():
             teacher_backbone       = teacher.forward_image(imgs)
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
-            # Mirror student feature construction for teacher
-            t_feats = [
-                f.permute(1, 2, 0).reshape(batch_size, -1, *size)
-                for f, size in zip(teacher_feats[::-1], feat_sizes[::-1])
-            ][::-1]
-            teacher_embed = t_feats[-1]
-            teacher_hires_feats = t_feats[:-1]
-
+            teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
+            teacher_hires_feats    = [f.permute(1,2,0).view(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
                 image_pe=teacher.sam_prompt_encoder.get_dense_pe(),
