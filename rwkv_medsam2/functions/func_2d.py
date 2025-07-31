@@ -104,11 +104,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         # 6) Decode mask
         feats = [
-            feat.permute(1,2,0).view(batch_size, -1, *size)
+            feat.permute(1,2,0).reshape(batch_size, -1, *size)
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        hires_feats = feats[:-1]
+        hires_feats = feats
 
         transformer_dim = student.sam_prompt_encoder.embed_dim  # 256
         proj = torch.nn.Conv2d(64, transformer_dim, 1).to(image_embed.device)
@@ -142,13 +142,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         print(f"DEBUG: k_proj weight shape = {tuple(w.shape)}")
         # ————————
 
-        # If we don’t have two high-res feature maps, turn off that branch
-        if len(hires_feats) < 2 and hasattr(student.sam_mask_decoder, "use_high_res_features"):
-            student.sam_mask_decoder.use_high_res_features = False
-            hr_feats = None
-        else:
-            hr_feats = hires_feats
-
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
@@ -156,7 +149,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             dense_prompt_embeddings=dense_embs,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=hr_feats
+            high_res_features=hires_feats
         )
         student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
@@ -164,8 +157,14 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         with torch.no_grad():
             teacher_backbone       = teacher.forward_image(imgs)
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
-            teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
-            teacher_hires_feats    = [f.permute(1,2,0).view(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
+            # Mirror student feature construction for teacher
+            t_feats = [
+                f.permute(1, 2, 0).reshape(batch_size, -1, *size)
+                for f, size in zip(teacher_feats[::-1], feat_sizes[::-1])
+            ][::-1]
+            teacher_embed = t_feats[-1]
+            teacher_hires_feats = t_feats
+
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
                 image_pe=teacher.sam_prompt_encoder.get_dense_pe(),
