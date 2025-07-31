@@ -201,6 +201,6 @@ model:
 decoder:
   # Spatial resolutions of the feature‐maps fed into the mask‐decoder
   feat_sizes:
-    - [256, 256] # High-resolution feature map
-    - [128, 128] # Middle-resolution feature map
-    - [ 64,  64] # Coarsest-resolution feature map
+    - [128, 128] # High-resolution feature map
+    - [ 64,  64] # Middle-resolution feature map
+    - [ 32,  32] # Coarsest-resolution feature map
