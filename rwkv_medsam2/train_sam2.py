@@ -433,7 +433,7 @@ def setup_optimizer_and_scheduler(model, config, data_dimension):
         list(model.obj_ptr_proj.parameters()) +
         list(model.memory_encoder.parameters()) +
         list(model.memory_attention.parameters()) +
-        list(model.mask_downsampler.parameters())
+        list(model.mask_downsample.parameters())
     )
 
     # 2) Build optimizers
