@@ -282,12 +282,12 @@ def get_data_loaders(config):
     # 2) Group by (dataset, subdataset).
     train_groups = defaultdict(list)
     for pair in train_pairings:
-        key = (p['dataset'], p.get('subdataset', ''))
+        key = (pair['dataset'], pair.get('subdataset', ''))
         train_groups[key].append(pair)
 
     test_groups = defaultdict(list)
     for pair in test_pairs:
-        key = (p['dataset'], p.get('subdataset', ''))
+        key = (pair['dataset'], pair.get('subdataset', ''))
         test_groups[key].append(pair)
 
     # 3) Split each train group into train/val
