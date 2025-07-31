@@ -168,7 +168,7 @@ model:
         layer_scale_init_value: 1e-6
         use_dwconv: true
       num_layers: 2
-      
+
   # ---------------------------
   # 6) Additional Model Settings
   # ---------------------------
@@ -201,5 +201,6 @@ model:
 decoder:
   # Spatial resolutions of the feature‐maps fed into the mask‐decoder
   feat_sizes:
-    - [64, 64]
-    - [64, 64]
+    - [64, 64] # High-resolution feature map
+    - [64, 64] # Middle-resolution feature map
+    - [64, 64] # Coarsest-resolution feature map
