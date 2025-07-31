@@ -156,7 +156,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
-                image_pe=teacher.sam_prompt_encoder.get_dense_pe(),
+                image_pe=dense_embs,
                 sparse_prompt_embeddings=sparse_embs,
                 dense_prompt_embeddings=dense_embs,
                 multimask_output=False,
