@@ -300,7 +300,7 @@ def get_data_loaders(config):
         train_groups[key] = pairs[n_val:]
 
     # 4) Load DRIPP tasks map
-    tasks_map = json.load(open(config.dripp.tasks_map, 'r'))
+    tasks_map = json.load(open(config.dripp.tasks_file, 'r'))
 
     # 5) Build dataset + loader for each group
     train_loaders = {}
