@@ -367,7 +367,7 @@ def build_teacher_predictor(config):
         mode='eval',
         apply_postprocessing=True,
     )
-    video_predictor.model.eval()
+    video_predictor.eval()
     return video_predictor
 
 def setup_optimizer_and_scheduler(model, config, data_dimension):
