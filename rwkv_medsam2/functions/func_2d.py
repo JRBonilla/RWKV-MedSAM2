@@ -110,6 +110,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
+        # Upsample dense embeddings to match feature map size
+        _, _, H_feat, W_feat = image_embed.shape
+        if dense_embs.shape[-2:] != (H_feat, W_feat):
+            dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
