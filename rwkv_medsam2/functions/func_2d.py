@@ -142,6 +142,13 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         print(f"DEBUG: k_proj weight shape = {tuple(w.shape)}")
         # ————————
 
+        # If we don’t have two high-res feature maps, turn off that branch
+        if len(hires_feats) < 2 and hasattr(student.sam_mask_decoder, "use_high_res_features"):
+            student.sam_mask_decoder.use_high_res_features = False
+            hr_feats = None
+        else:
+            hr_feats = hires_feats
+
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
@@ -149,7 +156,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             dense_prompt_embeddings=dense_embs,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=hires_feats
+            high_res_features=hr_feats
         )
         student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
