@@ -18,7 +18,7 @@ training:
   batch_size: 4          # Batch size
   num_workers: 8         # Number of dataloader workers
   lr: 1e-4               # Default Learning rate
-  prompt_lr: 1e-4        # Prompt learning rate\
+  mem_lr: 1e-4           # Memory learning rate\
   mask_lr: 1e-8          # Mask learning rate
   weight_decay: 0.0      # Weight decay
   warmup_epochs: 5       # Number of warmup epochs
