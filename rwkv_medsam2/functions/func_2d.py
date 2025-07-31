@@ -110,6 +110,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
+        transformer_dim = student.sam_prompt_encoder.embed_dim  # 256
+        proj = torch.nn.Conv2d(64, transformer_dim, 1).to(image_embed.device)
+        image_embed = proj(image_embed)
+        hires_feats  = [proj(f) for f in hires_feats]
+
         # Upsample + channel-match dense prompt embedding to match image embeddings 
         _, C_img, H_feat, W_feat = image_embed.shape
         # 1) Spatial resize
