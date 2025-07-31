@@ -127,6 +127,16 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             )
             dense_embs = torch.cat([dense_embs, pad], dim=1)
 
+        # —— DEBUGGING ——
+        print(f"DEBUG: image_embed shape = {image_embed.shape}")
+        print(f"DEBUG: dense_pe   shape = {dense_embs.shape}")
+        print(f"DEBUG: sparse_embs shape = {None if sparse_embs is None else sparse_embs.shape}")
+        # grab the first cross-attn layer’s k_proj to see what it expects:
+        w = student.sam_mask_decoder.transformer.layers[0] \
+                .cross_attn_token_to_image.k_proj.weight
+        print(f"DEBUG: k_proj weight shape = {tuple(w.shape)}")
+        # ————————
+
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
