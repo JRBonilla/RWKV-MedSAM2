@@ -71,7 +71,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     student.train()
     optimizer.zero_grad()
 
-    with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         # 5) Forward + memory attention
         backbone_out = student.forward_image(imgs)
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
