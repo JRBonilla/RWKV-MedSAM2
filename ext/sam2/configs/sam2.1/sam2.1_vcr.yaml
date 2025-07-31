@@ -168,10 +168,7 @@ model:
         layer_scale_init_value: 1e-6
         use_dwconv: true
       num_layers: 2
-
-  sam_mask_decoder_extra_args:
-    iou_head_hidden_dim: 256
-
+      
   # ---------------------------
   # 6) Additional Model Settings
   # ---------------------------
