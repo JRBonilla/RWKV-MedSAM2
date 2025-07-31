@@ -110,10 +110,22 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
-        # Upsample dense embeddings to match feature map size
-        _, _, H_feat, W_feat = image_embed.shape
+        # Upsample + channel-match dense prompt embedding to match image embeddings 
+        _, C_img, H_feat, W_feat = image_embed.shape
+        # 1) Spatial resize
         if dense_embs.shape[-2:] != (H_feat, W_feat):
             dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+        # 2) Channel-match: slice or pad the prompt channels to equal the image channels
+        C_dense = dense_embs.size(1)
+        if C_dense > C_img:
+            dense_embs = dense_embs[:, :C_img, :, :]
+        elif C_dense < C_img:
+            pad = torch.zeros(
+                (1, C_img - C_dense, H_feat, W_feat),
+                dtype=dense_embs.dtype,
+                device=dense_embs.device
+            )
+            dense_embs = torch.cat([dense_embs, pad], dim=1)
 
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
