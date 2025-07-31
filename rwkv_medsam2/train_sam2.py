@@ -183,9 +183,11 @@ def get_pairings(out_dir, split="train"):
               mask paths.
     """
     try:
-        datasets = sorted(os.listdir(out_dir))
+        entries = sorted(os.listdir(out_dir))
     except:
         raise RuntimeError(f"Could not find output directory {out_dir}")
+    # Filter out non-directories
+    datasets = [dataset for dataset in entries if os.path.isdir(os.path.join(out_dir, dataset))]
     print(f"Found {len(datasets)} datasets in {out_dir}")
 
     _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
