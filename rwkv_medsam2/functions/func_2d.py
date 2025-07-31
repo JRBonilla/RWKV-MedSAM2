@@ -153,7 +153,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_backbone       = teacher.forward_image(imgs)
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
-            teacher_hires_feats    = [f.permute(1,2,0).view(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
+            teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
                 image_pe=teacher.sam_prompt_encoder.get_dense_pe(),
