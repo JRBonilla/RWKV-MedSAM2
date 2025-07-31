@@ -83,6 +83,7 @@ class SegmentationSequenceDataset(Dataset):
             i_arr = sitk.GetArrayFromImage(sitk.ReadImage(imp_p))
             m_arr = sitk.GetArrayFromImage(sitk.ReadImage(msk_p))
             im_t, ms_t = self._to_tensor(i_arr, m_arr)
+            print(f"Image shape: {im_t.shape}, Mask shape: {ms_t.shape}")
             if self.transform:
                 im_t, ms_t = self.transform(im_t, ms_t)
             imgs.append(im_t)
