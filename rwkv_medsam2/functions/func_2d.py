@@ -111,6 +111,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         hires_feats = feats[:-1]
 
         # 1) Spatially resize dense prompt PE to H_feat x W_feat
+        _, C_img, H_feat, W_feat = image_embed.shape
         if dense_embs.shape[-2:] != (H_feat, W_feat):
             dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
 
