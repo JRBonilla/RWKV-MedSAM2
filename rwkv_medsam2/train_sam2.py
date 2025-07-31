@@ -614,12 +614,6 @@ def main(config_path, resume, multi_gpu, amp):
 
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
-    # Unpack optimizers
-    if dim == 2:
-        optimizer2d = optimizers[0]
-    else:
-        mask_decoder_opt, memory_opt = optimizers
-
     # 5) Multi-GPU setup
     if multi_gpu and torch.cuda.device_count() > 1:
         logger.info(f"Using {torch.cuda.device_count()} GPUs")
