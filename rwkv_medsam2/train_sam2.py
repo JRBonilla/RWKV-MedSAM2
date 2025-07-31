@@ -323,6 +323,7 @@ def get_data_loaders(config):
         loader = DataLoader(ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
         test_loaders[key] = loader
 
+    print(f"Created {len(train_loaders)} train loaders, {len(val_loaders)} val loaders, and {len(test_loaders)} test loaders.")
     return train_loaders, val_loaders, test_loaders
 
 def build_student_predictor(config):
