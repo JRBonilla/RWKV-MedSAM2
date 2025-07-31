@@ -50,26 +50,28 @@ class SegmentationSequenceDataset(Dataset):
         else:
             imgs, masks = self._load_2d_sequence([(normalize_path(i), normalize_path(m)) for i, m in pairs])
 
-        # Generate prompts per slice
+        # Generate prompts per slice (return empty tensors if no prompt)
         pt_list, label_list, bbox_list = [], [], []
         T = masks.shape[0]
         for t in range(T):
             prompt = generate_prompt(masks[t], prompt_type=self.prompt_type)
             if 'points' in prompt:
-                pt_list.append(prompt['points'])    # Tensor[n,2]
-                label_list.append(prompt['labels']) # Tensor[n]
-                bbox_list.append(None)
+                pt_list.append(prompt['points'])     # Tensor[n,2]
+                label_list.append(prompt['labels'])  # Tensor[n]
+                # Empty bbox tensor so default_collate can stack
+                bbox_list.append(torch.empty((0, 4), dtype=torch.int64))
             else:
-                pt_list.append(None)
-                label_list.append(None)
-                bbox_list.append(prompt['bbox'])    # Tensor[4]
+                # Empty point tensor so default_collate can stack
+                pt_list.append(torch.empty((0, 2), dtype=torch.int64))
+                label_list.append(torch.empty((0,),   dtype=torch.int64))
+                bbox_list.append(prompt['bbox'])       # Tensor[4]
 
         return {
             'image':   imgs,               # Tensor[T,C,H,W]
             'mask':    masks.unsqueeze(1), # Tensor[T,1,H,W]
-            'pt_list': pt_list,            # List[T] of Tensor[n,2] or None
-            'p_label': label_list,         # List[T] of Tensor[n] or None
-            'bbox':    bbox_list           # List[T] of Tensor[4] or None
+            'pt_list': pt_list,            # List[T] of Tensor[n,2]
+            'p_label': label_list,         # List[T] of Tensor[n]
+            'bbox':    bbox_list           # List[T] of Tensor[4]
         }
 
     def get_data_dimension(self):
