@@ -127,7 +127,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             student.sam_mask_decoder.adapter_s1(hires_feats[1])
         ]
 
-        student_logits, student_iou, *_ = student.sam_mask_decoder(
+        student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
             sparse_prompt_embeddings=sparse_embs,
@@ -186,6 +186,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         current_vision_feats=vision_feats,
         feat_sizes=feat_sizes,
         pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False),
+        object_score_logits=student_object_score_logits,
         is_mask_from_pts=(sparse_points is not None)
     )
     new_feats = new_feats.to(torch.bfloat16).to(device)
