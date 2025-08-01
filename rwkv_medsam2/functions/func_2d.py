@@ -176,7 +176,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         # Segmentation loss
         mask_target = masks.to(student_pred.dtype)
         pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
-        seg_loss = F.binary_cross_entropy_with_logits(student_pred, masks, pos_weight=pw)
+        seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
 
         dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
         loss = alpha * seg_loss + (1-alpha) * dis_loss
