@@ -182,6 +182,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         loss = alpha * seg_loss + (1-alpha) * dis_loss
 
     # 9) Memory encode and update
+
+    # Cast mask down-sampler to student's dtype
+    mask_downsampler = student.memory_encoder.mask_downsampler
+    student.memory_encoder.mask_downsampler = mask_downsampler.to(device=device, dtype=student_pred.dtype)
+
     new_feats, new_pos = student._encode_new_memory(
         current_vision_feats=vision_feats,
         feat_sizes=feat_sizes,
