@@ -54,7 +54,11 @@ class SegmentationSequenceDataset(Dataset):
         pt_list, label_list, bbox_list = [], [], []
         T = masks.shape[0]
         for t in range(T):
-            prompt = generate_prompt(masks[t], prompt_type=self.prompt_type)
+            mask_slice = masks[t]
+            # If has an extra channel dimension, squeeze it out
+            if mask_slice.ndim == 3 and mask_slice.size(0) == 1:
+              mask_slice = mask_slice.squeeze(0) # now [H,W]
+            prompt = generate_prompt(mask_slice, prompt_type=self.prompt_type)
             if 'points' in prompt:
                 pt_list.append(prompt['points'])     # Tensor[n,2]
                 label_list.append(prompt['labels'])  # Tensor[n]
@@ -314,6 +318,10 @@ class SequenceTransform:
             torch.Tensor: Transformed image.
             torch.Tensor: Transformed mask.
         """
+        # Ensure mask has a channel dimension so torchvision transforms work
+        if mask.ndim == 2:
+          mask = mask.unsqueeze(0) # Now [1,H,W]
+        
         _, h, w = image.shape
         if self.do_rotate:
             image = TF.rotate(image, self.angle, interpolation=TF.InterpolationMode.BILINEAR)

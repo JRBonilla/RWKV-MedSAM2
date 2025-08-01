@@ -105,7 +105,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
             with torch.no_grad():
                 teacher.train_add_new_mask(teacher_state, frame_idx, 0, mask_t)
 
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast('cuda'):
         # 5) Propagate through video
         student_preds = {}
         for frame_idx, obj_ids, mask_logits in student.train_propagate_in_video(train_state, start_frame_idx=0):

@@ -521,7 +521,7 @@ def train_epoch(student, teacher, train_loader, optimizers, scheduler, config, s
 
     # detect 2D vs 3D
     dim = train_loader.dataset.data_dimension  # 2 or 3
-    progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
+    progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", leave=False)
 
     for batch in progress:
         if dim == 2:
@@ -656,9 +656,9 @@ def main(config_path, resume, multi_gpu, amp):
     student = build_student_predictor(config)
     teacher = build_teacher_predictor(config)
 
-    # Attach adapters
-    attach_highres_adapters(student, config, device=config.training.device, dtype=torch.bfloat16 if amp else torch.float32)
-    attach_highres_adapters(teacher, config, device=config.training.device, dtype=torch.bfloat16)
+    # Attach adapters (disabled for now)
+    # attach_highres_adapters(student, config, device=config.training.device, dtype=torch.bfloat16 if amp else torch.float32)
+    # attach_highres_adapters(teacher, config, device=config.training.device, dtype=torch.bfloat16)
 
     # 4) optimizer + scheduler + scaler
     # 2D optimizer + scheduler
@@ -670,7 +670,7 @@ def main(config_path, resume, multi_gpu, amp):
     mask_decoder_opt, memory_opt = opt3d_cfg['optimizers']
     sched3d = opt3d_cfg['scheduler']
 
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp)
 
     # 5) Multi-GPU setup
     if multi_gpu and torch.cuda.device_count() > 1:

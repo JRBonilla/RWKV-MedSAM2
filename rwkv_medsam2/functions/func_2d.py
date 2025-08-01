@@ -116,7 +116,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     optimizer.zero_grad()
 
     torch.autograd.set_detect_anomaly(True)
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
         # 5) Forward + memory attention
         backbone_out = student.forward_image(imgs)
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
@@ -130,16 +130,26 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             banks = torch.stack([e[3] for e in memory_bank], dim=0)
             banks = F.normalize(banks, p=2, dim=1)
             sims  = (banks @ F.normalize(curr, p=2, dim=1).t()).t()
+            
             idx   = torch.multinomial(F.softmax(sims, dim=1), num_samples=1).squeeze(1)
-            sel_f = mem_feats[:, idx, :].permute(1,2,0)
-            sel_p = mem_pos[:, idx, :].permute(1,2,0)
-            vision_feats[-1], vision_pos[-1] = student.memory_attention(
+            
+            batch_mem_feats = mem_feats[idx] # [B,C,H,W]
+            batch_mem_pos   = mem_pos[idx]   # [B,C,H,W]
+            
+            B,C,H,W = batch_mem_feats.shape
+            S = H * W
+            # -> [B,C,S] -> permute to [S,B,C]
+            
+            sel_f = batch_mem_feats.reshape(B,C,S).permute(2,0,1)
+            sel_p = batch_mem_pos.reshape(  B,C,S).permute(2,0,1)
+            updated_feats = student.memory_attention(
                 curr=[vision_feats[-1]],
                 curr_pos=[vision_pos[-1]],
                 memory=sel_f,
                 memory_pos=sel_p,
                 num_obj_ptr_tokens=0
             )
+            vision_feats[-1] = updated_feats
         else:
             # If no memory yet, add a zero key/value so memory_attention always has something to attend to
             zeros_f = torch.zeros_like(vision_feats[-1])
@@ -164,7 +174,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         image_pe = image_pe.clone()
         
-        print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
+        # print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
 
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
@@ -215,6 +225,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         # 8) Compute losses
         # Segmentation loss
         mask_target = masks.to(student_pred.dtype).clone()
+        if mask_target.dim() == student_pred.dim() + 1:
+          mask_target = mask_target.squeeze(2) # [B,1,1,H,W] -> [B,1,W,H]
         pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
         seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
 
