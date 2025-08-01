@@ -72,6 +72,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     student.train()
     optimizer.zero_grad()
 
+    torch.autograd.set_detect_anomaly(True)
+
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         # 5) Forward + memory attention
         backbone_out = student.forward_image(imgs)
