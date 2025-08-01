@@ -101,11 +101,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         sparse_points = sparse_labels = None
 
     # 3) Encode prompts
-    sparse_embs, _ = student.sam_prompt_encoder(
+    sparse_embs, dense_embs = student.sam_prompt_encoder(
         points=(sparse_points, sparse_labels) if sparse_points is not None else None,
         boxes=None, masks=None
     )
-    dense_embs = student.sam_prompt_encoder.get_dense_pe()
+    image_pe = student.sam_prompt_encoder.get_dense_pe()
 
     # 4) Mixed precision + TF32
     if torch.cuda.get_device_properties(0).major >= 8:
@@ -156,7 +156,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
-            image_pe=dense_embs,
+            image_pe=image_pe,
             sparse_prompt_embeddings=sparse_embs,
             dense_prompt_embeddings=dense_embs,
             multimask_output=False,
@@ -172,14 +172,14 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
 
-            teacher_sparse_embs, _ = teacher.sam_prompt_encoder(
+            teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
                 points=(sparse_points, sparse_labels) if sparse_points is not None else None,
                 boxes=None, masks=None
             )
-            teacher_dense_embs     = teacher.sam_prompt_encoder.get_dense_pe()
+            teacher_image_pe     = teacher.sam_prompt_encoder.get_dense_pe()
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
-                image_pe=teacher_dense_embs,
+                image_pe=teacher_image_pe,
                 sparse_prompt_embeddings=teacher_sparse_embs,
                 dense_prompt_embeddings=teacher_dense_embs,
                 multimask_output=False,
