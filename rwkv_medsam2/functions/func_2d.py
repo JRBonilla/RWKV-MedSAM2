@@ -152,13 +152,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        raw_feat_hr, raw_feat_mr = feats[:-1] # [feat_hr, feat_mr]
-
-        # Use built-in high-res adapters in mask decoder
-        hires_feats = [
-            student.sam_mask_decoder.conv_s0(raw_feat_hr),
-            student.sam_mask_decoder.conv_s1(raw_feat_mr)
-        ]
+        hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
