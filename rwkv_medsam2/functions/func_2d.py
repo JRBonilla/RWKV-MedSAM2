@@ -157,6 +157,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         # Resize dense prompt embeddings
         dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
 
+        print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
+
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=image_pe,
