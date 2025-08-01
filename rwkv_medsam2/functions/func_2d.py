@@ -181,45 +181,46 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
         loss = alpha * seg_loss + (1-alpha) * dis_loss
 
-# 9) Memory encode and update
-new_feats, new_pos = student._encode_new_memory(
-    current_vision_feats=vision_feats,
-    feat_sizes=feat_sizes,
-    pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False),
-    object_score_logits=student_object_score_logits,
-    is_mask_from_pts=(sparse_points is not None)
-)
-new_feats = new_feats.to(torch.bfloat16).to(device)
-new_pos   = new_pos[0].to(torch.bfloat16).to(device)
+    # 9) Memory encode and update
+    with torch.cuda.amp.autocast(enabled=False):
+        new_feats, new_pos = student._encode_new_memory(
+            current_vision_feats=vision_feats,
+            feat_sizes=feat_sizes,
+            pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False),
+            object_score_logits=student_object_score_logits,
+            is_mask_from_pts=(sparse_points is not None)
+        )
+    new_feats = new_feats.to(torch.bfloat16).to(device)
+    new_pos   = new_pos[0].to(torch.bfloat16).to(device)
 
-# Update memory
-for i in range(batch_size):
-    entry = [
-        new_feats[i:i+1].detach(),          # Features
-        new_pos[i:i+1].detach(),            # Position embeddings
-        student_iou[i,0].item(),            # IoU
-        image_embed[i].reshape(-1).detach() # Image embedding
-    ]
-    # Only add automatically if memory bank is not full
-    # Otherwise, replace the least similar entry
-    if len(memory_bank) < capacity:
-        memory_bank.append(entry)
-    else:
-        flats = torch.stack([e[0].reshape(-1) for e in memory_bank]) # Flatten entries in memory bank
-        flats_norm = F.normalize(flats, p=2, dim=1)                  # Normalize
-        new_flat   = entry[0].reshape(-1)                            # Flatten new entry
-        sims_vec   = flats_norm @ F.normalize(new_flat, p=2, dim=0)  # Compute similarity of new entry with all others
-        min_idx    = torch.argmin(sims_vec)                          # Get index of least similar
-        sim_mat    = flats_norm @ flats_norm.t()                     # Compute similarity matrix
-        sim_mat.fill_diagonal_(-float('inf'))                        # Set diagonal to -inf so we don't replace with self
+    # Update memory
+    for i in range(batch_size):
+        entry = [
+            new_feats[i:i+1].detach(),          # Features
+            new_pos[i:i+1].detach(),            # Position embeddings
+            student_iou[i,0].item(),            # IoU
+            image_embed[i].reshape(-1).detach() # Image embedding
+        ]
+        # Only add automatically if memory bank is not full
+        # Otherwise, replace the least similar entry
+        if len(memory_bank) < capacity:
+            memory_bank.append(entry)
+        else:
+            flats = torch.stack([e[0].reshape(-1) for e in memory_bank]) # Flatten entries in memory bank
+            flats_norm = F.normalize(flats, p=2, dim=1)                  # Normalize
+            new_flat   = entry[0].reshape(-1)                            # Flatten new entry
+            sims_vec   = flats_norm @ F.normalize(new_flat, p=2, dim=0)  # Compute similarity of new entry with all others
+            min_idx    = torch.argmin(sims_vec)                          # Get index of least similar
+            sim_mat    = flats_norm @ flats_norm.t()                     # Compute similarity matrix
+            sim_mat.fill_diagonal_(-float('inf'))                        # Set diagonal to -inf so we don't replace with self
 
-        # Only add new entry if all of the following are true:
-        # - IoU is greater than least similar IoU
-        # - Similarity is greater than least similar
-        # - IoU is greater than threshold
-        if entry[2] >= memory_bank[min_idx][2] - 0.1 and sims_vec[min_idx] < sim_mat[min_idx].max():
-            if entry[2] >= c_thresh:
-                memory_bank[min_idx] = entry # Replace least similar entry
+            # Only add new entry if all of the following are true:
+            # - IoU is greater than least similar IoU
+            # - Similarity is greater than least similar
+            # - IoU is greater than threshold
+            if entry[2] >= memory_bank[min_idx][2] - 0.1 and sims_vec[min_idx] < sim_mat[min_idx].max():
+                if entry[2] >= c_thresh:
+                    memory_bank[min_idx] = entry # Replace least similar entry
 
     # 10) Backward and step
     scaler.scale(loss).backward()
