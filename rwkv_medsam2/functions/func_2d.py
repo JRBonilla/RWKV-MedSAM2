@@ -155,9 +155,15 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
+        image_embed = image_embed.clone()
+        hires_feats = [hf.clone() for hf in hires_feats]
+        sparse_embs = sparse_embs.clone()
+
         # Resize dense prompt embeddings
         dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False).clone()
 
+        image_pe = image_pe.clone()
+        
         print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
 
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
