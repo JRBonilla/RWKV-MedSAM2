@@ -76,6 +76,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         # 5) Forward + memory attention
         backbone_out = student.forward_image(imgs)
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
+        student.memory_encoder = student.memory_encoder.to(device=device, dtype=torch.bfloat16)
+        teacher.memory_encoder = teacher.memory_encoder.to(device=device, dtype=torch.bfloat16)
 
         if memory_bank:
             # Build [tokens, B, C] memory + pos
