@@ -145,11 +145,22 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
             
+            # Pull out mask decoder's upscaling layers to find target out-channels
+            dc1, ln1, act1, dc2, act2 = teacher.sam_mask_decoder.output_upscaling
+            target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
+            target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
+
+            if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
+                in_ch_s1 = teacher_hires_feats[1].shape[1]
+                in_ch_s0 = teacher_hires_feats[0].shape[1]
+                teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
+                teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
+
             teacher_hires_feats = [
-                student.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
-                student.sam_mask_decoder.adapter_s1(teacher_hires_feats[1])
+                teacher.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
+                teacher.sam_mask_decoder.adapter_s1(teacher_hires_feats[1])
             ]
-            
+
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
                 image_pe=dense_embs,
