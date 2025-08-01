@@ -100,7 +100,7 @@ model:
         normalize: true
         scale: null
         temperature: 10000
-      d_model: 256
+      d_model: 128
       backbone_channel_list: [256, 128, 64, 112]
       fpn_top_down_levels: [2, 3]
       fpn_interp_model: nearest
