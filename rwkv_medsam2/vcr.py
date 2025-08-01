@@ -59,7 +59,7 @@ class VCRStem(nn.Module):
         )
 
         self.norm = norm_layer(out_channels, eps=norm_eps)
-        self.act = act_layer(inplace=True)
+        self.act = act_layer(inplace=False)
     
     def forward(self, x):
         # Process input through stem block with 2x spatial reduction
@@ -110,7 +110,7 @@ class FusedMbConv(nn.Module):
             bias=False
         )
         self.fused_bn = norm_layer(hidden_dim)
-        self.fused_act = act_layer(inplace=True)
+        self.fused_act = act_layer(inplace=False)
 
         # Projection layer (1x1 convolution + BN) if needed
         if self.expand or (out_channels != in_channels):
@@ -141,7 +141,7 @@ class FusedMbConv(nn.Module):
             x = self.fused_act(x)
 
         if self.use_res_connect:
-            x += identity
+            x = x + identity
 
         return x
 
@@ -225,7 +225,7 @@ class MbConv(nn.Module):
                 bias=False
             )
             self.expand_bn = norm_layer(hidden_dim)
-            self.expand_act = act_layer(inplace=True)
+            self.expand_act = act_layer(inplace=False)
 
         self.dw_conv = nn.Conv2d(
             in_channels=hidden_dim if self.expand else in_channels,
@@ -237,7 +237,7 @@ class MbConv(nn.Module):
             bias=False
         )
         self.dw_bn = norm_layer(hidden_dim)
-        self.dw_act = act_layer(inplace=True)
+        self.dw_act = act_layer(inplace=False)
 
         self.project_conv = nn.Conv2d(
             in_channels=hidden_dim,
@@ -396,19 +396,19 @@ class RWKVBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, patch_resolution: tuple) -> torch.Tensor:
         def _inner_forward(t):
-            # --- Sub-block A: Spatial Mix with residual ---
+            # --- Sub-block A: Spatial Mix with residual (out-of-place) ---
             t_norm = self.norm1(t)
             out_spatial = self.spatial_mix(t_norm, patch_resolution)
             if self.use_layer_scale:
-                out_spatial *= self.gamma1
-            t += self.drop_path(out_spatial)
+                out_spatial = out_spatial * self.gamma1
+            t = t + self.drop_path(out_spatial)
 
-            # --- Sub-block B: Channel Mix with residual ---
+            # --- Sub-block B: Channel Mix with residual (out-of-place) ---
             t_norm = self.norm2(t)
             out_channel = self.channel_mix(t_norm, patch_resolution)
             if self.use_layer_scale:
-                out_channel *= self.gamma2
-            t += self.drop_path(out_channel)
+                out_channel = out_channel * self.gamma2
+            t = t + self.drop_path(out_channel)
 
             return t
         if self.with_cp and x.requires_grad:

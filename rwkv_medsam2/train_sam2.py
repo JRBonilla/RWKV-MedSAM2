@@ -13,6 +13,8 @@ import json
 import math
 import random
 import logging
+import argparse
+import pickle
 
 from collections import defaultdict
 
@@ -332,6 +334,51 @@ def get_data_loaders(config):
 
     print(f"Created {len(train_loaders)} train loaders, {len(val_loaders)} val loaders, and {len(test_loaders)} test loaders.")
     return train_loaders, val_loaders, test_loaders
+
+def save_data_loaders(save_path, train_loaders, val_loaders, test_loaders):
+    """
+    Save train, validation, and test DataLoader collections to disk via pickle.
+
+    Args:
+        save_path (str): Path to the output .pkl file.
+        train_loaders (dict): Mapping (dataset, subdataset) -> train DataLoaders.
+        val_loaders   (dict): Mapping (dataset, subdataset) -> validation DataLoaders.
+        test_loaders  (dict): Mapping (dataset, subdataset) -> test DataLoaders.
+    """
+    # Ensure target directory exists
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Serialize all three loader dicts in one file
+    with open(save_path, "wb") as f:
+        pickle.dump({
+            "train_loaders": train_loaders,
+            "val_loaders":   val_loaders,
+            "test_loaders":  test_loaders,
+        }, f)
+
+
+def load_data_loaders(load_path):
+    """
+    Load train, validation, and test DataLoader collections from a pickle file.
+
+    Args:
+        load_path (str): Path to the .pkl file created by save_data_loaders.
+
+    Returns:
+        tuple:
+            - train_loaders (dict): Mapping (dataset, subdataset) -> train DataLoaders.
+            - val_loaders   (dict): Mapping (dataset, subdataset) -> validation DataLoaders.
+            - test_loaders  (dict): Mapping (dataset, subdataset) -> test DataLoaders.
+    """
+    with open(load_path, "rb") as f:
+        data = pickle.load(f)
+
+    return (
+        data["train_loaders"],
+        data["val_loaders"],
+        data["test_loaders"],
+    )
+
 
 def build_student_predictor(config):
     """
@@ -676,8 +723,6 @@ def main(config_path, resume, multi_gpu, amp):
     logger.info("Training complete.")
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to config YAML")
     parser.add_argument("--resume", default=None, help="Path to checkpoint")
