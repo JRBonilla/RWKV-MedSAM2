@@ -154,11 +154,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
-        hires_feats = [
-            student.sam_mask_decoder.adapter_s0(hires_feats[0]),
-            student.sam_mask_decoder.adapter_s1(hires_feats[1])
-        ]
-
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=dense_embs,
@@ -176,11 +171,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
-
-            teacher_hires_feats = [
-                teacher.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
-                teacher.sam_mask_decoder.adapter_s1(teacher_hires_feats[1])
-            ]
 
             teacher_logits, _, *_  = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
