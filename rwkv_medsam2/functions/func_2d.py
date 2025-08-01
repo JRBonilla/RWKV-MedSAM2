@@ -151,8 +151,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             feat.permute(1,2,0).view(batch_size, -1, *size)
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
-        image_embed = feats[0]
-        hires_feats = feats[1:] # [feat_mr, feat_hr]
+        image_embed = feats[-1]
+        hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
         # Resize dense prompt embeddings
         dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
