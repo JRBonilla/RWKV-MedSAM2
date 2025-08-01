@@ -3,6 +3,7 @@
 # student-teacher distillation in the RWKV-MedSAM2 model.
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .func_metrics import compute_iou, compute_dice, compute_hd95
@@ -108,12 +109,23 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        hires_feats = feats[:-1]
+        hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
-        # Spatially resize dense prompt PE to H_feat x W_feat
-        _, C_img, H_feat, W_feat = image_embed.shape
-        if dense_embs.shape[-2:] != (H_feat, W_feat):
-            dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+        # Pull out mask decoder's upscaling layers to find target out-channels
+        dc1, ln1, act1, dc2, act2 = student.sam_mask_decoder.output_upscaling
+        target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
+        target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
+
+        if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
+            in_ch_s1 = hires_feats[1].shape[1]
+            in_ch_s0 = hires_feats[0].shape[1]
+            student_sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
+            student_sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
+
+        hires_feats = [
+            student_sam_mask_decoder.adapter_s0(hires_feats[0]),
+            student_sam_mask_decoder.adapter_s1(hires_feats[1])
+        ]
 
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
