@@ -115,6 +115,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     student.train()
     optimizer.zero_grad()
 
+    torch.autograd.set_detect_anomaly(True)
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         # 5) Forward + memory attention
         backbone_out = student.forward_image(imgs)
@@ -255,7 +256,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                     memory_bank[min_idx] = entry # Replace least similar entry
 
     # 10) Backward and step
-    torch.autograd.set_detect_anomaly(True)
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     scaler.update()
