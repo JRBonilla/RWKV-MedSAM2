@@ -192,7 +192,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_dense_embs = proj(teacher_dense_embs)
             teacher_image_pe   = teacher.sam_prompt_encoder.get_dense_pe()
             
-            print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}")
+            print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}, teacher image pe: {teacher_image_pe.shape}")
 
             teacher_logits, _, *_ = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
