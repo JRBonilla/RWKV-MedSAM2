@@ -437,7 +437,7 @@ def setup_optimizer_and_scheduler(model, config, data_dimension):
     )
 
     # 2) Build optimizers
-    mask_decoder_opt= AdamW(
+    mask_decoder_opt = AdamW(
         sam_layers,
         lr=float(config.training.mask_lr),
         weight_decay=float(config.training.weight_decay)

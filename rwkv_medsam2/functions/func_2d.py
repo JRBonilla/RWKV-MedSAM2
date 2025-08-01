@@ -177,8 +177,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 feat.permute(1,2,0).reshape(batch_size, -1, *size)
                 for feat, size in zip(teacher_feats[::-1], t_sizes)
             ][::-1]
-            teacher_embed       = feats_t[0]
-            teacher_hires_feats = feats_t[1:]
+            teacher_embed       = feats_t[-1]
+            teacher_hires_feats = feats_t[:-1]
 
             teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
                 points=(sparse_points, sparse_labels) if sparse_points is not None else None,
@@ -193,7 +193,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 dense_prompt_embeddings=teacher_dense_embs,
                 multimask_output=False,
                 repeat_image=False,
-                high_res_features=teacher_hires_feats
+                high_res_features=False
             )
             teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
