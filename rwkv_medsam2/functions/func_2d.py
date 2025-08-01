@@ -182,13 +182,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_embed       = feats_t[-1]
             teacher_hires_feats = feats_t[:-1]
 
-            # Project teacher embedding to match dense prompt embedding
-            teacher_embed = nn.Conv2d(in_channels=teacher_embed.shape[1], out_channels=tea_embed.shape[3], kernel_size=1).to(device)(teacher_embed)
-
             teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
                 points=(sparse_points, sparse_labels) if sparse_points is not None else None,
                 boxes=None, masks=None
             )
+            teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
             teacher_image_pe   = teacher.sam_prompt_encoder.get_dense_pe()
             
             print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}")
