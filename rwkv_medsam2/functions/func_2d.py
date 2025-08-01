@@ -119,8 +119,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
             in_ch_s1 = hires_feats[1].shape[1]
             in_ch_s0 = hires_feats[0].shape[1]
-            student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
-            student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
+            student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(dense_embs.dtype)
+            student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(dense_embs.dtype)
 
         hires_feats = [
             student.sam_mask_decoder.adapter_s0(hires_feats[0]),
@@ -153,8 +153,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             if not hasattr(teacher.sam_mask_decoder, 'adapter_s1'):
                 in_ch_s1 = teacher_hires_feats[1].shape[1]
                 in_ch_s0 = teacher_hires_feats[0].shape[1]
-                teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
-                teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
+                teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(dense_embs.dtype)
+                teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(dense_embs.dtype)
 
             teacher_hires_feats = [
                 teacher.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
