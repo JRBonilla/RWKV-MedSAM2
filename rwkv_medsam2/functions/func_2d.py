@@ -143,8 +143,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             # If no memory yet, add a zero key/value so memory_attention always has something to attend to
             zeros_f = torch.zeros_like(vision_feats[-1])
             zeros_p = torch.zeros_like(vision_pos[-1])
-            vision_feats[-1] = vision_feats[-1] + zeros_f
-            vision_pos[-1]   = vision_pos[-1] + zeros_p
+            vision_feats[-1] = (vision_feats[-1] + zeros_f).clone()
+            vision_pos[-1]   = (vision_pos[-1]   + zeros_p).clone()
 
         # 6) Decode mask
         feats = [
@@ -155,7 +155,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
         # Resize dense prompt embeddings
-        dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
+        dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False).clone()
 
         print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
 
@@ -181,7 +181,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         #    ][::-1]
         #    teacher_embed       = feats_t[-1]
         #    teacher_hires_feats = feats_t[:-1]
-#
+        #
         #    teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
         #        points=(sparse_points, sparse_labels) if sparse_points is not None else None,
         #        boxes=None, masks=None
@@ -193,7 +193,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         #    teacher_image_pe   = teacher.sam_prompt_encoder.get_dense_pe()
         #    
         #    print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}, teacher image pe: {teacher_image_pe.shape}")
-#
+        #
         #    teacher_logits, _, *_ = teacher.sam_mask_decoder(
         #        image_embeddings=teacher_embed,
         #        image_pe=teacher_image_pe,
@@ -207,7 +207,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         # 8) Compute losses
         # Segmentation loss
-        mask_target = masks.to(student_pred.dtype)
+        mask_target = masks.to(student_pred.dtype).clone()
         pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
         seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
 
@@ -255,6 +255,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                     memory_bank[min_idx] = entry # Replace least similar entry
 
     # 10) Backward and step
+    torch.autograd.set_detect_anomaly(True)
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     scaler.update()
