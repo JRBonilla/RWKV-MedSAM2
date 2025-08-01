@@ -173,7 +173,11 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
         # 8) Compute losses
-        seg_loss = F.binary_cross_entropy_with_logits(student_pred, masks, pos_weight=torch.tensor(pos_weight, device=device))
+        # Segmentation loss
+        mask_target = masks.to(student_pred.dtype)
+        pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
+        seg_loss = F.binary_cross_entropy_with_logits(student_pred, masks, pos_weight=pw)
+
         dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
         loss = alpha * seg_loss + (1-alpha) * dis_loss
 
