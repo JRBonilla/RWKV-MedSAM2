@@ -150,7 +150,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
             target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
 
-            if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
+            if not hasattr(teacher.sam_mask_decoder, 'adapter_s1'):
                 in_ch_s1 = teacher_hires_feats[1].shape[1]
                 in_ch_s0 = teacher_hires_feats[0].shape[1]
                 teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
