@@ -64,27 +64,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     )
     dense_embs = student.sam_prompt_encoder.get_dense_pe()
 
-    # 4) Build teacher and student 
-    # a) Build student adapters
-    dc1_s, _, _, dc2_s, _ = student.sam_mask_decoder.output_upscaling
-    tgt_mid_s   = dc1_s.out_channels
-    tgt_high_s  = dc2_s.out_channels
-    if not hasattr(student.sam_mask_decoder, 'stu_adapter_mid'):
-        in_mid_s = student.sam_mask_decoder.conv_s1.in_channels
-        in_high_s= student.sam_mask_decoder.conv_s0.in_channels
-        student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_mid_s,  tgt_mid_s,  kernel_size=1).to(device=device, dtype=torch.bfloat16)
-        student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_high_s, tgt_high_s, kernel_size=1).to(device=device, dtype=torch.bfloat16)
-
-    # b) Build teacher adapters
-    dc1_t, _, _, dc2_t, _ = teacher.sam_mask_decoder.output_upscaling
-    tgt_mid_t   = dc1_t.out_channels
-    tgt_high_t  = dc2_t.out_channels
-    if not hasattr(teacher.sam_mask_decoder, 'tea_adapter_mid'):
-        in_mid_t = teacher.sam_mask_decoder.conv_s1.in_channels
-        in_high_t= teacher.sam_mask_decoder.conv_s0.in_channels
-        teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_mid_t,  tgt_mid_t,  kernel_size=1).to(device=device, dtype=torch.bfloat16)
-        teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_high_t, tgt_high_t, kernel_size=1).to(device=device, dtype=torch.bfloat16)
-
     # 4) Mixed precision + TF32
     if torch.cuda.get_device_properties(0).major >= 8:
         # Turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
@@ -92,8 +71,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         torch.backends.cudnn.allow_tf32 = True
     student.train()
     optimizer.zero_grad()
-
-    torch.autograd.set_detect_anomaly(True)
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         # 5) Forward + memory attention
@@ -134,6 +111,17 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
+        # Pull out mask decoder's upscaling layers to find target out-channels
+        dc1, ln1, act1, dc2, act2 = student.sam_mask_decoder.output_upscaling
+        target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
+        target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
+
+        if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
+            in_ch_s1 = hires_feats[1].shape[1]
+            in_ch_s0 = hires_feats[0].shape[1]
+            student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
+            student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
+
         hires_feats = [
             student.sam_mask_decoder.adapter_s0(hires_feats[0]),
             student.sam_mask_decoder.adapter_s1(hires_feats[1])
@@ -156,6 +144,17 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
+            
+            # Pull out mask decoder's upscaling layers to find target out-channels
+            dc1, ln1, act1, dc2, act2 = teacher.sam_mask_decoder.output_upscaling
+            target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
+            target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
+
+            if not hasattr(teacher.sam_mask_decoder, 'adapter_s1'):
+                in_ch_s1 = teacher_hires_feats[1].shape[1]
+                in_ch_s0 = teacher_hires_feats[0].shape[1]
+                teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
+                teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
 
             teacher_hires_feats = [
                 teacher.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
@@ -183,14 +182,13 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         loss = alpha * seg_loss + (1-alpha) * dis_loss
 
     # 9) Memory encode and update
-    with torch.cuda.amp.autocast(enabled=False):
-        new_feats, new_pos = student._encode_new_memory(
-            current_vision_feats=vision_feats,
-            feat_sizes=feat_sizes,
-            pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False).float(),
-            object_score_logits=student_object_score_logits,
-            is_mask_from_pts=(sparse_points is not None)
-        )
+    new_feats, new_pos = student._encode_new_memory(
+        current_vision_feats=vision_feats,
+        feat_sizes=feat_sizes,
+        pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False),
+        object_score_logits=student_object_score_logits,
+        is_mask_from_pts=(sparse_points is not None)
+    )
     new_feats = new_feats.to(torch.bfloat16).to(device)
     new_pos   = new_pos[0].to(torch.bfloat16).to(device)
 
