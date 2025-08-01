@@ -110,32 +110,10 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
-        # 1) Spatially resize dense prompt PE to H_feat x W_feat
+        # Spatially resize dense prompt PE to H_feat x W_feat
         _, C_img, H_feat, W_feat = image_embed.shape
         if dense_embs.shape[-2:] != (H_feat, W_feat):
             dense_embs = F.interpolate(dense_embs, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-
-        # 2) Make image_embed match the transformer_dim (C_dense == 256)
-        C_dense = dense_embs.size(1)  # 256
-        if C_img > C_dense:
-            image_embed = image_embed[:, :C_dense, :, :]
-        elif C_img < C_dense:
-            pad = torch.zeros(
-                (batch_size, C_dense - C_img, H_feat, W_feat),
-                dtype=image_embed.dtype,
-                device=image_embed.device
-            )
-            image_embed = torch.cat([image_embed, pad], dim=1)
-
-        # —— DEBUGGING ——
-        print(f"DEBUG: image_embed shape = {image_embed.shape}")
-        print(f"DEBUG: dense_pe   shape = {dense_embs.shape}")
-        print(f"DEBUG: sparse_embs shape = {None if sparse_embs is None else sparse_embs.shape}")
-        # grab the first cross-attn layer’s k_proj to see what it expects:
-        w = student.sam_mask_decoder.transformer.layers[0] \
-                .cross_attn_token_to_image.k_proj.weight
-        print(f"DEBUG: k_proj weight shape = {tuple(w.shape)}")
-        # ————————
 
         student_logits, student_iou, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
