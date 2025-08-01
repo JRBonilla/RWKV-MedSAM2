@@ -187,9 +187,9 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 boxes=None, masks=None
             )
             
-            proj = nn.Conv2d(256, 1024, kernel_size=1).to(image_embed.device)
+            proj = nn.Conv2d(1024, 256, kernel_size=1).to(image_embed.device)
             teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
-            teacher_dense_embs = proj(teacher_dense_embs)
+            teacher_embed      = proj(teacher_embed)
             teacher_image_pe   = teacher.sam_prompt_encoder.get_dense_pe()
             
             print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}, teacher image pe: {teacher_image_pe.shape}")
