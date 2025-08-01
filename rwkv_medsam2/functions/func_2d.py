@@ -8,6 +8,49 @@ import torch.nn.functional as F
 
 from .func_metrics import compute_iou, compute_dice, compute_hd95
 
+def attach_highres_adapters(model, config, device=None, dtype=torch.float32):
+    """
+    Helper function to attach 2D adapters to the SAM mask decoder.
+    1) Runs a dummy forward through model.image_encoder + _prepare_backbone_features  
+    2) Inspects the spatial feature shapes that will be fed as high_res_features  
+    3) Creates adapter_s0 and adapter_s1 (1x1 convs) to map them into
+       the mask-decoder's expected channel dims  
+    4) Attaches those convs onto model.sam_mask_decoder
+
+    Args:
+        model (SAM2VideoPredictor): The SAM2VideoPredictor model.
+        config (DictConfig): The configuration dictionary.
+        device (torch.device, optional): The device to run the model on.
+        dtype (torch.dtype, optional): The data type for the adapters.
+    """
+    device = device or next(model.parameters()).device
+    # 1) Dummy image
+    H = config.model.image_size
+    dummy = torch.zeros(1, 3, H, H, device=device)
+    # 2) Forward to get vision_feats
+    with torch.no_grad():
+        backbone_out = model.image_encoder(dummy)
+        _, vision_feats, _, _ = model._prepare_backbone_features(backbone_out)
+    # 3) Mimic review logic to get (B=1,C,H',W') tensors
+    feat_sizes = config.decoder.feat_sizes           # e.g. [[128,128],[64,64],[32,32]]
+    raw_feats = [
+        feat.permute(1,2,0).view(1, -1, *size)
+        for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
+    ]
+    hires_feats = raw_feats[:-1]                     # [feat_hr, feat_mr]
+    in_ch_s0 = hires_feats[0].shape[1]
+    in_ch_s1 = hires_feats[1].shape[1]
+    # 4) Read out the target dims from the decoder
+    dc1, ln1, act1, dc2, act2 = model.sam_mask_decoder.output_upscaling
+    target_ch_s1 = dc1.out_channels                  # e.g. hidden_dim//4
+    target_ch_s0 = dc2.out_channels                  # e.g. hidden_dim//8
+    # 5) Create & attach adapters once
+    dec = model.sam_mask_decoder
+    dec.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1)\
+                         .to(device=device, dtype=dtype)
+    dec.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1)\
+                         .to(device=device, dtype=dtype)
+
 def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scaler):
     """
     Perform a single training step for a 2D model using student-teacher distillation.
@@ -111,17 +154,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         image_embed = feats[-1]
         hires_feats = feats[:-1] # [feat_hr, feat_mr]
 
-        # Pull out mask decoder's upscaling layers to find target out-channels
-        dc1, ln1, act1, dc2, act2 = student.sam_mask_decoder.output_upscaling
-        target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
-        target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
-
-        if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
-            in_ch_s1 = hires_feats[1].shape[1]
-            in_ch_s0 = hires_feats[0].shape[1]
-            student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
-            student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
-
         hires_feats = [
             student.sam_mask_decoder.adapter_s0(hires_feats[0]),
             student.sam_mask_decoder.adapter_s1(hires_feats[1])
@@ -144,17 +176,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
             teacher_embed          = teacher_feats[-1].permute(1,2,0).view(batch_size, -1, *feat_sizes[-1])
             teacher_hires_feats    = [f.permute(1,2,0).reshape(batch_size, -1, *size) for f, size in zip(teacher_feats[::-1][1:], feat_sizes[:-1])]
-            
-            # Pull out mask decoder's upscaling layers to find target out-channels
-            dc1, ln1, act1, dc2, act2 = teacher.sam_mask_decoder.output_upscaling
-            target_ch_s1 = dc1.out_channels # Expected channels for the middle-resolution feature-map
-            target_ch_s0 = dc2.out_channels # Expected channels for the high-resolution feature-map
-
-            if not hasattr(teacher.sam_mask_decoder, 'adapter_s1'):
-                in_ch_s1 = teacher_hires_feats[1].shape[1]
-                in_ch_s0 = teacher_hires_feats[0].shape[1]
-                teacher.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
-                teacher.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(device=device, dtype=dense_embs.dtype)
 
             teacher_hires_feats = [
                 teacher.sam_mask_decoder.adapter_s0(teacher_hires_feats[0]),
