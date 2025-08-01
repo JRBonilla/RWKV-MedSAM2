@@ -151,8 +151,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             feat.permute(1,2,0).view(batch_size, -1, *size)
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
-        image_embed = feats[-1]
-        hires_feats = feats[:-1] # [feat_hr, feat_mr]
+        image_embed = feats[0]
+        hires_feats = feats[1:] # [feat_mr, feat_hr]
 
         # Resize dense prompt embeddings
         dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
@@ -177,8 +177,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 feat.permute(1,2,0).reshape(batch_size, -1, *size)
                 for feat, size in zip(teacher_feats[::-1], t_sizes)
             ][::-1]
-            teacher_hires_feats = feats_t[:-1]
-            teacher_embed       = feats_t[-1]
+            teacher_embed       = feats_t[0]
+            teacher_hires_feats = feats_t[1:]
 
             teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
                 points=(sparse_points, sparse_labels) if sparse_points is not None else None,
@@ -313,7 +313,7 @@ def validate_step_2d(student, batch, config, return_logits=False):
             for feat, sz in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        hires_feats  = feats[:-1]
+        hires_feats = feats[:-1]
 
         logits, _, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
