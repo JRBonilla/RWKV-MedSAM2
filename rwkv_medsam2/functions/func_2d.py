@@ -119,12 +119,12 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         if not hasattr(student.sam_mask_decoder, 'adapter_s1'):
             in_ch_s1 = hires_feats[1].shape[1]
             in_ch_s0 = hires_feats[0].shape[1]
-            student_sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
-            student_sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
+            student.sam_mask_decoder.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1).to(image_embed.device)
+            student.sam_mask_decoder.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1).to(image_embed.device)
 
         hires_feats = [
-            student_sam_mask_decoder.adapter_s0(hires_feats[0]),
-            student_sam_mask_decoder.adapter_s1(hires_feats[1])
+            student.sam_mask_decoder.adapter_s0(hires_feats[0]),
+            student.sam_mask_decoder.adapter_s1(hires_feats[1])
         ]
 
         student_logits, student_iou, *_ = student.sam_mask_decoder(
