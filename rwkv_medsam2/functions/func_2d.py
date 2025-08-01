@@ -179,7 +179,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 points=(sparse_points, sparse_labels) if sparse_points is not None else None,
                 boxes=None, masks=None
             )
-            teacher_dense_prompts = F.interpolate(teacher_dense_prompts, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
+            teacher_dense_embs    = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
             teacher_image_pe      = teacher.sam_prompt_encoder.get_dense_pe()
             teacher_logits, _, *_ = teacher.sam_mask_decoder(
                 image_embeddings=teacher_embed,
