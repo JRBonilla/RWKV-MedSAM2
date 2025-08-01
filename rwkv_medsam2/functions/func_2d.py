@@ -185,7 +185,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     new_feats, new_pos = student._encode_new_memory(
         current_vision_feats=vision_feats,
         feat_sizes=feat_sizes,
-        pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False).to(torch.bfloat16),
+        pred_masks_high_res=F.interpolate(student_logits, size=(config.model.image_size, config.model.image_size), mode='bilinear', align_corners=False).to(torch.float32),
         object_score_logits=student_object_score_logits,
         is_mask_from_pts=(sparse_points is not None)
     )
