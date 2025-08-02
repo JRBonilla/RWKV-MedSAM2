@@ -114,7 +114,7 @@ class SegmentationSequenceDataset(Dataset):
 
         seq_imgs, seq_masks = [], []
         # For each axis, gather slices forward and reverse
-        for axis in (0, 1, 2):
+        for axis in (0,):
             length = msk_vol.shape[axis]
             for i in range(length):
                 slice_img = self._slice(img_vol, axis, i)
