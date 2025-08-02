@@ -209,38 +209,6 @@ def load_video_frames(
             "Only MP4 video and JPEG folder are supported at this moment"
         )
 
-# Lifted directly from Medical SAM-2
-# https://github.com/SuperMedIntel/Medical-SAM2/blob/main/sam2_train/utils/misc.py
-def load_video_frames_from_data(
-    imgs_tensor,
-    offload_video_to_cpu,
-    img_mean=(0.485, 0.456, 0.406),
-    img_std=(0.229, 0.224, 0.225),
-    async_loading_frames=False,
-):
-    """
-    Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
-
-    The frames are resized to image_size x image_size and are loaded to GPU if
-    `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
-
-    You can load a frame asynchronously by setting `async_loading_frames` to `True`.
-    """
-
-    num_frames = imgs_tensor.shape[0]
-
-    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
-
-    images = imgs_tensor / 255.0
-    if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
-    # normalize by mean and std
-    images -= img_mean
-    images /= img_std
-    return images
 
 def load_video_frames_from_jpg_images(
     video_path,
