@@ -8,49 +8,6 @@ import torch.nn.functional as F
 
 from .func_metrics import compute_iou, compute_dice, compute_hd95
 
-def attach_highres_adapters(model, config, device=None, dtype=torch.float32):
-    """
-    Helper function to attach 2D adapters to the SAM mask decoder.
-    1) Runs a dummy forward through model.image_encoder + _prepare_backbone_features  
-    2) Inspects the spatial feature shapes that will be fed as high_res_features  
-    3) Creates adapter_s0 and adapter_s1 (1x1 convs) to map them into
-       the mask-decoder's expected channel dims  
-    4) Attaches those convs onto model.sam_mask_decoder
-
-    Args:
-        model (SAM2VideoPredictor): The SAM2VideoPredictor model.
-        config (DictConfig): The configuration dictionary.
-        device (torch.device, optional): The device to run the model on.
-        dtype (torch.dtype, optional): The data type for the adapters.
-    """
-    device = device or next(model.parameters()).device
-    # 1) Dummy image
-    H = config.model.image_size
-    dummy = torch.zeros(1, 3, H, H, device=device)
-    # 2) Forward to get vision_feats
-    with torch.no_grad():
-        backbone_out = model.image_encoder(dummy)
-        _, vision_feats, _, _ = model._prepare_backbone_features(backbone_out)
-    # 3) Mimic review logic to get (B=1,C,H',W') tensors
-    feat_sizes = config.decoder.feat_sizes           # e.g. [[128,128],[64,64],[32,32]]
-    raw_feats = [
-        feat.permute(1,2,0).view(1, -1, *size)
-        for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
-    ]
-    hires_feats = raw_feats[:-1]                     # [feat_hr, feat_mr]
-    in_ch_s0 = hires_feats[0].shape[1]
-    in_ch_s1 = hires_feats[1].shape[1]
-    # 4) Read out the target dims from the decoder
-    dc1, ln1, act1, dc2, act2 = model.sam_mask_decoder.output_upscaling
-    target_ch_s1 = dc1.out_channels                  # e.g. hidden_dim//4
-    target_ch_s0 = dc2.out_channels                  # e.g. hidden_dim//8
-    # 5) Create & attach adapters once
-    dec = model.sam_mask_decoder
-    dec.adapter_s0 = nn.Conv2d(in_ch_s0, target_ch_s0, kernel_size=1)\
-                         .to(device=device, dtype=dtype)
-    dec.adapter_s1 = nn.Conv2d(in_ch_s1, target_ch_s1, kernel_size=1)\
-                         .to(device=device, dtype=dtype)
-
 def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scaler):
     """
     Perform a single training step for a 2D model using student-teacher distillation.
@@ -187,40 +144,44 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         )
         student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
-        ## 7) Teacher distillation
-        #with torch.no_grad():
-        #    teacher_backbone       = teacher.forward_image(imgs)
-        #    _, teacher_feats, _, _ = teacher._prepare_backbone_features(teacher_backbone)
-        #    t_sizes = [feat.shape[-2:] for feat in teacher_feats[::-1]]
-        #    feats_t = [
-        #        feat.permute(1,2,0).reshape(batch_size, -1, *size)
-        #        for feat, size in zip(teacher_feats[::-1], t_sizes)
-        #    ][::-1]
-        #    teacher_embed       = feats_t[-1]
-        #    teacher_hires_feats = feats_t[:-1]
-        #
-        #    teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
-        #        points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-        #        boxes=None, masks=None
-        #    )
-        #    
-        #    proj = nn.Conv2d(1024, 256, kernel_size=1).to(image_embed.device)
-        #    teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
-        #    teacher_embed      = proj(teacher_embed)
-        #    teacher_image_pe   = teacher.sam_prompt_encoder.get_dense_pe()
-        #    
-        #    print(f"Teacher image embedding: {teacher_embed.shape}, teacher dense embs: {teacher_dense_embs.shape}, teacher image pe: {teacher_image_pe.shape}")
-        #
-        #    teacher_logits, _, *_ = teacher.sam_mask_decoder(
-        #        image_embeddings=teacher_embed,
-        #        image_pe=teacher_image_pe,
-        #        sparse_prompt_embeddings=teacher_sparse_embs,
-        #        dense_prompt_embeddings=teacher_dense_embs,
-        #        multimask_output=False,
-        #        repeat_image=False,
-        #        high_res_features=teacher_hires_feats
-        #    )
-        #    teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
+        # 7) Teacher distillation
+        with torch.no_grad():
+            teacher_backbone = teacher.forward_image(imgs)
+            # Get both feats *and* spatial sizes
+            _, t_feats, t_pos, t_sizes = teacher._prepare_backbone_features(teacher_backbone)
+
+            # Rebuild the same "feats" list the student uses
+            feats_t = [
+                feat.permute(1, 2, 0).view(batch_size, -1, *size)
+                for feat, size in zip(t_feats[::-1], t_sizes[::-1])
+            ][::-1]
+            teacher_embed       = feats_t[-1]
+            teacher_hires_feats = feats_t[:-1]
+
+            # Encode the exact same prompts
+            teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
+                points=(sparse_points, sparse_labels) if sparse_points is not None else None,
+                boxes=None, masks=None
+            )
+
+            # Resize dense prompts to match teacher_embed's HxW
+            teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
+
+            # Get & resize the image positional encoding
+            teacher_image_pe = teacher.sam_prompt_encoder.get_dense_pe()
+            teacher_image_pe = F.interpolate(teacher_image_pe, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
+
+            # Forward through exactly the same mask‐decoder call
+            teacher_logits, _, *_ = teacher.sam_mask_decoder(
+                image_embeddings=teacher_embed,
+                image_pe=teacher_image_pe,
+                sparse_prompt_embeddings=teacher_sparse_embs,
+                dense_prompt_embeddings=teacher_dense_embs,
+                multimask_output=False,
+                repeat_image=False,
+                high_res_features=teacher_hires_feats
+            )
+            teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
 
         # 8) Compute losses
         # Segmentation loss
@@ -230,8 +191,8 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
         seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
 
-        # dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
-        loss = alpha * seg_loss # + (1-alpha) * dis_loss
+        dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
+        loss = alpha * seg_loss + (1-alpha) * dis_loss
 
     # 9) Memory encode and update
     new_feats, new_pos = student._encode_new_memory(
@@ -321,11 +282,11 @@ def validate_step_2d(student, batch, config, return_logits=False):
 
     # 3) Prompt‑encode, forward backbone, prepare features & decode mask
     with torch.no_grad():
-        sparse_embs, _ = student.sam_prompt_encoder(
+        sparse_embs, dense_embs = student.sam_prompt_encoder(
             points=(sparse_points, sparse_labels) if sparse_points is not None else None,
             boxes=None, masks=None
         )
-        dense_embs = student.sam_prompt_encoder.get_dense_pe()
+        image_pe = student.sam_prompt_encoder.get_dense_pe()
 
         backbone_out = student.forward_image(imgs)
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
@@ -342,9 +303,10 @@ def validate_step_2d(student, batch, config, return_logits=False):
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
+        dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
         logits, _, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
-            image_pe=dense_embs,
+            image_pe=image_pe,
             sparse_prompt_embeddings=sparse_embs,
             dense_prompt_embeddings=dense_embs,
             multimask_output=False,
@@ -358,6 +320,11 @@ def validate_step_2d(student, batch, config, return_logits=False):
         # b) Compute probabilities and hard predictions for metrics
         probs = torch.sigmoid(logits_up) # [B,1,H,W]
         preds = (probs > 0.5).long().squeeze(1).cpu()
+        
+        # If masks are [B,1,1,H,W], squeeze to [B,1,H,W]
+        if masks.dim() == 5 and masks.size(2) == 1:
+            masks = masks.squeeze(2)
+        
         masks = F.interpolate(masks.float().cpu(), size=(out_size, out_size), mode='nearest').long().squeeze(1)  # [B,H,W]
 
     # 4) Metrics

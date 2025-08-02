@@ -25,9 +25,20 @@ def visualize_predictions_2d(image, mask, pred_logits, threshold=0.5, figsize=(1
         mask = mask.cpu().numpy()
         pred_logits = pred_logits.cpu().numpy()
 
-    img_np  = np.transpose(image, (1, 2, 0)) if image.ndim == 3 else image
-    mask_np = mask.squeeze(0)
-    pred_np = (1 / (1 + np.exp(-pred_logits))).squeeze(0) >= threshold
+    # Collapse any leading singleton dims, then handle channels
+    img_np = np.squeeze(image)              # now HxW or CxHxW
+    if img_np.ndim == 3:                    # CxHxW -> HxWxC
+        img_np = np.transpose(img_np, (1, 2, 0))
+    # Normalize to [0,1] for safe imshow
+    img_np = img_np.astype(np.float32)
+    img_np -= img_np.min()
+    img_np /= (img_np.max() + 1e-8)
+
+    mask_np = np.squeeze(mask)              # Drop any 1-sized dims -> HxW
+    
+    pred_arr = pred_logits
+    pred_arr = np.squeeze(pred_arr)         # Drop any channel dim -> HxW
+    pred_np = (1 / (1 + np.exp(-pred_arr))) >= threshold
 
     fig, axes = plt.subplots(1, 3, figsize=figsize)
     axes[0].imshow(img_np, cmap='gray')

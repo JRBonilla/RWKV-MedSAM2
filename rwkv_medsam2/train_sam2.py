@@ -656,10 +656,6 @@ def main(config_path, resume, multi_gpu, amp):
     student = build_student_predictor(config)
     teacher = build_teacher_predictor(config)
 
-    # Attach adapters (disabled for now)
-    # attach_highres_adapters(student, config, device=config.training.device, dtype=torch.bfloat16 if amp else torch.float32)
-    # attach_highres_adapters(teacher, config, device=config.training.device, dtype=torch.bfloat16)
-
     # 4) optimizer + scheduler + scaler
     # 2D optimizer + scheduler
     opt2d_cfg = setup_optimizer_and_scheduler(student, config, data_dimension=2)

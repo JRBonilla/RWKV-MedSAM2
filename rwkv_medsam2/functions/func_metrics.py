@@ -3,7 +3,7 @@
 #   - compute_iou  - Intersection over Union between two binary masks
 #   - compute_dice - Dice Similarity Coefficient between two binary masks
 #   - compute_hd95 - 95th percentile Hausdorff Distance between mask boundaries
-import cupy as cp
+import cupy as cp # type: ignore
 import SimpleITK as sitk
 from scipy.spatial.distance import directed_hausdorff
 
@@ -64,10 +64,14 @@ def compute_hd95(pred_mask, gt_mask):
     """
     # Extract boundary points
     def boundary_pts(mask):
-        arr = mask.cpu().numpy().astype('uint8')
-        sitk_img = sitk.GetImageFromArray(arr)
-        contour = sitk.LabelContour(sitk_img)
-        return cp.argwhere(sitk.GetArrayFromImage(contour) > 0)
+        # Get numpy mask -> SimpleITK contour -> numpy Boolean array
+        arr_np   = mask.cpu().numpy()
+        sitk_img = sitk.GetImageFromArray(arr_np)
+        contour  = sitk.LabelContour(sitk_img)
+        bool_np  = sitk.GetArrayFromImage(contour) > 0
+        # Convert to cupy before argwhere
+        bool_cp  = cp.asarray(bool_np)
+        return cp.argwhere(bool_cp)
     b_p = cp.asnumpy(boundary_pts(pred_mask))
     b_g = cp.asnumpy(boundary_pts(gt_mask))
     if len(b_p) == 0 or len(b_g) == 0:
