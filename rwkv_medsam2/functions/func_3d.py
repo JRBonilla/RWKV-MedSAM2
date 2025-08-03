@@ -17,12 +17,20 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
         teacher (SAM2VideoPredictor): The teacher model.
         mask_decoder_opt (torch.optim.Optimizer): The optimizer for the mask decoder.
         memory_opt (torch.optim.Optimizer): The optimizer for the memory encoder.
-        batch (tuple): A tuple containing the input data and labels.
+        batch (dict): A dictionary containing input tensors and labels, e.g.:
+            'image': Tensor[T, 3, H, W],
+            'mask':  Tensor[T, 1, H, W],
+            'pt_list': list[T] of point-coordinate Tensors or None,
+            'p_label': list[T] of label Tensors or None,
+            'bbox': list[T] of bounding-box Tensors or None
         config (DictConfig): The configuration dictionary.
         scaler (torch.cuda.amp.GradScaler): The scaler.
 
     Returns:
-        loss (float): The loss value.
+        tuple:
+            batch_loss (float): Combined loss over all frames.
+            prompt_loss (float): Loss for frames with prompts.
+            non_prompt_loss (Optional[float]): Loss for frames without prompts, or None.
     """
     # 0) Device and config
     device      = config.training.device
@@ -32,10 +40,14 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     max_prompts = config.prompt.max_per_seq
     image_size  = config.model.image_size
 
-    # 1) Prepare video tensor ([T,C,H,W])
-    imgs_seq = batch['image'].to(device)
-    # Assume batch size is 1 for 3D training
-    imgs = imgs_seq.squeeze(0) # [T,C,H,W]
+    # 1) Prepare video tensor and mask sequence
+    imgs_seq = batch['image'].to(device) # [B,T,C,H,W]
+    mask_seq = batch['mask'].to(device)  # [B,T,1,H,W]
+    # Remove batch dimension -> [T,C,H,W] and [T,1,H,W]
+    imgs     = imgs_seq.squeeze(0) # [T,C,H,W]
+    mask_seq = mask_seq.squeeze(0) # [T,1,H,W]
+    # Upsample to teacher's image resolution
+    imgs_up  = F.interpolate(imgs, size=(teacher.image_size, teacher.image_size), mode='bilinear', align_corners=False)
 
     # 2) Initialize state for student and teacher
     if torch.cuda.get_device_properties(device).major >= 8:
@@ -45,11 +57,11 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     student.train()
     if mask_decoder_opt: mask_decoder_opt.zero_grad()
     if memory_opt: memory_opt.zero_grad()
-    train_state = student.train_init_state(imgs)
+    train_state = student.init_state_from_tensor(imgs_tensor=imgs, mode="train")
 
     teacher.eval()
     with torch.no_grad():
-        teacher_state = teacher.train_init_state(imgs)
+        teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs_up, mode="eval")
 
     # 3) Select prompt frames evenly
     T = imgs.shape[0] # T = num_frames
@@ -59,11 +71,11 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     for frame_idx in prompt_idxs:
         points = batch['pt_list'][frame_idx]
         labels = batch['p_label'][frame_idx]
-        mask   = batch['mask'][frame_idx] if 'mask' in batch else None
+        mask   = mask_seq[frame_idx]
         if points is not None:
             points_t = points.to(device).float()
             labels_t = labels.to(device).long()
-            student.train_add_new_points(
+            student.train_add_new_points_or_box(
                 inference_state=train_state,
                 frame_idx=frame_idx,
                 obj_id=0,
@@ -72,7 +84,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
                 clear_old_points=False
             )
             with torch.no_grad():
-                teacher.train_add_new_points(
+                teacher.add_new_points_or_box(
                     inference_state=teacher_state,
                     frame_idx=frame_idx,
                     obj_id=0,
@@ -81,29 +93,28 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
                     clear_old_points=False
                 )
         elif mask is None:
-            bbox = batch['bbox'][frame_idx]
-            bbox_t = bbox.to(device)
-            student.train_add_new_bbox(
+            bbox_t = batch['bbox'][frame_idx].to(device)
+            student.train_add_new_points_or_box(
                 inference_state=train_state,
                 frame_idx=frame_idx,
                 obj_id=0,
-                bbox=bbox_t,
+                box=bbox_t,
                 clear_old_points=False
             )
             with torch.no_grad():
-                teacher.train_add_new_bbox(
+                teacher.add_new_points_or_box(
                     inference_state=teacher_state,
                     frame_idx=frame_idx,
                     obj_id=0,
-                    bbox=bbox_t,
+                    box=bbox_t,
                     clear_old_points=False
                 )
         else:
             # Mask prompt
-            mask_t = mask.to(device).float().unsqueeze(0)
+            mask_t = mask.float().unsqueeze(0) # [1,1,H,W]
             student.train_add_new_mask(train_state, frame_idx, 0, mask_t)
             with torch.no_grad():
-                teacher.train_add_new_mask(teacher_state, frame_idx, 0, mask_t)
+                teacher.add_new_mask(teacher_state, frame_idx, 0, mask_t)
 
     with torch.amp.autocast('cuda'):
         # 5) Propagate through video
@@ -114,23 +125,22 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
 
         teacher_preds = {}
         with torch.no_grad():
-            for frame_idx, obj_ids, mask_logits in teacher.train_propagate_in_video(teacher_state, start_frame_idx=0):
+            for frame_idx, obj_ids, mask_logits in teacher.propagate_in_video(teacher_state, start_frame_idx=0):
                 # Mask logits: [num_objs, Hf, Wf]
                 teacher_preds[frame_idx] = mask_logits[0].unsqueeze(0)
 
         # 6) Compute loss
         p_seg_losses, p_dis_losses   = [], [] # Losses for frames with prompts
         np_seg_losses, np_dis_losses = [], [] # Losses for frames without prompts
-        mask_seq = batch['mask'].to(device).squeeze(0) # [T,1,H',W']
         for frame_idx in range(T):
             student_logit = student_preds[frame_idx]   # [1,Hf,Wf]
             teacher_logit = teacher_preds[frame_idx]   # [1,Hf,Wf]
 
             # Resize to out_size
-            student_pred = F.interpolate(student_logit.unsqueeze(0), size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
-            teacher_pred = F.interpolate(teacher_logit.unsqueeze(0), size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
+            student_pred = F.interpolate(student_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
+            teacher_pred = F.interpolate(teacher_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
 
-            gt_mask = mask_seq[frame_idx].unsqueeze(0) # [1,1,out_size,out_size]
+            gt_mask = mask_seq[frame_idx].float()      # [1,1,H,W]
 
             frame_seg_loss = F.binary_cross_entropy_with_logits(student_pred, gt_mask, pos_weight=torch.tensor(pos_weight, device=device))
             frame_dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
@@ -142,16 +152,16 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
                 np_seg_losses.append(frame_seg_loss)
                 np_dis_losses.append(frame_dis_loss)
 
-    # 7) Combine and normalize each loss bucket
-    avg_p_seg_loss = torch.stack(p_seg_losses).mean()
-    avg_p_dis_loss = torch.stack(p_dis_losses).mean()
-    prompt_loss    = alpha * avg_p_seg_loss + (1-alpha) * avg_p_dis_loss
-    if len(prompt_idxs) > 1:
-        avg_np_seg_loss = torch.stack(np_seg_losses).mean()
-        avg_np_dis_loss = torch.stack(np_dis_losses).mean()
-        non_prompt_loss = alpha * avg_np_seg_loss + (1-alpha) * avg_np_dis_loss
-    else:
-        non_prompt_loss = None
+        # 7) Combine and normalize each loss bucket
+        avg_p_seg_loss = torch.stack(p_seg_losses).mean()
+        avg_p_dis_loss = torch.stack(p_dis_losses).mean()
+        prompt_loss    = alpha * avg_p_seg_loss + (1-alpha) * avg_p_dis_loss
+        if len(prompt_idxs) > 1:
+            avg_np_seg_loss = torch.stack(np_seg_losses).mean()
+            avg_np_dis_loss = torch.stack(np_dis_losses).mean()
+            non_prompt_loss = alpha * avg_np_seg_loss + (1-alpha) * avg_np_dis_loss
+        else:
+            non_prompt_loss = None
 
     # 8) Compute overall combined batch_loss (all frames)
     all_seg_losses = p_seg_losses + np_seg_losses
@@ -160,7 +170,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     avg_b_dis_loss = torch.stack(all_dis_losses).mean()
     batch_loss     = alpha * avg_b_seg_loss + (1-alpha) * avg_b_dis_loss
 
-    # 7) Backpropagation and optimizer updates
+    # 9) Backpropagation and optimizer updates
     # a) Non-prompt -> memory modules
     if non_prompt_loss is not None:
         scaler.scale(non_prompt_loss).backward(retain_graph=True)
@@ -205,13 +215,15 @@ def validate_step_3d(student, batch, config, return_logits=False):
 
     # 1) Prepare video frames [T,C,H,W]
     imgs_seq = batch['image'].to(device) # [1,T,C,H,W]
+    mask_seq = batch['mask'].to(device)  # [1,T,1,H,W]
     imgs     = imgs_seq.squeeze(0)       # [T,C,H,W]
+    mask_seq = mask_seq.squeeze(0)       # [T,1,H,W]
     T        = imgs.shape[0]             # T = num_frames
 
     # 2) Initialize train state and inject prompts
     student.eval()
     with torch.no_grad():
-        train_state = student.train_init_state(imgs)
+        train_state = student.init_state_from_tensor(imgs_tensor=imgs, mode="eval")
 
         # Pick prompt frames evenly
         prompt_idxs = torch.linspace(0, T-1, steps=max_prompts, dtype=torch.int64).tolist()
@@ -220,11 +232,12 @@ def validate_step_3d(student, batch, config, return_logits=False):
             points = batch['pt_list'][frame_idx]
             labels = batch['p_label'][frame_idx]
             bbox   = batch['bbox'][frame_idx]
+            mask   = mask_seq[frame_idx]
 
             if points is not None:
                 points_t = points.to(device).float()
                 labels_t = labels.to(device).long()
-                student.train_add_new_points(
+                student.add_new_points_or_box(
                     inference_state=train_state,
                     frame_idx=frame_idx,
                     obj_id=0,
@@ -233,64 +246,57 @@ def validate_step_3d(student, batch, config, return_logits=False):
                     clear_old_points=False
                 )
             elif bbox is not None:
-                bbox_t = bbox.to(device)
-                student.train_add_new_bbox(
+                bbox_t = batch['bbox'][frame_idx].to(device)
+                student.add_new_points_or_box(
                     inference_state=train_state,
                     frame_idx=frame_idx,
                     obj_id=0,
-                    bbox=bbox_t,
+                    box=bbox_t,
                     clear_old_points=False
                 )
             else:
                 # Fallback to mask prompt if no point or bbox
-                mask_t = batch['mask'][0, frame_idx].to(device).float().unsqueeze(0)
-                student.train_add_new_mask(train_state, frame_idx, 0, mask_t)
+                mask_t = mask.float().unsqueeze(0) # [1,1,H,W]
+                student.add_new_mask(train_state, frame_idx, 0, mask_t)
 
         # 3) Propagate through video
         preds = {}
-        for frame_idx, obj_ids, mask_logits in student.train_propagate_in_video(train_state, start_frame_idx=0):
+        for frame_idx, obj_ids, mask_logits in student.propagate_in_video(train_state, start_frame_idx=0):
             # mask_logits: [num_objs, Hf, Wf]
-            preds[int(frame_idx)] = mask_logits[0]
+            preds[frame_idx] = mask_logits[0].squeeze(0)
 
-    # 4) Resize and threshold + compute metrics
-    mask_seq = batch['mask'][0].to(device).squeeze(1)  # [T, H',W']
-    ious, dices, hd95s = [], [], []
-
-    # Assemble raw logits volume and upsample each frame for visualization
+    # 4) Assemble raw logits volume and upsample each frame for visualization
     raw_logits_vol = torch.stack([preds[t] for t in sorted(preds.keys())], dim=0) # [T, Hf, Wf]
     logits_up = F.interpolate(
-        raw_logits_vol.unsqueeze(1), # [T,1,Hf,Wf]
+        raw_logits_vol.unsqueeze(1), # [T,Hf,Wf]
         size=(out_size, out_size),
         mode='bilinear', align_corners=False
-    ).squeeze(1) # [T,H,W]
+    ) # [T,1,H,W]
 
+    # 5) Compute per-frame metrics
+    ious, dices, hd95s = [], [], []
     for t in range(T):
-        logit = preds[t].unsqueeze(0).unsqueeze(0)  # [1,1,Hf,Wf]
-        prob  = torch.sigmoid(F.interpolate(
-            logit, size=(out_size, out_size),
-            mode='bilinear', align_corners=False
-        ))
-        pred_mask = (prob > 0.5).long().squeeze(0).squeeze(0)  # [H,W]
+        # Compute predicted mask
+        pred_logit = preds[t].unsqueeze(0).unsqueeze(0)  # [1,1,Hf,Wf]
+        pred_prob  = torch.sigmoid(F.interpolate(pred_logit, size=(out_size, out_size), mode='bilinear', align_corners=False))
+        pred_mask = (pred_prob > 0.5).long().squeeze(0).squeeze(0)  # [H,W]
 
-        gt_mask = F.interpolate(
-            mask_seq[t].unsqueeze(0).unsqueeze(0).float(),
-            size=(out_size, out_size),
-            mode='nearest'
-        ).long().squeeze(0).squeeze(0)
+        # Compute ground truth mask
+        gt_mask = mask_seq[t] # [1,1,H,W]
+        gt_up = F.interpolate(gt_mask.float(), size=(out_size, out_size), mode='nearest').long().squeeze(0).squeeze(0)
 
         # Compute metrics
-        ious.append(compute_iou(pred_mask, gt_mask) )
-        dices.append(compute_dice(pred_mask, gt_mask) )
-        hd95s.append(compute_hd95(pred_mask, gt_mask) )
+        ious.append( compute_iou( pred_mask, gt_up))
+        dices.append(compute_dice(pred_mask, gt_up))
+        hd95s.append(compute_hd95(pred_mask, gt_up))
 
     # 5) Compute average metrics
     metrics = {
         'iou':  sum(ious)  / T,
-        'dice': sum(dices)/ T,
-        'hd95': sum(hd95s)/ T,
+        'dice': sum(dices) / T,
+        'hd95': sum(hd95s) / T,
     }
 
     if return_logits:
         return metrics, logits_up.cpu() # [T,H,W]
-    else:
-        return metrics
+    return metrics

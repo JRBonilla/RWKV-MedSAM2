@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from typing import Union, List
+from pathlib import Path
+import SimpleITK as sitk
 
 def visualize_predictions_2d(image, mask, pred_logits, threshold=0.5, figsize=(12, 4)):
     """
@@ -66,49 +68,55 @@ def visualize_nifti_predictions(img_vol, gt_mask_vol, pred_logits, axes=('Axial'
         threshold (float): Threshold for binarizing the predicted mask. Default is 0.5.
         figsize (tuple[int]): Figure size in inches. Default is (12, 4).
     """
-    # Ensure shape
-    assert img_vol.ndim in (3,4), "Expected img_vol of shape [Z,H,W] or [Z,C,H,W]"
+    # 1) Load from filepaths if needed
+    if isinstance(img_vol, (str, Path)):
+        img_vol = sitk.GetArrayFromImage(sitk.ReadImage(str(img_vol)))  # [Z, H, W]
+    if isinstance(gt_mask_vol, (str, Path)):
+        gt_mask_vol = sitk.GetArrayFromImage(sitk.ReadImage(str(gt_mask_vol)))
+    if isinstance(gt_mask_vol, list):
+        gt_mask_vol = np.stack([sitk.GetArrayFromImage(sitk.ReadImage(str(p))) for p in gt_mask_vol], axis=0)
 
-    # Convert to numpy
+    # 2) Convert Tensors to numpy
     if isinstance(img_vol, torch.Tensor):
-        img_vol     = img_vol.cpu().numpy()
+        img_vol = img_vol.cpu().numpy()
+    if isinstance(gt_mask_vol, torch.Tensor):
         gt_mask_vol = gt_mask_vol.cpu().numpy()
+    if isinstance(pred_logits, torch.Tensor):
         pred_logits = pred_logits.cpu().numpy()
 
-    # Ensure shape [Z,H,W]
-    if img_vol.ndim == 4:
-        # [Z,C,H,W] -> take first channel
-        img_vol = img_vol[:, 0]
-    if gt_mask_vol.ndim == 4:
-        gt_mask_vol = gt_mask_vol[:, 0]
-    pred_vol = (1 / (1 + np.exp(-pred_logits)))
-    if pred_vol.ndim == 4:
-        pred_vol = pred_vol[:, 0]
+    # 3) Flatten any extra dims so volumes are [Z, H, W]
+    if img_vol.ndim > 3:
+        img_vol = img_vol.reshape(-1, img_vol.shape[-2], img_vol.shape[-1])
+    if gt_mask_vol.ndim > 3:
+        gt_mask_vol = gt_mask_vol.reshape(-1, gt_mask_vol.shape[-2], gt_mask_vol.shape[-1])
 
-    # Binarize
+    # 4) Sigmoid + flatten preds similarly
+    pred_vol = 1 / (1 + np.exp(-pred_logits))
+    if pred_vol.ndim > 3:
+        pred_vol = pred_vol.reshape(-1, pred_vol.shape[-2], pred_vol.shape[-1])
+
+    # 5) Binarize predictions
     pred_mask_vol = (pred_vol >= threshold).astype(np.int32)
 
-    # Overlay helper
+    # 6) Compute center indices based on mask shape
+    Zm, Hm, Wm = gt_mask_vol.shape
+    idx = {
+        'Axial':    Zm // 2,
+        'Coronal':  Hm // 2,
+        'Sagittal': Wm // 2
+    }
+
+    # 7) Overlay helper
     def _overlay(slice_img, slice_mask, color, alpha):
         mn, mx = slice_img.min(), slice_img.max()
         norm = ((slice_img - mn) / (mx - mn) * 255).astype(np.uint8) if mx > mn else np.zeros_like(slice_img, np.uint8)
         rgb = np.stack([norm]*3, -1).astype(float)
         msk = slice_mask.astype(bool)
         for c in range(3):
-            rgb[..., c] = np.where(
-                msk,
-                (1 - alpha) * rgb[..., c] + alpha * color[c],
-                rgb[..., c]
-            )
+            rgb[..., c] = np.where(msk, (1 - alpha) * rgb[..., c] + alpha * color[c], rgb[..., c])
         return rgb.astype(np.uint8)
 
-    # Get center slices
-    Z, H, W = img_vol.shape
-    idx = {'Axial':   Z//2,
-           'Coronal': H//2,
-           'Sagittal':W//2}
-
-    # Plot
+    # 8) Plot
     fig, axs = plt.subplots(1, len(axes), figsize=figsize)
     for ax, name in zip(axs, axes):
         if name == 'Axial':
@@ -128,7 +136,6 @@ def visualize_nifti_predictions(img_vol, gt_mask_vol, pred_logits, axes=('Axial'
         gt_rgb  = _overlay(im_s, gt_s, color=(255, 0, 0), alpha=alpha)
         pr_rgb  = _overlay(im_s, pr_s, color=(0, 255, 0), alpha=alpha)
 
-        # Concatenate images
         comp = np.concatenate([raw_rgb, gt_rgb, pr_rgb], axis=1)
         ax.imshow(comp)
         ax.set_title(f"{name} (raw -> gt -> pred)")

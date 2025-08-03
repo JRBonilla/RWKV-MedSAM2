@@ -209,6 +209,42 @@ def load_video_frames(
             "Only MP4 video and JPEG folder are supported at this moment"
         )
 
+# Adapted from the official Medical SAM-2 code
+# https://github.com/SuperMedIntel/Medical-SAM2/blob/main/sam2_train/utils/misc.py
+def load_video_frames_from_data(
+    imgs_tensor: torch.Tensor,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    offload_video_to_cpu: bool = False,
+) -> torch.Tensor:
+    """
+    Normalize an in-memory video tensor for SAM2 training.
+
+    Args:
+        imgs_tensor: torch.Tensor of shape [T, C, H, W] with values in [0, 255].
+        img_mean: 3-tuple of per-channel mean (0-1 scale).
+        img_std: 3-tuple of per-channel std (0-1 scale).
+        offload_video_to_cpu: if True, keep frames on CPU; otherwise move to model device.
+
+    Returns:
+        Normalized video tensor of shape [T, C, H, W] on the appropriate device.
+    """
+    # Convert mean/std to tensors
+    mean = torch.tensor(img_mean, device=imgs_tensor.device).view(1, -1, 1, 1)
+    std = torch.tensor(img_std, device=imgs_tensor.device).view(1, -1, 1, 1)
+
+    # Scale to [0,1]
+    imgs = imgs_tensor.float() / 255.0
+
+    # Move to CUDA if desired
+    if not offload_video_to_cpu:
+        imgs = imgs.cuda(non_blocking=True)
+        mean = mean.cuda(non_blocking=True)
+        std = std.cuda(non_blocking=True)
+
+    # Normalize
+    imgs = (imgs - mean) / std
+    return imgs
 
 def load_video_frames_from_jpg_images(
     video_path,

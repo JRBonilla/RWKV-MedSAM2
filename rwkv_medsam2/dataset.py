@@ -15,7 +15,7 @@ import torchvision.transforms.functional as TF
 from dripp.helpers import normalize_path, get_extension
 
 class SegmentationSequenceDataset(Dataset):
-    def __init__(self, pairings, transform):
+    def __init__(self, pairings, transform, max_frames_per_sequence=8):
         """
         Initializes a SegmentationSequenceDataset.
         
@@ -23,11 +23,13 @@ class SegmentationSequenceDataset(Dataset):
             pairings (list[dict]): A list of dictionaries, each containing 'pairs' which is a list of tuples,
                 where each tuple contains a path to an image and a path to its corresponding mask.
             transform (callable): An optional transformation to be applied to every image and mask pair.
+            max_frames_per_sequence (int, optional): Maximum number of frames per sequence. Default is 8.
         """
         self.pairings = pairings
         self.transform = transform
         self.data_dimension = self.get_data_dimension()
         self.prompt_type = 'bbox' if self.data_dimension == 3 else 'click'
+        self.max_frames_per_sequence = max_frames_per_sequence
 
     def __len__(self):
         return len(self.pairings)
@@ -49,6 +51,13 @@ class SegmentationSequenceDataset(Dataset):
             imgs, masks = self._load_3d(img0, normalize_path(pairs[0][1]))
         else:
             imgs, masks = self._load_2d_sequence([(normalize_path(i), normalize_path(m)) for i, m in pairs])
+
+        # Limit sequence length if too long
+        T_full = imgs.shape[0]
+        if T_full > self.max_frames_per_sequence:
+            start = random.randint(0, T_full - self.max_frames_per_sequence)
+            imgs  = imgs[start:start+self.max_frames_per_sequence]
+            masks = masks[start:start+self.max_frames_per_sequence]
 
         # Generate prompts per slice (return empty tensors if no prompt)
         pt_list, label_list, bbox_list = [], [], []
