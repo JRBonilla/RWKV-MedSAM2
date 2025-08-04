@@ -88,17 +88,34 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             banks = F.normalize(banks, p=2, dim=1)
             sims  = (banks @ F.normalize(curr, p=2, dim=1).t()).t()
             
-            idx   = torch.multinomial(F.softmax(sims, dim=1), num_samples=1).squeeze(1)
+            # Compute softmax
+            probs = F.softmax(sims, dim=1)
+            K     = config.memory_bank.capacity
+
+            # a) Draw K indices per example (with replacement)
+            idxs = torch.multinomial(probs, num_samples=K, replacement=True) # [B, K]
+
+            # b) Gather K features & positions per example -> [B,K,C,H,W]
+            batch_mem_feats = mem_feats[idxs]
+            batch_mem_pos   = mem_pos[idxs]
             
-            batch_mem_feats = mem_feats[idx] # [B,C,H,W]
-            batch_mem_pos   = mem_pos[idx]   # [B,C,H,W]
-            
-            B,C,H,W = batch_mem_feats.shape
+            # c) Flatten into KxHxW tokens: [B,K,C,H,W] -> [K*H*W,B,C]
+            B,K,C,H,W = batch_mem_feats.shape
             S = H * W
-            # -> [B,C,S] -> permute to [S,B,C]
-            
-            sel_f = batch_mem_feats.reshape(B,C,S).permute(2,0,1)
-            sel_p = batch_mem_pos.reshape(  B,C,S).permute(2,0,1)
+            sel_f = (
+                batch_mem_feats         # [B,K,C,H,W]
+                    .reshape(B,K,C,S)   # [B,K,C,S]
+                    .permute(1,3,0,2)   # [K,S,B,C]
+                    .reshape(K*S,B,C)   # [K*S,B,C]
+            )
+            sel_p = (
+                batch_mem_pos           # [B,K,C,H,W]
+                    .reshape(B,K,C,S)   # [B,K,C,S]
+                    .permute(1,3,0,2)   # [K,S,B,C]
+                    .reshape(K*S,B,C)   # [K*S,B,C]
+            )
+
+            # d) Memory attention
             updated_feats = student.memory_attention(
                 curr=[vision_feats[-1]],
                 curr_pos=[vision_pos[-1]],

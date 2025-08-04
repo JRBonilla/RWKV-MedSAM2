@@ -27,16 +27,25 @@ class SegmentationSequenceDataset(Dataset):
         """
         self.pairings = pairings
         self.transform = transform
-        self.data_dimension = self.get_data_dimension()
-        self.prompt_type = 'bbox' if self.data_dimension == 3 else 'click'
+        self.entry_dims = []
+        self.prompt_types = []
+        for entry in pairings:
+            dim = self.get_data_dimension(entry['pairs'][0][0])
+            self.entry_dims.append(dim)
+            self.prompt_types.append('bbox' if dim == 3 else 'click')
         self.max_frames_per_sequence = max_frames_per_sequence
 
     def __len__(self):
         return len(self.pairings)
 
     def __getitem__(self, idx):
-        entry = self.pairings[idx]
-        pairs = entry['pairs']
+        # Get entry and associated data
+        entry       = self.pairings[idx]
+        ds_name     = entry['dataset']
+        sub_name    = entry.get('subdataset', '')
+        pairs       = entry['pairs']
+        data_dim    = self.entry_dims[idx]
+        prompt_type = self.prompt_types[idx]
 
         # Reset transformations
         if self.transform is not None:
@@ -46,8 +55,8 @@ class SegmentationSequenceDataset(Dataset):
         img0 = normalize_path(pairs[0][0])
         ext = get_extension(img0)
 
-        # 3D if exactly one pair and NIfTI
-        if self.data_dimension == 3:
+        # Branch per entry
+        if data_dim == 3:
             imgs, masks = self._load_3d(img0, normalize_path(pairs[0][1]))
         else:
             imgs, masks = self._load_2d_sequence([(normalize_path(i), normalize_path(m)) for i, m in pairs])
@@ -67,7 +76,7 @@ class SegmentationSequenceDataset(Dataset):
             # If has an extra channel dimension, squeeze it out
             if mask_slice.ndim == 3 and mask_slice.size(0) == 1:
               mask_slice = mask_slice.squeeze(0) # now [H,W]
-            prompt = generate_prompt(mask_slice, prompt_type=self.prompt_type)
+            prompt = generate_prompt(mask_slice, prompt_type=prompt_type)
             if 'points' in prompt:
                 pt_list.append(prompt['points'])     # Tensor[n,2]
                 label_list.append(prompt['labels'])  # Tensor[n]
@@ -80,15 +89,17 @@ class SegmentationSequenceDataset(Dataset):
                 bbox_list.append(prompt['bbox'])       # Tensor[4]
 
         return {
-            'image':   imgs,               # Tensor[T,C,H,W]
-            'mask':    masks.unsqueeze(1), # Tensor[T,1,H,W]
-            'pt_list': pt_list,            # List[T] of Tensor[n,2]
-            'p_label': label_list,         # List[T] of Tensor[n]
-            'bbox':    bbox_list           # List[T] of Tensor[4]
+            'image':      imgs,               # Tensor[T,C,H,W]
+            'mask':       masks.unsqueeze(1), # Tensor[T,1,H,W]
+            'pt_list':    pt_list,            # List[T] of Tensor[n,2]
+            'p_label':    label_list,         # List[T] of Tensor[n]
+            'bbox':       bbox_list,          # List[T] of Tensor[4]
+            'dataset':    ds_name,
+            'subdataset': sub_name,
         }
 
-    def get_data_dimension(self):
-        img0 = normalize_path(self.pairings[0]['pairs'][0][0])
+    def get_data_dimension(self, img_path):
+        img0 = normalize_path(img_path)
         ext = get_extension(img0)
         return 3 if ext in {'.nii', '.nii.gz'} else 2
 
@@ -120,10 +131,11 @@ class SegmentationSequenceDataset(Dataset):
         """
         img_vol = sitk.GetArrayFromImage(sitk.ReadImage(img_path)) # [D, H, W]
         msk_vol = sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
+        _, H0, W0 = self._to_tensor(img_vol[0], msk_vol[0])[0].shape
 
         seq_imgs, seq_masks = [], []
         # For each axis, gather slices forward and reverse
-        for axis in (0,):
+        for axis in (0,1,2):
             length = msk_vol.shape[axis]
             for i in range(length):
                 slice_img = self._slice(img_vol, axis, i)
@@ -131,6 +143,11 @@ class SegmentationSequenceDataset(Dataset):
                 im_t, ms_t = self._to_tensor(slice_img, slice_msk)
                 if self.transform:
                     im_t, ms_t = self.transform(im_t, ms_t)
+                    # Resize to (H0, W0)
+                    if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
+                        im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
+                        ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0],
+                                         interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
                 seq_imgs.append(im_t)
                 seq_masks.append(ms_t)
             for i in reversed(range(length)):
@@ -139,6 +156,11 @@ class SegmentationSequenceDataset(Dataset):
                 im_t, ms_t = self._to_tensor(slice_img, slice_msk)
                 if self.transform:
                     im_t, ms_t = self.transform(im_t, ms_t)
+                    # Resize to (H0, W0)
+                    if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
+                        im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
+                        ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0],
+                                         interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
                 seq_imgs.append(im_t)
                 seq_masks.append(ms_t)
         return torch.stack(seq_imgs, dim=0), torch.stack(seq_masks, dim=0)

@@ -279,8 +279,8 @@ def get_data_loaders(config):
         tuple: A tuple of (train_loaders, val_loaders, test_loaders), where each
                loader is a dict mapping (dataset, subdataset) to a DataLoader instance.
     """
-    train_pairings = get_pairings(config.dripp.output_dir, split='train')
     # 1) Load all DRIPP pairings
+    train_pairings = get_pairings(config.dripp.output_dir, split='train')
     test_pairs     = get_pairings(config.dripp.output_dir, split='test')
 
     # 2) Group by (dataset, subdataset).
@@ -311,29 +311,26 @@ def get_data_loaders(config):
     # 4) Load DRIPP tasks map
     tasks_map = json.load(open(config.dripp.tasks_file, 'r'))
 
-    # 5) Build dataset + loader for each group
-    train_loaders = {}
-    val_loaders   = {}
-    test_loaders  = {}
+    # 5) Flatten into three big lists
+    all_train_pairs = [p for pairs in train_groups.values() for p in pairs]
+    all_val_pairs   = [p for pairs in val_groups.values()   for p in pairs]
+    all_test_pairs  = [p for pairs in test_groups.values()  for p in pairs]
 
-    for key, pairs in train_groups.items():
-        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
-        sampler = BalancedTaskSampler(pairs, tasks_map, config.training.seed)
-        loader = DataLoader(ds, batch_size=config.training.batch_size, sampler=sampler, num_workers=config.training.num_workers, pin_memory=True)
-        train_loaders[key] = loader
+    # single train loader with balanced sampler
+    train_ds      = SegmentationSequenceDataset(all_train_pairs, transform=SequenceTransform())
+    train_sampler = BalancedTaskSampler(all_train_pairs, tasks_map, config.training.seed)
+    train_loader  = DataLoader(train_ds, batch_size=config.training.batch_size, sampler=train_sampler, num_workers=config.training.num_workers, pin_memory=True)
 
-    for key, pairs in val_groups.items():
-        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
-        loader = DataLoader(ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
-        val_loaders[key] = loader
+    # single val loader (no sampler)
+    val_ds     = SegmentationSequenceDataset(all_val_pairs, transform=SequenceTransform())
+    val_loader = DataLoader(val_ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
 
-    for key, pairs in test_groups.items():
-        ds = SegmentationSequenceDataset(pairs, transform=SequenceTransform())
-        loader = DataLoader(ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
-        test_loaders[key] = loader
+    # single test loader
+    test_ds     = SegmentationSequenceDataset(all_test_pairs, transform=SequenceTransform())
+    test_loader = DataLoader(test_ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
 
-    print(f"Created {len(train_loaders)} train loaders, {len(val_loaders)} val loaders, and {len(test_loaders)} test loaders.")
-    return train_loaders, val_loaders, test_loaders
+    print("Data loaders created.")
+    return train_loader, val_loader, test_loader
 
 def save_data_loaders(save_path, train_loaders, val_loaders, test_loaders):
     """
@@ -509,63 +506,94 @@ def setup_optimizer_and_scheduler(model, config, data_dimension):
         'scheduler':  scheduler3d
     }
 
-def train_epoch(student, teacher, train_loader, optimizers, scheduler, config, scaler, epoch, logger):
+from tqdm.auto import tqdm
+
+def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched2d, sched3d, config, scaler, epoch, logger):
     """
-    Single epoch over all batches, selecting 2D vs 3D training.
+    Perform one epoch of training over the dataset.
+
+    This function iterates over the training data and performs either a 2D or 3D training step
+    depending on the data dimensionality. It also visualizes predictions for the first batch
+    and logs the average loss for the epoch.
+
+    Args:
+        student (SAM2VideoPredictor): The student model to be trained.
+        teacher (SAM2VideoPredictor): The teacher model for distillation.
+        train_loader (DataLoader): DataLoader for the training dataset.
+        optimizer2d (torch.optim.Optimizer): Optimizer for 2D training.
+        optimizers3d (tuple): Tuple containing optimizers for 3D training.
+        sched2d (torch.optim.lr_scheduler._LRScheduler): Scheduler for 2D optimizer.
+        sched3d (torch.optim.lr_scheduler._LRScheduler): Scheduler for 3D optimizers.
+        config (dict): Configuration parameters.
+        scaler (torch.cuda.amp.GradScaler): Gradient scaler for mixed precision training.
+        epoch (int): The current epoch number.
+        logger (logging.Logger): Logger for logging training information.
+
+    Returns:
+        float: The average loss over all batches.
     """
+    # 0) Set model in training mode and initialize variables
     student.train()
-    total_batch_loss      = 0.0
-    total_prompt_loss     = 0.0
-    total_non_prompt_loss = 0.0
-    memory_bank = []  # for 2D only
+    total_loss = 0.0
+    mem_bank = []
+    first_vis = False
 
-    # detect 2D vs 3D
-    dim = train_loader.dataset.data_dimension  # 2 or 3
-    progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", leave=False)
+    # 1) Training loop
+    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", unit="batch")
+    for batch in pbar:
+        # Show dataset/subdataset metadata in progress bar
+        # If batch_size > 1, take the first element
+        ds_name  = batch.get('dataset', 'NA')
+        sub_name = batch.get('subdataset', 'NA')
+        if isinstance(ds_name,  (list, tuple)): ds_name  = ds_name[0]
+        if isinstance(sub_name, (list, tuple)): sub_name = sub_name[0]
+        pbar.set_description(f"Train Epoch {epoch} - [{ds_name}/{sub_name}]")
 
-    for batch in progress:
-        if dim == 2:
-            optimizer2d = optimizers[0]
-            batch_loss = train_step_2d(student, teacher, optimizer2d, batch, config, memory_bank, scaler)
+        T = batch['image'].shape[1]
+        if T == 1:
+            # 2D step
+            loss = train_step_2d(student, teacher, optimizer2d, batch, config, mem_bank, scaler)
+            if not first_vis:
+                # Visualize 2D
+                metrics, logits = validate_step_2d(student, batch, config, return_logits=True)
+                img = batch['image'][0,0]; msk = batch['mask'][0,0]; pred = logits[0]
+                visualize_predictions_2d(img, msk, pred)
+                first_vis = True
         else:
-            mask_decoder_opt, memory_opt = optimizers
-            batch_loss, prompt_loss, non_prompt_loss = train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config, scaler)
-            total_prompt_loss += prompt_loss
-            total_non_prompt_loss += non_prompt_loss
-        total_batch_loss += batch_loss
-        progress.set_postfix(batch_loss=f"{batch_loss:.4f}")
+            # 3D step
+            opt3a, opt3b = optimizers3d
+            loss, pl, npl = train_step_3d(student, teacher, opt3a, opt3b, batch, config, scaler)
+            if not first_vis:
+                # Visualize 3D
+                metrics3, logits3 = validate_step_3d(student, batch, config, return_logits=True)
+                img_np  = batch['image'][0].cpu().numpy()
+                msk_np  = batch['mask'][0].cpu().numpy()
+                vol_i, vol_m, vol_p = img_np[:,0], msk_np[:,0], logits3.detach().cpu().numpy()[:,0]
+                visualize_nifti_predictions(
+                    vol_i, vol_m, vol_p,
+                    axes=('Axial','Coronal','Sagittal'),
+                    threshold=0.5, alpha=0.4, figsize=(12,4)
+                )
+                first_vis = True
+        # Update total loss
+        total_loss += loss
+        pbar.set_postfix(loss=f"{loss:.4f}")
+    # Close progress bar and compute average loss
+    pbar.close()
+    avg_loss = total_loss / len(train_loader)
+    logger.info(f"[Epoch {epoch}] Train avg loss: {avg_loss:.4f}")
 
-    n = len(train_loader)
-    avg_batch_loss = total_batch_loss / n
-    
-    if dim == 2:
-        logger.info(f"[Epoch {epoch}] Average batch loss: {avg_batch_loss:.4f}")
-    else:
-        avg_prompt_loss     = total_prompt_loss / n
-        avg_non_prompt_loss = total_non_prompt_loss / n
-        logger.info(f"[Epoch {epoch}] Average loss: {avg_batch_loss:.4f}, Prompt loss: {avg_prompt_loss:.4f}, Non-prompt loss: {avg_non_prompt_loss:.4f}")
+    # Step both schedulers
+    sched2d.step()
+    sched3d.step()
 
-    # step the LR scheduler once per epoch
-    if scheduler is not None:
-        scheduler.step()
+    return avg_loss
 
-    if dim == 2:
-        return {
-            "avg_batch_loss": avg_batch_loss
-        }
-    else:
-        return {
-            "avg_batch_loss": avg_batch_loss,
-            "avg_prompt_loss": avg_prompt_loss,
-            "avg_non_prompt_loss": avg_non_prompt_loss
-        }
 
 def validate_epoch(student, val_loader, config):
     """
     Run one full validation epoch, calling validate_step_2d or validate_step_3d
     on each batch and averaging the per-batch metrics.
-
-    Visualizes a single sample from the first batch for both 2D and 3D.
 
     Args:
         student (SAM2VideoPredictor): the student model in eval mode
@@ -575,51 +603,26 @@ def validate_epoch(student, val_loader, config):
     Returns:
         dict: average metrics {'iou', 'dice', 'hd95'} over all batches
     """
-    # Initialize model in eval
+    # 0) Set model in eval and initialize variables
     student.eval()
+    totals = {'iou': 0.0, 'dice': 0.0, 'hd95': 0.0}
+    n = 0
 
-    # Pick 2D vs 3D
-    dim = val_loader.dataset.data_dimension  # 2 or 3
-
-    # Initialize metrics
-    total = {'iou': 0.0, 'dice': 0.0, 'hd95': 0.0}
-    n_batches = 0
-
-    # Run validation
+    # 1) Validation loop
     with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            # Select validation step based on data dimension
-            if dim == 2:
-                # Only visualize first batch
-                if batch_idx == 0:
-                    metrics, logits = validate_step_2d(student, batch, config, return_logits=True)
-                    # Visualize single sample
-                    img = batch['image'][0, 0]
-                    msk = batch['mask'][0, 0]
-                    pred = logits[0]
-                    visualize_predictions_2d(img, msk, pred)
-                else:
-                    metrics = validate_step_2d(student, batch, config)
+        for batch in val_loader:
+            T = batch['image'].shape[1]
+            if T == 1:
+                m = validate_step_2d(student, batch, config)
             else:
-                # Only visualize first batch
-                if batch_idx == 0:
-                    metrics, logits = validate_step_3d(student, batch, config, return_logits=True)
-                    # Image mask paths from dataset
-                    img_path  = batch['image'][0]
-                    msk_paths = batch['mask'][0]
-                    visualize_nifti_predictions(img_path, msk_paths, logits)
-                else:
-                    metrics = validate_step_3d(student, batch, config)
+                m = validate_step_3d(student, batch, config)
+            for k in totals:
+                totals[k] += m[k]
+            n += 1
 
-            # Accumulate metrics
-            total['iou']  += metrics['iou']
-            total['dice'] += metrics['dice']
-            total['hd95'] += metrics['hd95']
-            n_batches     += 1
+    # 2) Compute metrics
+    return {k: totals[k] / n for k in totals}
 
-    # Average metrics over all batches
-    avg = {k: total[k] / n_batches for k in total}
-    return avg
 
 def main(config_path, resume, multi_gpu, amp):
     """
@@ -644,77 +647,62 @@ def main(config_path, resume, multi_gpu, amp):
         multi_gpu (bool): Whether to use DataParallel on multiple GPUs.
         amp (bool): Whether to use mixed precision training.
     """
-    # 1) Load config + logging
-    config  = load_config(config_path)
-    log_cfg = config.logging
-    logger  = setup_logger(log_cfg)
+    # 1) Config + logger
+    config = load_config(config_path)
+    logger = setup_logger(config.logging)
 
     # 2) Data loaders
-    train_loaders, val_loaders, test_loaders = get_data_loaders(config)
+    train_loader, val_loader, _ = get_data_loaders(config)
 
-    # 3) Models
-    student = build_student_predictor(config)
-    teacher = build_teacher_predictor(config)
+    # 3) Build Models
+    student = build_student_predictor(config).to(config.training.device)
+    teacher = build_teacher_predictor(config).to(config.training.device)
 
-    # 4) optimizer + scheduler + scaler
-    # 2D optimizer + scheduler
-    opt2d_cfg = setup_optimizer_and_scheduler(student, config, data_dimension=2)
-    optimizer2d, sched2d = opt2d_cfg['optimizers'][0], opt2d_cfg['scheduler']
+    # 4) Setup optimizers + schedulers
+    opt2 = setup_optimizer_and_scheduler(student, config, data_dimension=2)
+    optimizer2d, sched2d = opt2['optimizers'][0], opt2['scheduler']
+    opt3 = setup_optimizer_and_scheduler(student, config, data_dimension=3)
+    sched3d = opt3['scheduler']
+    optimizers3d = opt3['optimizers']  # (mask_decoder_opt, memory_opt)
 
-    # 3D optimizer + scheduler
-    opt3d_cfg = setup_optimizer_and_scheduler(student, config, data_dimension=3)
-    mask_decoder_opt, memory_opt = opt3d_cfg['optimizers']
-    sched3d = opt3d_cfg['scheduler']
-
-    scaler = torch.amp.GradScaler('cuda', enabled=amp)
-
-    # 5) Multi-GPU setup
+    # 5) AMP & multi-GPU
+    scaler = torch.amp.GradScaler(enabled=amp)
     if multi_gpu and torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs")
         student = torch.nn.DataParallel(student)
         teacher = torch.nn.DataParallel(teacher)
 
-    # 6) Load from checkpoint if resuming
+    # 6) Resume from checkpoint if needed
     ckpt_mgr = CheckpointManager(config.training.output_dir)
     start_ep = 0
     if resume:
-        start_ep, opt1_state, opt2_state, sched_state = ckpt_mgr.load(resume, student)
-        # load checkpoint weights into both 2D and 3D optimizers/schedulers
-        optimizer2d.load_state_dict(opt1_state)
-        mask_decoder_opt.load_state_dict(opt1_state)
-        memory_opt.load_state_dict(opt2_state)
-        sched2d.load_state_dict(sched_state)
-        sched3d.load_state_dict(sched_state)
+        start_ep, s1, s2, sch = ckpt_mgr.load(resume, student)
+        optimizer2d.load_state_dict(s1)
+        optimizers3d[0].load_state_dict(s1)
+        optimizers3d[1].load_state_dict(s2)
+        sched2d.load_state_dict(sch)
+        sched3d.load_state_dict(sch)
         logger.info(f"Resumed from epoch {start_ep}")
 
-    # 7) Training and validation loops over each sub-dataset
-    train_loss, val_metrics = None, None
+    # 7) Epoch loop
     for epoch in range(start_ep, int(config.training.epochs)):
-        # Train: Iterate through all 2D and 3D loaders
-        for key, loader in train_loaders.items():
-            dim = loader.dataset.data_dimension
-            if dim == 2:
-                train_loss[key] = train_epoch(student, teacher, loader, [optimizer2d], sched2d, config, scaler, epoch, logger)
-            else:
-                train_loss[key] = train_epoch(student, teacher, loader, [mask_decoder_opt, memory_opt], sched3d, config, scaler, epoch, logger)
+        train_epoch(
+            student, teacher, train_loader,
+            optimizer2d, optimizers3d,
+            sched2d, sched3d,
+            config, scaler, epoch, logger
+        )
 
-        # Step both schedulers once per epoch
-        sched2d.step()
-        sched3d.step()
+        # 8) Validation
+        if epoch % config.training.val_freq == 0 or epoch == config.training.epochs - 1:
+            val_metrics = validate_epoch(student, val_loader, config)
 
-        # Validation: Evaluate each loader at the configured frequency
-        if epoch % config.training.val_freq == 0 or epoch == int(config.training.epochs) - 1:
-            for key, loader in val_loaders.items():
-                dim = loader.dataset.data_dimension
-                val_metrics[key] = validate_epoch(student, loader, config)
+            # 9) Save checkpoints
+            ckpt_mgr.save_latest(student, optimizer2d, optimizers3d[0], sched2d, epoch)
+            if val_metrics['iou'] > getattr(ckpt_mgr, 'best_metric', -1):
+                ckpt_mgr.save_best(student, optimizer2d, optimizers3d[0], sched2d, epoch, metric=val_metrics['iou'])
 
-                # Save per-modality checkpoints
-                if dim == 2:
-                    ckpt_mgr.save_latest(student, optimizer2d, optimizer2d, sched2d, epoch)
-                    ckpt_mgr.save_best(  student, optimizer2d, optimizer2d, sched2d, epoch, val_metrics[key]['iou'])
-                else:
-                    ckpt_mgr.save_latest(student, mask_decoder_opt, memory_opt, sched3d, epoch)
-                    ckpt_mgr.save_best(  student, mask_decoder_opt, memory_opt, sched3d, epoch, val_metrics[key]['iou'])
+            # 10) Log metrics
+            logger.info(f"[Epoch {epoch}] Val metrics: {val_metrics}")
 
     logger.info("Training complete.")
 
