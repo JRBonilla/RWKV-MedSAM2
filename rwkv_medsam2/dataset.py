@@ -15,36 +15,53 @@ import torchvision.transforms.functional as TF
 from dripp.helpers import normalize_path, get_extension
 
 class SegmentationSequenceDataset(Dataset):
-    def __init__(self, pairings, transform, max_frames_per_sequence=8):
+    def __init__(self, sequences, transform, max_frames_per_sequence=8):
         """
         Initializes a SegmentationSequenceDataset.
-        
+
         Args:
-            pairings (list[dict]): A list of dictionaries, each containing 'pairs' which is a list of tuples,
-                where each tuple contains a path to an image and a path to its corresponding mask.
+            sequences (list[dict]): List of dictionaries containing sequence metadata.
+                Each dictionary should contain the following keys:
+                    - sequence (list[tuple]): List of tuples containing image and mask paths.
+                    - dataset (str): Name of the dataset.
+                    - subdataset (str, optional): Name of the subdataset, if applicable.
+                    - dim (int): Dimension of the image (2 or 3).
             transform (callable): An optional transformation to be applied to every image and mask pair.
             max_frames_per_sequence (int, optional): Maximum number of frames per sequence. Default is 8.
         """
-        self.pairings = pairings
+        self.sequences = sequences
         self.transform = transform
-        self.entry_dims = []
-        self.prompt_types = []
-        for entry in pairings:
-            dim = self.get_data_dimension(entry['pairs'][0][0])
-            self.entry_dims.append(dim)
-            self.prompt_types.append('bbox' if dim == 3 else 'click')
+        self.entry_dims = [entry['dim'] for entry in sequences]
+        self.prompt_types = ['bbox' if dim == 3 else 'click' for dim in self.entry_dims]
         self.max_frames_per_sequence = max_frames_per_sequence
 
     def __len__(self):
-        return len(self.pairings)
+        """Returns the number of sequences in the dataset."""
+        return len(self.sequences)
 
     def __getitem__(self, idx):
+        """
+        Gets a sequence of 2D/3D images and masks as tensors.
+
+        Args:
+            idx (int): Index of the sequence to retrieve.
+
+        Returns:
+            dict[str, Any]: A dictionary containing the following:
+                - image (Tensor[T,C,H,W]): The sequence of images.
+                - mask (Tensor[T,1,H,W]): The sequence of masks.
+                - pt_list (List[T] of Tensor[n,2]): List of point prompts per frame.
+                - p_label (List[T] of Tensor[n]): List of point labels per frame.
+                - bbox (List[T] of Tensor[4]): List of bounding box prompts per frame.
+                - dataset (str): Name of the dataset.
+                - subdataset (str): Name of the subdataset, if applicable.
+        """
         # Get entry and associated data
-        entry       = self.pairings[idx]
+        entry       = self.sequences[idx]
         ds_name     = entry['dataset']
         sub_name    = entry.get('subdataset', '')
-        pairs       = entry['pairs']
-        data_dim    = self.entry_dims[idx]
+        seq         = entry['sequence']             # List[(img_path, mask_path)]
+        data_dim    = self.entry_dims[idx]          # entry['dim']
         prompt_type = self.prompt_types[idx]
 
         # Reset transformations
@@ -52,21 +69,24 @@ class SegmentationSequenceDataset(Dataset):
             self.transform.reset()
 
         # Normalize and detect extension
-        img0 = normalize_path(pairs[0][0])
+        img0 = normalize_path(seq[0][0])
         ext = get_extension(img0)
 
-        # Branch per entry
         if data_dim == 3:
-            imgs, masks = self._load_3d(img0, normalize_path(pairs[0][1]))
+            imgs, masks = self._load_3d(normalize_path(seq[0][0]), normalize_path(seq[0][1]))
         else:
-            imgs, masks = self._load_2d_sequence([(normalize_path(i), normalize_path(m)) for i, m in pairs])
+            # Load entire 2D "pseudo-video"
+            cleaned = [(normalize_path(i), normalize_path(m)) for i, m in seq]
+            imgs, masks = self._load_2d_sequence(cleaned)
 
         # Limit sequence length if too long
         T_full = imgs.shape[0]
         if T_full > self.max_frames_per_sequence:
-            start = random.randint(0, T_full - self.max_frames_per_sequence)
-            imgs  = imgs[start:start+self.max_frames_per_sequence]
-            masks = masks[start:start+self.max_frames_per_sequence]
+            # Randomly choose max_frames_per_sequence frames
+            idxs = random.sample(range(T_full), self.max_frames_per_sequence)
+            idxs.sort()
+            imgs  = imgs[idxs]
+            masks = masks[idxs]
 
         # Generate prompts per slice (return empty tensors if no prompt)
         pt_list, label_list, bbox_list = [], [], []
@@ -98,14 +118,20 @@ class SegmentationSequenceDataset(Dataset):
             'subdataset': sub_name,
         }
 
-    def get_data_dimension(self, img_path):
-        img0 = normalize_path(img_path)
-        ext = get_extension(img0)
-        return 3 if ext in {'.nii', '.nii.gz'} else 2
+    def _load_2d_sequence(self, seq):
+        """
+        Loads a sequence of 2D images and their corresponding masks as a sequence of tensors.
 
-    def _load_2d_sequence(self, pairs):
+        Args:
+            seq (list[tuple]): A list of tuples, where each tuple contains a path to an image and
+                a path to its corresponding mask.
+
+        Returns:
+            tuple: A tuple containing two tensors. The first tensor is a sequence of images (Tensor[T,C,H,W]),
+                and the second tensor is a sequence of masks (Tensor[T,1,H,W]).
+        """
         imgs, masks = [], []
-        for imp_p, msk_p in pairs:
+        for imp_p, msk_p in seq:
             i_arr = sitk.GetArrayFromImage(sitk.ReadImage(imp_p))
             m_arr = sitk.GetArrayFromImage(sitk.ReadImage(msk_p))
             im_t, ms_t = self._to_tensor(i_arr, m_arr)
@@ -204,53 +230,53 @@ class SegmentationSequenceDataset(Dataset):
         return img, mask
 
 class BalancedTaskSampler(Sampler):
-    def __init__(self, pairings, tasks_map, seed):
+    def __init__(self, sequences, tasks_map, seed=None):
         """
-        Initializes the sampler with the given pairings and tasks map.
+        Sampler that balances both tasks and modalities (2D vs 3D).
 
         Args:
-            pairings (list[dict]): A list of dictionaries, each containing information about the
-                dataset/subdataset.
-            tasks_map (dict): A dictionary with task IDs as keys and dictionaries containing
-                information about the task as values.
-            seed (int, optional): An optional seed for the random number generator. If not provided,
-                the sampler will use the current system time as the seed.
+            sequences (list[dict]): List of sequence dicts, each with keys
+                'dataset', 'subdataset', 'tasks', 'dim', etc.
+            tasks_map (dict): Mapping from task IDs to configs, each containing:
+                - 'classes': List of classes for that task
+                - 'datasets': { dataset_name: [subdataset_names...] }
+            seed (int, optional): Random seed for reproducibility.
         """
-        self.pairings = pairings
+        self.sequences = sequences
         self.tasks_map = tasks_map
-        self.num_samples = len(self.pairings)
-        self.by_task = {} # task_id -> list of sample indices
+        self.num_samples = len(sequences)
 
-        # Precompute valid indices per task
-        for task_id, info in self.tasks_map.items():
-            task_classes = set(info['classes'])
-            valid_idxs = []
-            for idx, pair in enumerate(self.pairings):
-                ds, sd = pair['dataset'], pair.get('subdataset')
-                if ds in info['datasets'] and sd in info['datasets'][ds]:
-                    if set(pair.get('mask_classes', {}).keys()) & task_classes:
-                        valid_idxs.append(idx)
-            if valid_idxs:
-                self.by_task[task_id] = valid_idxs
+        # Build buckets keyed by (task_id, modality)
+        # modality = dim (2 or 3)
+        self.buckets = {}  # (task_id, dim) -> list of indices
+        for idx, seq in enumerate(sequences):
+            ds = seq['dataset']
+            sd = seq.get('subdataset')
+            dim = seq.get('dim')
+            for task_id in seq.get('tasks', []):
+                info = tasks_map.get(task_id, {})
+                # check dataset/subdataset eligibility
+                if ds in info.get('datasets', {}) and sd in info['datasets'].get(ds, []):
+                    key = (task_id, dim)
+                    self.buckets.setdefault(key, []).append(idx)
 
-        self.tasks = list(self.by_task.keys())
+        # Keep only non-empty buckets
+        self.keys = [k for k, v in self.buckets.items() if v]
         if seed is not None:
             random.seed(seed)
 
     def __iter__(self):
         """
-        Yields a sequence of indices into the pairings, where each index is sampled
-        uniformly at random from the valid indices for a randomly chosen task.
+        Yields indices by:
+          1. Sampling a random (task, modality) bucket
+          2. Sampling a random sequence index within that bucket
         """
         for _ in range(self.num_samples):
-            task = random.choice(self.tasks)
-            yield random.choice(self.by_task[task])
+            key = random.choice(self.keys)          # (task_id, dim)
+            yield random.choice(self.buckets[key])
 
     def __len__(self):
-        """
-        Returns the total number of possible samples.
-        Returns the number of indices in the pairings.
-        """
+        """Total number of samples per epoch."""
         return self.num_samples
 
 class SequenceTransform:

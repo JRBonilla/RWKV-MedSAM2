@@ -2,6 +2,8 @@
 # Main training script for RWKV‑MedSAM2:
 #   - load_config                   - Load YAML config and set random seeds
 #   - setup_logger                  - Configure console + timed rotating file logging
+#   - get_pairings                  - Load raw (image, mask) pairs
+#   - get_sequence                  - Assemble (image, mask) pairs into sequences
 #   - get_data_loaders              - Build SegmentationSequenceDataset + BalancedTaskSampler
 #   - build_student/teacher         - Instantiate SAM2VideoPredictor models
 #   - setup_optimizer_and_scheduler - Create AdamW optimizers and warm-up + cosine scheduler
@@ -161,7 +163,7 @@ class CheckpointManager:
             ckpt["scheduler"]
         )
 
-def get_pairings(out_dir, split="train"):    
+def get_pairings(out_dir, datasets, split="train"):
     """
     Loads the groupings.json files from each folder in the given output directory
     for the specified split.
@@ -177,21 +179,15 @@ def get_pairings(out_dir, split="train"):
     corresponding image.
 
     Args:
-        out_dir (str): The output directory containing the groupings.json files.
+        out_dir (str): The output directory containing the dataset folders.
+        datasets (list): The list of dataset names to load groupings for.
         split (str, optional): The split to load groupings for. Default is "train".
 
     Returns:
         list: A list of lists, where each inner list contains pairs of image and
               mask paths.
     """
-    try:
-        entries = sorted(os.listdir(out_dir))
-    except:
-        raise RuntimeError(f"Could not find output directory {out_dir}")
-    # Filter out non-directories
-    datasets = [dataset for dataset in entries if os.path.isdir(os.path.join(out_dir, dataset))]
-    print(f"Found {len(datasets)} datasets in {out_dir}")
-
+    # Find all image and mask pairs for each dataset and collect them
     _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
     all_pairs = []
     for ds in datasets:
@@ -203,9 +199,9 @@ def get_pairings(out_dir, split="train"):
             continue
 
         # Parse the groups file
-        raw_data = json.load(open(grp_file, 'r'))
+        data = json.load(open(grp_file, 'r'))
         entries  = []
-        for sub in raw_data.get("subdatasets", []):
+        for sub in data.get("subdatasets", []):
             for entry in sub.get(split, []):
                 entry["subdataset_name"] = sub.get("name", "default")
                 entry["tasks"]           = sub.get("tasks", [])
@@ -213,7 +209,7 @@ def get_pairings(out_dir, split="train"):
                 entries.append(entry)
         print(f"Found {len(entries)} '{split}' entries in {grp_file}")
 
-        # Pair each mask with its corresponding image
+        # Iterate through the groupings and create image/mask pairs
         for entry in entries:
             # Skip entries that don't match the split
             if entry.get('split') != split:
@@ -221,52 +217,203 @@ def get_pairings(out_dir, split="train"):
 
             imgs = entry.get('proc_images', [])
             msks = entry.get('proc_masks', [])
+
+            # Create a map from index to image
             idx_map = {}
             for img_path in imgs:
                 m = _idx_pattern.search(os.path.basename(img_path))
                 if m:
                     idx_map[int(m.group(1))] = img_path
+            
+            # Pair each mask with its corresponding image and add to the list of pairs
+            # Each list of pairs corresponds to a single grouping
             pairs = []
-            for mpath in msks:
-                m = _idx_pattern.search(os.path.basename(mpath['path']))
-                if not m:
+            for mask in msks:
+                msk_path = mask['path']
+                cls_name = mask['class']
+                m = _idx_pattern.search(os.path.basename(msk_path))
+                if not m or cls_name is None: # Skip if no index or class
                     continue
-                img_p = idx_map.get(int(m.group(1)))
-                if img_p:
-                    pairs.append((img_p, mpath['path']))
-            if pairs:
-                # Sort the pairs to ensure temporal order
-                pairs.sort(key=lambda x: int(_idx_pattern.search(os.path.basename(x[0])).group(1)))
-                if len(pairs) > 1 and get_extension(pairs[0][0]) == '.png':
-                    for img_p, m_p in pairs:
-                        all_pairs.append({
-                            'dataset':      ds,
-                            'subdataset':   entry['subdataset_name'],
-                            'tasks':        entry['tasks'],
-                            'mask_classes': entry['mask_classes'],
-                            'pairs':        [(img_p, m_p)]
-                        })
-                else:
+                img_path = idx_map.get(int(m.group(1)))
+                if img_path:
+                    pairs.append({
+                        'image': img_path,
+                        'mask':  msk_path,
+                        'class': cls_name
+                    })
+
+            # If no pairs found, skip
+            if not pairs:
+                continue
+
+            # Add the pairs to the raw list
+            # Sort the pairs to ensure temporal order
+            pairs.sort(key=lambda x: int(_idx_pattern.search(os.path.basename(x['image'])).group(1)))
+            # For multiple pairs, split the pairs into separate entries in the raw list
+            if len(pairs) > 1:
+                for pair in pairs:
                     all_pairs.append({
                         'dataset':      ds,
                         'subdataset':   entry['subdataset_name'],
                         'tasks':        entry['tasks'],
-                        'mask_classes': entry['mask_classes'],
-                        'pairs':        pairs
+                        'class':        pair['class'],
+                        'pair':         (pair['image'], pair['mask']),
+                        'dim':          2 if get_extension(pair['image']) == '.png' else 3
                     })
+            else:
+                # For single pair, add to the raw list of pairs
+                all_pairs.append({
+                    'dataset':      ds,
+                    'subdataset':   entry['subdataset_name'],
+                    'tasks':        entry['tasks'],
+                    'mask_classes': pairs[0]['class'],
+                    'pair':         (pairs[0]['image'], pairs[0]['mask']),
+                    'dim':          2 if get_extension(pairs[0]['image']) == '.png' else 3
+                })
     print(f"Found {len(all_pairs)} pairs for {ds} '{split}' split")
     return all_pairs
+
+def get_sequences(out_dir, split="train", val_frac=0.1, seed=42, max_frames_per_sequence=8):
+    """
+    Load and assemble 2D and 3D data into "sequences" for unified video-style training.
+
+    A "sequence" is a list of frames, where each frame is an (image_path, mask_path)
+    tuple. For 2D tasks, each sequence contains up to 'max_frames_per_sequence' frames—
+    chunked (non-overlapping) from each dataset/subdataset/task group in temporal order.
+    The final chunk may be shorter than 'max_frames_per_sequence'. For 3D volumes,
+    each sequence represents one full volume as a single-element list.
+
+    Processing steps:
+      1. Load raw (image, mask) pairs via 'get_pairings()', each dict tagged with:
+         dataset, subdataset, tasks, class, pair, dim.
+      2. Group all 'dim==2' entries by (dataset, subdataset, tasks) into long frame lists.
+      3. Chunk each 2D list into windows of length 'max_frames_per_sequence'.
+      4. Treat each 'dim==3' entry as a single-element sequence.
+      5. If 'split=='train', shuffle and split each set of chunks or volumes
+         into train/validation subsets using 'val_frac'.
+      6. Return:
+         - For 'split=='train': a tuple '(train_seqs, val_seqs)'.
+         - For 'split=='test': a list 'test_seqs'.
+
+    Args:
+        out_dir (str): Path to the directory containing dataset subfolders.
+        split (str): One of '"train"' or '"test"'.
+        val_frac (float): Fraction of each sequence reserved for validation
+                          (only used when 'split=='train'').
+        seed (int): Random seed for reproducibility.
+        max_frames_per_sequence (int): Maximum number of frames per 2D sequence.
+
+    Returns:
+        - If 'split=='train'': '(train_seqs, val_seqs)', each a list of sequence dicts.
+        - If 'split=='test'': 'test_seqs', a list of sequence dicts.
+
+    Each sequence dict contains:
+        - 'dataset' (str)
+        - 'subdataset' (str)
+        - 'tasks' (List[str])
+        - 'sequence' (List[Tuple[str, str]]): ordered image/mask path tuples
+        - 'dim' (int): 2 or 3
+    """
+    # 0a) Find dataset subfolders
+    try:
+        entries = sorted(os.listdir(out_dir))
+    except Exception:
+        raise RuntimeError(f"Could not find output directory {out_dir}")
+    datasets = [d for d in entries if os.path.isdir(os.path.join(out_dir, d))]
+
+    # 0b) Regex + helper to extract frame index
+    idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
+    def extract_idx(path):
+        m = idx_pattern.search(os.path.basename(path))
+        return int(m.group(1)) if m else 0
+
+    # 1) Load all (image, mask) pairs
+    pairs    = get_pairings(out_dir, datasets, split)
+    pairs2D  = [p for p in pairs if p['dim'] == 2]
+    pairs3D  = [p for p in pairs if p['dim'] == 3]
+
+    # 2) Group into true sequences
+    grouped2D = defaultdict(list)
+    for p in pairs2D:
+        key = (p['dataset'], p['subdataset'], tuple(p['tasks']))
+        grouped2D[key].append(p['pair'])
+
+    grouped3D = defaultdict(list)
+    for p in pairs3D:
+        key = (p['dataset'], p['subdataset'], tuple(p['tasks']))
+        grouped3D[key].append(p['pair'])
+
+    # 3) Build train/val or test lists
+    if split == 'train':
+        train_seqs, val_seqs = [], []
+
+        # 3a) 2D: shuffle & chunk frames into many K‐length sequences
+        K = max_frames_per_sequence
+        for (ds, sub, tasks), frames in grouped2D.items():
+            random.seed(seed)
+            random.shuffle(frames)
+            # Split into train / val at frame‐level
+            n_val = int(len(frames) * val_frac)
+            train_f, val_f = frames[n_val:], frames[:n_val]
+            # Restore temporal order within each split
+            train_f.sort(key=lambda pair: extract_idx(pair[0]))
+            val_f.sort(  key=lambda pair: extract_idx(pair[0]))
+
+            # Chunk each into sliding / non‐overlapping windows of length K
+            for i in range(0, len(train_f), K):
+                chunk = train_f[i : i + K] # Train
+                if chunk:
+                    train_seqs.append({
+                        'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                        'sequence': chunk, 'dim': 2
+                    })
+            for i in range(0, len(val_f), K): # Val
+                chunk = val_f[i : i + K]
+                if chunk:
+                    val_seqs.append({
+                        'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                        'sequence': chunk, 'dim': 2
+                    })
+
+        # 3b) 3D: shuffle & split volumes per sequence
+        for (ds, sub, tasks), vols in grouped3D.items():
+            random.seed(seed)
+            random.shuffle(vols)
+            n_val   = int(len(vols) * val_frac)
+            train_v = vols[n_val:]
+            val_v   = vols[:n_val]
+
+            for v in train_v:
+                train_seqs.append({'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                                   'sequence': [v], 'dim': 3})
+            for v in val_v:
+                val_seqs.  append({'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                                   'sequence': [v], 'dim': 3})
+
+        return train_seqs, val_seqs
+
+    # Test split
+    test_seqs = []
+    for (ds, sub, tasks), frames in grouped2D.items():
+        frames.sort(key=lambda pair: extract_idx(pair[0]))
+        test_seqs.append({'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                          'sequence': frames, 'dim': 2})
+
+    for (ds, sub, tasks), vols in grouped3D.items():
+        for v in vols:
+            test_seqs.append({'dataset': ds, 'subdataset': sub, 'tasks': list(tasks),
+                              'sequence': [v], 'dim': 3})
+
+    return test_seqs
 
 def get_data_loaders(config):
     """
     Given a config object, this function will create a set of train, val, and test
     data loaders using the DRIPP pairings. The function works as follows:
 
-    1) Load all DRIPP pairings for the train and test splits.
-    2) Group each set of pairings by (dataset, subdataset).
-    3) Split each train group into train/val using the val_frac parameter.
-    4) Load the DRIPP tasks map.
-    5) Build a dataset + loader for each group.
+    1) Load all DRIPP sequences for the train and test splits.
+    2) Load the DRIPP tasks map.
+    3) Build a dataset + loader for each group.
 
     Args:
         config: A config object with the following attributes:
@@ -279,55 +426,48 @@ def get_data_loaders(config):
         tuple: A tuple of (train_loaders, val_loaders, test_loaders), where each
                loader is a dict mapping (dataset, subdataset) to a DataLoader instance.
     """
-    # 1) Load all DRIPP pairings
-    train_pairings = get_pairings(config.dripp.output_dir, split='train')
-    test_pairs     = get_pairings(config.dripp.output_dir, split='test')
+    # 1) Load all sequences
+    train_seqs, val_seqs = get_sequences(
+        config.dripp.output_dir,
+        split='train',
+        val_frac=config.training.val_frac,
+        seed=config.training.seed
+    )
+    test_seqs = get_sequences(
+        config.dripp.output_dir,
+        split='test'
+    )
 
-    # 2) Group by (dataset, subdataset).
-    train_groups = defaultdict(list)
-    for pair in train_pairings:
-        key = (pair['dataset'], pair.get('subdataset', ''))
-        train_groups[key].append(pair)
-
-    test_groups = defaultdict(list)
-    for pair in test_pairs:
-        key = (pair['dataset'], pair.get('subdataset', ''))
-        test_groups[key].append(pair)
-
-    # 3) Split each train group into train/val
-    val_groups = {}
-    for key, pairs in train_groups.items():
-        random.seed(config.training.seed)
-        random.shuffle(pairs)
-        n_val = int(len(pairs) * config.training.val_frac)
-        val_groups[key]   = pairs[:n_val]
-        train_groups[key] = pairs[n_val:]
-
-    # Remove empty groups
-    train_groups = {k: v for k, v in train_groups.items() if v}
-    val_groups   = {k: v for k, v in val_groups.items()   if v}
-    test_groups  = {k: v for k, v in test_groups.items()  if v}
-
-    # 4) Load DRIPP tasks map
+    # 2) Load the tasks map
     tasks_map = json.load(open(config.dripp.tasks_file, 'r'))
 
-    # 5) Flatten into three big lists
-    all_train_pairs = [p for pairs in train_groups.values() for p in pairs]
-    all_val_pairs   = [p for pairs in val_groups.values()   for p in pairs]
-    all_test_pairs  = [p for pairs in test_groups.values()  for p in pairs]
-
-    # single train loader with balanced sampler
-    train_ds      = SegmentationSequenceDataset(all_train_pairs, transform=SequenceTransform())
-    train_sampler = BalancedTaskSampler(all_train_pairs, tasks_map, config.training.seed)
-    train_loader  = DataLoader(train_ds, batch_size=config.training.batch_size, sampler=train_sampler, num_workers=config.training.num_workers, pin_memory=True)
-
-    # single val loader (no sampler)
-    val_ds     = SegmentationSequenceDataset(all_val_pairs, transform=SequenceTransform())
-    val_loader = DataLoader(val_ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
-
-    # single test loader
-    test_ds     = SegmentationSequenceDataset(all_test_pairs, transform=SequenceTransform())
-    test_loader = DataLoader(test_ds, batch_size=config.training.batch_size, shuffle=False, num_workers=config.training.num_workers, pin_memory=True)
+    # 3) Build a dataset + loader for each group
+    # Train
+    train_ds      = SegmentationSequenceDataset(train_seqs, transform=SequenceTransform())
+    train_sampler = BalancedTaskSampler(train_seqs, tasks_map, config.training.seed)
+    train_loader  = DataLoader(train_ds,
+                               batch_size=config.training.batch_size,
+                               sampler=train_sampler,
+                               num_workers=config.training.num_workers,
+                               pin_memory=True)
+    
+    # Val
+    val_loader = DataLoader(
+        SegmentationSequenceDataset(val_seqs, transform=SequenceTransform()),
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=config.training.num_workers,
+        pin_memory=True
+    )
+    
+    # Test
+    test_loader = DataLoader(
+        SegmentationSequenceDataset(test_seqs, transform=SequenceTransform()),
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=config.training.num_workers,
+        pin_memory=True
+    )
 
     print("Data loaders created.")
     return train_loader, val_loader, test_loader
@@ -505,8 +645,6 @@ def setup_optimizer_and_scheduler(model, config, data_dimension):
         'optimizers': [mask_decoder_opt, memory_opt],
         'scheduler':  scheduler3d
     }
-
-from tqdm.auto import tqdm
 
 def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched2d, sched3d, config, scaler, epoch, logger):
     """
