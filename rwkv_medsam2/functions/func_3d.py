@@ -133,14 +133,14 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
         p_seg_losses, p_dis_losses   = [], [] # Losses for frames with prompts
         np_seg_losses, np_dis_losses = [], [] # Losses for frames without prompts
         for frame_idx in range(T):
-            student_logit = student_preds[frame_idx]   # [1,Hf,Wf]
-            teacher_logit = teacher_preds[frame_idx]   # [1,Hf,Wf]
+            student_logit = student_preds[frame_idx]            # [1,Hf,Wf]
+            teacher_logit = teacher_preds[frame_idx]            # [1,Hf,Wf]
 
             # Resize to out_size
             student_pred = F.interpolate(student_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
             teacher_pred = F.interpolate(teacher_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
 
-            gt_mask = mask_seq[frame_idx].float()      # [1,1,H,W]
+            gt_mask = mask_seq[frame_idx].float().unsqueeze(0)  # [1,1,H,W]
 
             frame_seg_loss = F.binary_cross_entropy_with_logits(student_pred, gt_mask, pos_weight=torch.tensor(pos_weight, device=device))
             frame_dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
@@ -156,7 +156,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
         avg_p_seg_loss = torch.stack(p_seg_losses).mean()
         avg_p_dis_loss = torch.stack(p_dis_losses).mean()
         prompt_loss    = alpha * avg_p_seg_loss + (1-alpha) * avg_p_dis_loss
-        if len(prompt_idxs) > 1:
+        if len(np_seg_losses) > 0:
             avg_np_seg_loss = torch.stack(np_seg_losses).mean()
             avg_np_dis_loss = torch.stack(np_dis_losses).mean()
             non_prompt_loss = alpha * avg_np_seg_loss + (1-alpha) * avg_np_dis_loss
@@ -282,7 +282,7 @@ def validate_step_3d(student, batch, config, return_logits=False):
         pred_mask = (pred_prob > 0.5).long().squeeze(0).squeeze(0)  # [H,W]
 
         # Compute ground truth mask
-        gt_mask = mask_seq[t] # [1,1,H,W]
+        gt_mask = mask_seq[t].unsqueeze(0) # [1,1,H,W]
         gt_up = F.interpolate(gt_mask.float(), size=(out_size, out_size), mode='nearest').long().squeeze(0).squeeze(0)
 
         # Compute metrics

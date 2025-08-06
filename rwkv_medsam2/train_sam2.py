@@ -42,7 +42,7 @@ from .functions.func_2d import train_step_2d, validate_step_2d
 from .functions.func_3d import train_step_3d, validate_step_3d
 
 from .dataset import SegmentationSequenceDataset, BalancedTaskSampler, SequenceTransform
-from .utils.vis import visualize_predictions_2d, visualize_nifti_predictions
+from .utils.vis import visualize_sequence
 
 def load_config(config_path):
     """
@@ -693,25 +693,19 @@ def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched
             loss = train_step_2d(student, teacher, optimizer2d, batch, config, mem_bank, scaler)
             if not first_vis:
                 # Visualize 2D
-                metrics, logits = validate_step_2d(student, batch, config, return_logits=True)
-                img = batch['image'][0,0]; msk = batch['mask'][0,0]; pred = logits[0]
-                visualize_predictions_2d(img, msk, pred)
+                # Get per‐frame logits
+                _, logits_seq = validate_step_2d(student, batch, config, return_logits=True)
+                visualize_sequence(batch['image'][0], batch['mask'][0].squeeze(1), logits_seq, threshold=0.5, fps=2,)
                 first_vis = True
         else:
             # 3D step
-            opt3a, opt3b = optimizers3d
-            loss, pl, npl = train_step_3d(student, teacher, opt3a, opt3b, batch, config, scaler)
+            mask_decoder_opt, memory_opt = optimizers3d
+            loss, pl, npl = train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config, scaler)
             if not first_vis:
                 # Visualize 3D
-                metrics3, logits3 = validate_step_3d(student, batch, config, return_logits=True)
-                img_np  = batch['image'][0].cpu().numpy()
-                msk_np  = batch['mask'][0].cpu().numpy()
-                vol_i, vol_m, vol_p = img_np[:,0], msk_np[:,0], logits3.detach().cpu().numpy()[:,0]
-                visualize_nifti_predictions(
-                    vol_i, vol_m, vol_p,
-                    axes=('Axial','Coronal','Sagittal'),
-                    threshold=0.5, alpha=0.4, figsize=(12,4)
-                )
+                # Get full‐sequence logits [T,H,W]
+                _, logits3_seq = validate_step_3d(student, batch, config, return_logits=True)
+                visualize_sequence(batch['image'][0], batch['mask'][0].squeeze(1), logits3_seq, threshold=0.5, fps=2,)
                 first_vis = True
         # Update total loss
         total_loss += loss

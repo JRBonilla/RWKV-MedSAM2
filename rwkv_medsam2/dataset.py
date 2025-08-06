@@ -108,14 +108,20 @@ class SegmentationSequenceDataset(Dataset):
                 label_list.append(torch.empty((0,),   dtype=torch.int64))
                 bbox_list.append(prompt['bbox'])       # Tensor[4]
 
+        # Only unsqueeze if needed
+        mask_seq = masks
+        if mask_seq.ndim == 3:              # [T,H,W]
+            mask_seq = mask_seq.unsqueeze(1)
+
         return {
-            'image':      imgs,               # Tensor[T,C,H,W]
-            'mask':       masks.unsqueeze(1), # Tensor[T,1,H,W]
-            'pt_list':    pt_list,            # List[T] of Tensor[n,2]
-            'p_label':    label_list,         # List[T] of Tensor[n]
-            'bbox':       bbox_list,          # List[T] of Tensor[4]
-            'dataset':    ds_name,
-            'subdataset': sub_name,
+            'image':      imgs,                 # Tensor[T,C,H,W]
+            'mask':       mask_seq,             # Tensor[T,1,H,W]
+            'pt_list':    pt_list,              # List[T] of Tensor[n,2]
+            'p_label':    label_list,           # List[T] of Tensor[n]
+            'bbox':       bbox_list,            # List[T] of Tensor[4]
+            'dataset':    ds_name,              # Dataset name
+            'subdataset': sub_name,             # Subdataset name
+            'seq_idx':    idx                   # Index of the sequence (for debugging)
         }
 
     def _load_2d_sequence(self, seq):
@@ -375,9 +381,12 @@ class SequenceTransform:
             torch.Tensor: Transformed image.
             torch.Tensor: Transformed mask.
         """
-        # Ensure mask has a channel dimension so torchvision transforms work
+        # Ensure mask has a channel dim so torchvision transforms work
         if mask.ndim == 2:
-          mask = mask.unsqueeze(0) # Now [1,H,W]
+            mask = mask.unsqueeze(0)  # [1,H,W]
+
+        # Keep originals around in case we need to roll back
+        orig_image, orig_mask = image.clone(), mask.clone()
         
         _, h, w = image.shape
         if self.do_rotate:
@@ -408,6 +417,10 @@ class SequenceTransform:
             image, mask = TF.hflip(image), TF.hflip(mask)
         if self.vflip:
             image, mask = TF.vflip(image), TF.vflip(mask)
+
+        # Safety check: If this transform zeroed out the mask, revert
+        if (mask > 0).sum() == 0:
+            return orig_image, orig_mask
         return image, mask
 
 def generate_prompt(mask_tensor, prompt_type='click'):

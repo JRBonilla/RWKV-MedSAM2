@@ -38,19 +38,23 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
     capacity   = config.memory_bank.capacity
     c_thresh   = config.memory_bank.c_thresh
 
-    # 1) Unpack first slice
-    imgs  = batch['image'][:,0].to(device) # [B,C,H,W]
-    masks = batch['mask'][:,0].to(device)  # [B,1,H,W]
-    batch_size = imgs.size(0)              # B = batch_size
+    # 1) Unpack all frames & flatten batch/time
+    B,T,C,H,W  = batch['image'].shape
+    imgs       = batch['image'].view(B*T, C, H, W).to(device)   # [B*T, C, H, W]
+    masks      = batch['mask'].view( B*T, 1, H, W).to(device)   # [B*T, 1, H, W]
+    batch_size = B * T
 
-    # 2) Build sparse prompts for slice 0
-    raw_points = batch['pt_list'][0]
-    raw_labels = batch['p_label'][0]
+    # 2) Build sparse prompts per flattened frame (B*T total)
+    raw_pt_list  = batch['pt_list']    # List[T] of length-B lists of point Tensors
+    raw_lbl_list = batch['p_label']    # List[T] of length-B lists of label Tensors
     points, labels = [], []
-    for i in range(batch_size):
-        if raw_points[i] is not None:
-            points.append(raw_points[i].to(device).unsqueeze(0).float()) # [1,N,2]
-            labels.append(raw_labels[i].to(device).unsqueeze(0).long())  # [1,N]
+    for t in range(T):
+        for b in range(B):
+            pts = raw_pt_list[t][b]
+            lbs = raw_lbl_list[t][b]
+            if pts is not None and pts.numel() > 0:
+                points.append(pts.to(device).unsqueeze(0).float())  # [1,n,2]
+                labels.append(lbs.to(device).unsqueeze(0).long())   # [1,n]
     if points:
         sparse_points = torch.cat(points, dim=0)
         sparse_labels = torch.cat(labels, dim=0)
@@ -58,13 +62,23 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         sparse_points = sparse_labels = None
 
     # 3) Encode prompts
-    sparse_embs, dense_embs = student.sam_prompt_encoder(
-        points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-        boxes=None, masks=None
-    )
-    image_pe = student.sam_prompt_encoder.get_dense_pe()
+    # Build a single prompt_args dict for both student & teacher
+    if sparse_points is None or sparse_points.shape[0] < batch_size:
+        # Fallback to full‐image box
+        full_box   = torch.tensor([0, 0, W-1, H-1], device=device, dtype=torch.int64)
+        prompt_args = {'points': None,
+                       'boxes': full_box.unsqueeze(0).repeat(batch_size, 1),
+                       'masks': None}
+    else:
+        prompt_args = {'points': (sparse_points, sparse_labels),
+                       'boxes': None,
+                       'masks': None}
 
-    # 4) Mixed precision + TF32
+    # Student embeddings
+    sparse_embs, dense_embs = student.sam_prompt_encoder(**prompt_args)
+    image_pe                = student.sam_prompt_encoder.get_dense_pe()
+
+    # 4) Enable TF32 matmuls on Ampere+ GPUs while using bfloat16 autocast
     if torch.cuda.get_device_properties(0).major >= 8:
         # Turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,7 +93,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
 
         if memory_bank:
-            # Build [tokens, B, C] memory + pos
+            # Gather saved memory features & positions -> [bank_size, P, C, H, W]
             mem_feats = torch.cat([m[0] for m in memory_bank], dim=0)
             mem_pos   = torch.cat([m[1] for m in memory_bank], dim=0)
             # Sample one entry per batch by similarity
@@ -148,8 +162,6 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
 
         image_pe = image_pe.clone()
         
-        # print(f"Student image embedding: {image_embed.shape}, student dense embs: {dense_embs.shape}")
-
         student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=image_pe,
@@ -159,15 +171,15 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             repeat_image=False,
             high_res_features=hires_feats
         )
-        student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
+        student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B*T,1,H,W]
 
         # 7) Teacher distillation
         with torch.no_grad():
             teacher_backbone = teacher.forward_image(imgs)
-            # Get both feats *and* spatial sizes
+            # Get both feats and spatial sizes
             _, t_feats, t_pos, t_sizes = teacher._prepare_backbone_features(teacher_backbone)
 
-            # Rebuild the same "feats" list the student uses
+            # Rebuild the same feats list the student uses
             feats_t = [
                 feat.permute(1, 2, 0).view(batch_size, -1, *size)
                 for feat, size in zip(t_feats[::-1], t_sizes[::-1])
@@ -176,10 +188,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
             teacher_hires_feats = feats_t[:-1]
 
             # Encode the exact same prompts
-            teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(
-                points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-                boxes=None, masks=None
-            )
+            teacher_sparse_embs, teacher_dense_embs = teacher.sam_prompt_encoder(**prompt_args)
 
             # Resize dense prompts to match teacher_embed's HxW
             teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
@@ -198,17 +207,20 @@ def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scale
                 repeat_image=False,
                 high_res_features=teacher_hires_feats
             )
-            teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
+            teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B*T,1,H,W]
 
         # 8) Compute losses
-        # Segmentation loss
+        # a) Segmentation loss (BCE)
         mask_target = masks.to(student_pred.dtype).clone()
         if mask_target.dim() == student_pred.dim() + 1:
-          mask_target = mask_target.squeeze(2) # [B,1,1,H,W] -> [B,1,W,H]
+          mask_target = mask_target.squeeze(2) # [B*T,1,1,H,W] -> [B*T,1,W,H]
         pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
         seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
 
+        # b) Distillation loss (KL-divergence)
         dis_loss = F.kl_div(F.log_softmax(student_pred, dim=1), F.softmax(teacher_pred, dim=1), reduction='batchmean')
+        
+        # c) Total loss (weighted sum of both losses)
         loss = alpha * seg_loss + (1-alpha) * dis_loss
 
     # 9) Memory encode and update
@@ -278,19 +290,23 @@ def validate_step_2d(student, batch, config, return_logits=False):
     device   = config.training.device
     out_size = config.training.out_size
 
-    # 1) Unpack
-    imgs       = batch['image'][:, 0].to(device)  # [B,C,H,W]
-    masks      = batch['mask'][:, 0].to(device)   # [B,1,H,W]
-    batch_size = imgs.size(0)
+    # 1) Unpack all frames & flatten batch/time
+    B,T,C,H,W  = batch['image'].shape
+    imgs       = batch['image'].view(B*T, C, H, W).to(device)   # [B*T, C, H, W]
+    masks      = batch['mask'].view( B*T, 1, H, W).to(device)   # [B*T, 1, H, W]
+    batch_size = B * T
 
-    # 2) Build sparse prompts exactly as in train
-    raw_points = batch['pt_list'][0]
-    raw_labels = batch['p_label'][0]
+    # 2) Build sparse prompts over all T frames (flattened to B*T images)
+    raw_pt_list  = batch['pt_list']    # List[T] of length-B lists of point Tensors
+    raw_lbl_list = batch['p_label']    # List[T] of length-B lists of label Tensors
     points, labels = [], []
-    for i in range(batch_size):
-        if raw_points[i] is not None:
-            points.append(raw_points[i].to(device).unsqueeze(0).float())  # [1,N,2]
-            labels.append(raw_labels[i].to(device).unsqueeze(0).long())   # [1,N]
+    for t in range(T):
+        for b in range(B):
+            pts = raw_pt_list[t][b]
+            lbs = raw_lbl_list[t][b]
+            if pts is not None and pts.numel() > 0:
+                points.append(pts.to(device).unsqueeze(0).float())  # [1,n,2]
+                labels.append(lbs.to(device).unsqueeze(0).long())   # [1,n]
     if points:
         sparse_points = torch.cat(points, dim=0)
         sparse_labels = torch.cat(labels, dim=0)
@@ -299,10 +315,23 @@ def validate_step_2d(student, batch, config, return_logits=False):
 
     # 3) Prompt‑encode, forward backbone, prepare features & decode mask
     with torch.no_grad():
-        sparse_embs, dense_embs = student.sam_prompt_encoder(
-            points=(sparse_points, sparse_labels) if sparse_points is not None else None,
-            boxes=None, masks=None
-        )
+        # If no clicks *or* fewer clicks than images, use full-image boxes
+        if sparse_points is None or sparse_points.shape[0] < batch_size:
+            # Build [batch_size, 4] tensor: [x1,y1,x2,y2] = full image
+            full_box = torch.tensor([0, 0, W-1, H-1], device=device, dtype=torch.int64)
+            boxes    = full_box.unsqueeze(0).repeat(batch_size, 1)
+            sparse_embs, dense_embs = student.sam_prompt_encoder(
+                points=None,
+                boxes=boxes,
+                masks=None
+            )
+        else:
+            sparse_embs, dense_embs = student.sam_prompt_encoder(
+                points=(sparse_points, sparse_labels),
+                boxes=None,
+                masks=None
+            )
+
         image_pe = student.sam_prompt_encoder.get_dense_pe()
 
         backbone_out = student.forward_image(imgs)
@@ -331,25 +360,29 @@ def validate_step_2d(student, batch, config, return_logits=False):
             high_res_features=hires_feats
         )
 
-        # a) Up-sample the raw logits to output size
-        logits_up = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B,1,H,W]
+        # a) Up-sample the raw logits to output size -> flat [B*T,1,H_out,W_out]
+        logits_up_flat = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
+        # b) Reshape flat logits into sequence [B, T, H_out, W_out] for per-frame metrics
+        _, _, Hout, Wout = logits_up_flat.shape
+        logits_up_seq = logits_up_flat.view(B, T, Hout, Wout)  # [B,T,H,W]
 
-        # b) Compute probabilities and hard predictions for metrics
-        probs = torch.sigmoid(logits_up) # [B,1,H,W]
-        preds = (probs > 0.5).long().squeeze(1).cpu()
-        
-        # If masks are [B,1,1,H,W], squeeze to [B,1,H,W]
-        if masks.dim() == 5 and masks.size(2) == 1:
-            masks = masks.squeeze(2)
-        
-        masks = F.interpolate(masks.float().cpu(), size=(out_size, out_size), mode='nearest').long().squeeze(1)  # [B,H,W]
+        # c) Compute probabilities and hard predictions: [B,T,H,W]
+        probs      = torch.sigmoid(logits_up_seq)
+        preds_seq  = (probs > 0.5).long().cpu()
+
+        # d) Up-sample masks to match out_size, then reshape to [B, T, H_out, W_out]
+        masks_seq = masks
+
+        # e) Flatten to [B*T, H_out, W_out] for per-frame metrics
+        preds_flat = preds_seq.view(B * T, Hout, Wout)
+        masks_flat = masks_seq.view(B * T, Hout, Wout)
 
     # 4) Metrics
     iou_list, dice_list, hd95_list = [], [], []
     for i in range(batch_size):
-        iou_list.append(compute_iou(preds[i], masks[i]))
-        dice_list.append(compute_dice(preds[i], masks[i]))
-        hd95_list.append(compute_hd95(preds[i], masks[i]))
+        iou_list.append(compute_iou(  preds_flat[i], masks_flat[i]))
+        dice_list.append(compute_dice(preds_flat[i], masks_flat[i]))
+        hd95_list.append(compute_hd95(preds_flat[i], masks_flat[i]))
 
     # Compute averages of all metrics
     metrics = {
@@ -360,6 +393,6 @@ def validate_step_2d(student, batch, config, return_logits=False):
 
     if return_logits:
         # Return up-sampled raw logits (on CPU) so validate_epoch can visualize them
-        return metrics, logits_up.squeeze(1).cpu() # [B,H,W]
+        return metrics, logits_up_seq.cpu() # [B,T,H,W]
     else:
         return metrics

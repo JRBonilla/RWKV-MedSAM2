@@ -4,6 +4,8 @@
 # - visualize_predictions_2d    - Visualize a 2D image, its ground truth mask, and its predicted mask.
 # - visualize_nifti_predictions - Visualize a 3D image, its ground truth mask, and its predicted mask.
 import matplotlib.pyplot as plt
+from matplotlib import animation
+from IPython.display import display, HTML
 import numpy as np
 import torch
 from typing import Union, List
@@ -143,3 +145,71 @@ def visualize_nifti_predictions(img_vol, gt_mask_vol, pred_logits, axes=('Axial'
 
     plt.tight_layout()
     plt.show()
+
+def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=2, figsize=(12,4)):
+    """
+    Animate a sequence of 2D frames side-by-side:
+      [Input image | GT mask | Predicted mask]
+
+    Plays forward then backward in a loop (ping-pong style).
+
+    Args:
+        image_seq       (torch.Tensor or np.ndarray): [T,C,H,W] or [T,H,W]
+        mask_seq        (torch.Tensor or np.ndarray): [T,1,H,W] or [T,H,W]
+        pred_logits_seq (torch.Tensor or np.ndarray): [T,1,H,W] or [T,H,W]
+        threshold       (float): sigmoid cutoff for binarizing pred.
+        fps             (int): frames per second.
+        figsize         (tuple): size of the matplotlib figure.
+    Returns:
+        ani (FuncAnimation): the animation object (can be saved or displayed).
+    """
+    # 1) to numpy & drop singleton channels → [T,H,W]
+    if hasattr(image_seq, 'cpu'):
+        image_seq       = image_seq.cpu().numpy()
+        mask_seq        = mask_seq.cpu().numpy()
+        pred_logits_seq = pred_logits_seq.cpu().numpy()
+    if mask_seq.ndim == 4 and mask_seq.shape[1] == 1:
+        mask_seq = mask_seq[:,0]
+    if pred_logits_seq.ndim == 4 and pred_logits_seq.shape[1] == 1:
+        pred_logits_seq = pred_logits_seq[:,0]
+
+    T = image_seq.shape[0]
+    # 2) build normalized frames
+    frames = []
+    for t in range(T):
+        img = np.squeeze(image_seq[t])
+        if img.ndim == 3:
+            img = img.transpose(1,2,0)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+        gt    = np.squeeze(mask_seq[t])
+        pred  = (1/(1+np.exp(-np.squeeze(pred_logits_seq[t])))) >= threshold
+        frames.append((img, gt, pred))
+
+    # 3) set up figure & initial images
+    fig, (ax0,ax1,ax2) = plt.subplots(1,3, figsize=figsize)
+    for ax in (ax0,ax1,ax2): ax.axis('off')
+    ax0.set_title('Input'); ax1.set_title('GT'); ax2.set_title('Pred')
+
+    im0 = ax0.imshow(frames[0][0], cmap='gray', animated=True)
+    im1 = ax1.imshow(frames[0][1], cmap='gray', animated=True)
+    im2 = ax2.imshow(frames[0][2], cmap='gray', animated=True)
+
+    # 4) ping-pong frame indices & interval
+    seq = list(range(T)) + list(range(T-2, 0, -1))
+    interval = 1000 / fps  # ms per frame
+
+    def _update(i):
+        img, gt, pr = frames[i]
+        im0.set_array(img)
+        im1.set_array(gt)
+        im2.set_array(pr)
+        return im0, im1, im2
+
+    ani = animation.FuncAnimation(
+        fig, _update, frames=seq,
+        interval=interval, blit=True, repeat=True
+    )
+
+    plt.close(fig)                     # prevent double‐display
+    display(HTML(ani.to_jshtml()))
