@@ -82,11 +82,25 @@ class SegmentationSequenceDataset(Dataset):
         # Limit sequence length if too long
         T_full = imgs.shape[0]
         if T_full > self.max_frames_per_sequence:
-            # Randomly choose max_frames_per_sequence frames
-            idxs = random.sample(range(T_full), self.max_frames_per_sequence)
-            idxs.sort()
-            imgs  = imgs[idxs]
-            masks = masks[idxs]
+            N = self.max_frames_per_sequence
+    
+            # Find indices of frames that actually contain mask pixels
+            # mask[i] is [1,H,W], .any()->Tensor, .item()->bool
+            pos_idxs = [i for i in range(T_full) if masks[i].any().item()]
+    
+            if len(pos_idxs) >= N:
+                # If we have enough positives, just sample N of them
+                selected = random.sample(pos_idxs, N)
+            else:
+                # Otherwise, take all positives and fill the rest from the remaining frames
+                neg_idxs = list(set(range(T_full)) - set(pos_idxs))
+                n_fill   = N - len(pos_idxs)
+                fill     = random.sample(neg_idxs, n_fill)
+                selected = pos_idxs + fill
+    
+            selected.sort()
+            imgs  = imgs[selected]
+            masks = masks[selected]
 
         # Generate prompts per slice (return empty tensors if no prompt)
         pt_list, label_list, bbox_list = [], [], []
@@ -228,6 +242,7 @@ class SegmentationSequenceDataset(Dataset):
             tuple: A tuple containing the image tensor and the mask tensor.
         """
         img = torch.from_numpy(img_arr).float()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
         if img.ndim == 2:               # Single channel
             img = img.unsqueeze(0)
         elif img.ndim == 3 and img.shape[0] not in (1, 3):

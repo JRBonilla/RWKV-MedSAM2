@@ -178,7 +178,8 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
     frames = []
     for t in range(T):
         img = np.squeeze(image_seq[t])
-        if img.ndim == 3:
+        # Only transpose if channel-first and not HxWxC
+        if img.ndim == 3 and img.shape[0] in (1,3,4):
             img = img.transpose(1,2,0)
         img = (img - img.min()) / (img.max() - img.min() + 1e-8)
 
@@ -191,7 +192,11 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
     for ax in (ax0,ax1,ax2): ax.axis('off')
     ax0.set_title('Input'); ax1.set_title('GT'); ax2.set_title('Pred')
 
-    im0 = ax0.imshow(frames[0][0], cmap='gray', animated=True)
+    img0 = frames[0][0] # Use gray for 2D and RGB for anything else
+    if img0.ndim == 2:
+        im0 = ax0.imshow(img0, cmap='gray', animated=True)
+    else:
+        im0 = ax0.imshow(img0, animated=True)
     im1 = ax1.imshow(frames[0][1], cmap='gray', animated=True)
     im2 = ax2.imshow(frames[0][2], cmap='gray', animated=True)
 

@@ -721,7 +721,6 @@ def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched
 
     return avg_loss
 
-
 def validate_epoch(student, val_loader, config):
     """
     Run one full validation epoch, calling validate_step_2d or validate_step_3d
