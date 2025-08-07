@@ -54,10 +54,9 @@ logging:
 # ---- Checkpoint config --------------------------------------------------------------
 ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 
-
 # ---- Teacher settings ---------------------------------------------------------------
 teacher:
-  _config_path: "sam2/sam2_hiera_t.yaml"
+  _config_path: "sam2/sam2_hiera_t_512.yaml"
   ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
 
 # ---- Model config -------------------------------------------------------------------

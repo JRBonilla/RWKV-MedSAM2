@@ -47,7 +47,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
     imgs     = imgs_seq.squeeze(0) # [T,C,H,W]
     mask_seq = mask_seq.squeeze(0) # [T,1,H,W]
     # Upsample to teacher's image resolution
-    imgs_up  = F.interpolate(imgs, size=(teacher.image_size, teacher.image_size), mode='bilinear', align_corners=False)
+    # imgs_up  = F.interpolate(imgs, size=(teacher.image_size, teacher.image_size), mode='bilinear', align_corners=False)
 
     # 2) Initialize state for student and teacher
     if torch.cuda.get_device_properties(device).major >= 8:
@@ -61,7 +61,7 @@ def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config,
 
     teacher.eval()
     with torch.no_grad():
-        teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs_up, mode="eval")
+        teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs, mode="eval")
 
     # 3) Select prompt frames evenly
     T = imgs.shape[0] # T = num_frames

@@ -754,7 +754,6 @@ def validate_epoch(student, val_loader, config):
     # 2) Compute metrics
     return {k: totals[k] / n for k in totals}
 
-
 def main(config_path, resume, multi_gpu, amp):
     """
     Train a SAM2 model from scratch or from a checkpoint.
@@ -762,7 +761,7 @@ def main(config_path, resume, multi_gpu, amp):
     This function will:
 
     1.  Load the configuration from the given YAML file.
-    2.  Set up the data loaders for the training and validation datasets.
+    2.  Set up the data loaders for the training, validation, and test datasets.
     3.  Build the student and teacher models.
     4.  Set up the optimizers, scheduler, and AMP (mixed precision) scaler.
     5.  If multi-GPU is enabled and there is more than one GPU, use DataParallel.
@@ -770,7 +769,7 @@ def main(config_path, resume, multi_gpu, amp):
     7.  Run the training loop for the specified number of epochs.
     8.  Run the validation loop at the end of each epoch depending on the validation frequency.
     9.  Save the latest and best checkpoints after validation.
-    10. Log training metrics and validation metrics.
+    10. Log training metrics and validation and test metrics.
 
     Args:
         config_path (str): Path to the YAML configuration file.
@@ -782,8 +781,8 @@ def main(config_path, resume, multi_gpu, amp):
     config = load_config(config_path)
     logger = setup_logger(config.logging)
 
-    # 2) Data loaders
-    train_loader, val_loader, _ = get_data_loaders(config)
+    # 2) Data loaders (train, validation, test)
+    train_loader, val_loader, test_loader = get_data_loaders(config)
 
     # 3) Build Models
     student = build_student_predictor(config).to(config.training.device)
@@ -835,7 +834,15 @@ def main(config_path, resume, multi_gpu, amp):
             # 10) Log metrics
             logger.info(f"[Epoch {epoch}] Val metrics: {val_metrics}")
 
+            # --- Optional: run test evaluation at final epoch ---
+            if epoch == config.training.epochs - 1:
+                test_metrics = validate_epoch(student, test_loader, config)
+                logger.info(f"[Epoch {epoch}] Test metrics: {test_metrics}")
+
     logger.info("Training complete.")
+    # Final test pass after training loop
+    test_metrics = validate_epoch(student, test_loader, config)
+    logger.info(f"Final test metrics: {test_metrics}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
