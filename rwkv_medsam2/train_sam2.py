@@ -42,7 +42,7 @@ from .functions.func_2d import train_step_2d, validate_step_2d
 from .functions.func_3d import train_step_3d, validate_step_3d
 
 from .dataset import SegmentationSequenceDataset, BalancedTaskSampler, SequenceTransform
-from .utils.vis import visualize_sequence
+from .utils.vis import visualize_sequence, view_triplanar_interactive, montage_overlays
 
 def load_config(config_path):
     """
@@ -453,7 +453,7 @@ def get_data_loaders(config):
     
     # Val
     val_loader = DataLoader(
-        SegmentationSequenceDataset(val_seqs, transform=SequenceTransform()),
+        SegmentationSequenceDataset(val_seqs, transform=SequenceTransform(), truncate=True),
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=config.training.num_workers,
@@ -462,7 +462,7 @@ def get_data_loaders(config):
     
     # Test
     test_loader = DataLoader(
-        SegmentationSequenceDataset(test_seqs, transform=SequenceTransform()),
+        SegmentationSequenceDataset(test_seqs, transform=SequenceTransform(), truncate=True),
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=config.training.num_workers,
@@ -535,6 +535,7 @@ def build_student_predictor(config):
         apply_postprocessing=True,
     )
     video_predictor.train()
+    video_predictor.use_obj_ptrs_in_encoder = False
     return video_predictor
 
 def build_teacher_predictor(config):
@@ -556,6 +557,7 @@ def build_teacher_predictor(config):
         apply_postprocessing=True,
     )
     video_predictor.eval()
+    video_predictor.use_obj_ptrs_in_encoder = False
     return video_predictor
 
 def setup_optimizer_and_scheduler(model, config, data_dimension):
@@ -703,9 +705,32 @@ def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched
             loss, pl, npl = train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config, scaler)
             if not first_vis:
                 # Visualize 3D
-                # Get full‐sequence logits [T,H,W]
-                _, logits3_seq = validate_step_3d(student, batch, config, return_logits=True)
+                # Get per-frame logits and optional 3D aggregated probs
+                val_out = validate_step_3d(student, batch, config, return_logits=True)
+                logits3_seq = val_out["per_frame_logits"]  # [T, H, W]
                 visualize_sequence(batch['image'][0], batch['mask'][0].squeeze(1), logits3_seq, threshold=0.5, fps=2,)
+                # Use aggregated probability volume if available
+                #agg_prob = val_out.get("aggregated_prob")  # [D, H, W] probabilities
+                #if agg_prob is not None:
+                #    # Try to fetch the full image/mask volume (path or array).
+                #    vol_img = (batch.get('vol_image_path') or batch.get('vol_image') or batch.get('img_vol'))
+                #    vol_gt  = (batch.get('vol_mask_path') or batch.get('vol_mask') or batch.get('gt_vol'))
+                #
+                #    try:
+                #        if vol_img is not None and vol_gt is not None:
+                #            # Interactive tri-planar viewer
+                #            view_triplanar_interactive(vol_img, agg_prob, vol_gt, prob_alpha=0.5, figsize=(12, 4))
+                #            # Static axial montage
+                #            step = max(1, int(agg_prob.shape[0] / 12))
+                #            montage_overlays(vol_img, agg_prob, vol_gt, plane='Axial', step=step, ncols=6, prob_alpha=0.5, figsize=(12, 4))
+                #            # (Optional) Write to NIfTI for Slicer/ITK-SNAP inspection:
+                #            # save_prob_to_nifti(agg_prob, "pred_prob_epoch{:03d}.nii.gz".format(epoch),
+                #            #                    reference_img_path=vol_img if isinstance(vol_img, (str, bytes, os.PathLike)) else None)
+                #        else:
+                #            # Fallback: visualize probabilities alone by using them as the "background" image
+                #            view_triplanar_interactive(agg_prob, agg_prob, None, prob_alpha=0.75, figsize=(12, 4))
+                #    except Exception as e:
+                #        print(f"[vis] 3D visualization failed: {e}")
                 first_vis = True
         # Update total loss
         total_loss += loss

@@ -15,7 +15,20 @@ import torchvision.transforms.functional as TF
 from dripp.helpers import normalize_path, get_extension
 
 class SegmentationSequenceDataset(Dataset):
-    def __init__(self, sequences, transform, max_frames_per_sequence=8):
+    def __init__(
+            self,
+            sequences,
+            transform,
+            truncate=True,
+            max_frames_per_sequence=8,
+            prompt_mix=None,
+            max_prompt_frames=2,
+            always_prompt_first=True,
+            enable_negative_clicks=True,
+            num_pos_clicks=1,
+            num_neg_clicks=1,
+            neg_margin_frac=0.1
+    ):
         """
         Initializes a SegmentationSequenceDataset.
 
@@ -27,13 +40,36 @@ class SegmentationSequenceDataset(Dataset):
                     - subdataset (str, optional): Name of the subdataset, if applicable.
                     - dim (int): Dimension of the image (2 or 3).
             transform (callable): An optional transformation to be applied to every image and mask pair.
+            truncate (bool, optional): Whether to truncate sequences to max_frames_per_sequence. Default is True.
             max_frames_per_sequence (int, optional): Maximum number of frames per sequence. Default is 8.
+            prompt_mix (list[float], optional): List of probabilities for each prompt type. Default is None.
+            max_prompt_frames (int, optional): 
+            always_prompt_first (bool, optional): Whether to always prompt the first frame. Default is True.
+            enable_negative_clicks (bool, optional): Whether to enable negative clicks. Default is True.
+            num_pos_clicks (int, optional): Number of positive clicks per frame. Default is 1.
+            num_neg_clicks (int, optional): Number of negative clicks per frame. Default is 1.
+            neg_margin_frac (float, optional): Fraction of negative click margin. Default is 0.1.
         """
         self.sequences = sequences
         self.transform = transform
         self.entry_dims = [entry['dim'] for entry in sequences]
-        self.prompt_types = ['bbox' if dim == 3 else 'click' for dim in self.entry_dims]
+        self.truncate = truncate
+        
         self.max_frames_per_sequence = max_frames_per_sequence
+
+        self.prompt_mix = prompt_mix or {"mask": 0.5, "click": 0.25, "bbox": 0.25}
+
+        # Normalize prompt mix
+        s = sum(self.prompt_mix.values())
+        self.prompt_mix = {k: v/(s + 1e-8) for k,v in self.prompt_mix.items()}
+
+        # Prompt config
+        self.max_prompt_frames      = max_prompt_frames
+        self.always_prompt_first    = always_prompt_first
+        self.enable_negative_clicks = enable_negative_clicks
+        self.num_pos_clicks         = num_pos_clicks
+        self.num_neg_clicks         = num_neg_clicks
+        self.neg_margin_frac        = neg_margin_frac
 
     def __len__(self):
         """Returns the number of sequences in the dataset."""
@@ -62,26 +98,23 @@ class SegmentationSequenceDataset(Dataset):
         sub_name    = entry.get('subdataset', '')
         seq         = entry['sequence']             # List[(img_path, mask_path)]
         data_dim    = self.entry_dims[idx]          # entry['dim']
-        prompt_type = self.prompt_types[idx]
 
         # Reset transformations
         if self.transform is not None:
             self.transform.reset()
 
-        # Normalize and detect extension
-        img0 = normalize_path(seq[0][0])
-        ext = get_extension(img0)
-
+        # Load images, masks, and axis lengths if 3D.
         if data_dim == 3:
-            imgs, masks = self._load_3d(normalize_path(seq[0][0]), normalize_path(seq[0][1]))
+            imgs, masks, axis_lengths = self._load_3d(normalize_path(seq[0][0]), normalize_path(seq[0][1]))
         else:
             # Load entire 2D "pseudo-video"
             cleaned = [(normalize_path(i), normalize_path(m)) for i, m in seq]
             imgs, masks = self._load_2d_sequence(cleaned)
+            axis_lengths = None
 
         # Limit sequence length if too long
         T_full = imgs.shape[0]
-        if T_full > self.max_frames_per_sequence:
+        if axis_lengths is not None and self.truncate and T_full > self.max_frames_per_sequence:
             N = self.max_frames_per_sequence
     
             # Find indices of frames that actually contain mask pixels
@@ -103,40 +136,108 @@ class SegmentationSequenceDataset(Dataset):
             masks = masks[selected]
 
         # Generate prompts per slice (return empty tensors if no prompt)
-        pt_list, label_list, bbox_list = [], [], []
+        pt_list, label_list, bbox_list, m_prompt_list = [], [], [], []
+        
+        # Get mask shape
         T = masks.shape[0]
+        H = masks.shape[-2]
+        W = masks.shape[-1]
+
+        # Select which frames get prompts
+        prompt_frames = set()
+        if self.always_prompt_first and T > 0:
+            prompt_frames.add(0)
+        remaining_slots = max(0, self.max_prompt_frames - len(prompt_frames))
+        if remaining_slots > 0 and T > 1:
+            pool = list(range(1, T))
+            pick = random.sample(pool, k=min(remaining_slots, len(pool)))
+            prompt_frames.update(pick)
+
+        # Prompt mix
+        keys  = list(self.prompt_mix.keys())
+        probs = [self.prompt_mix[k] for k in keys]
+
+        # Select exactly one prompt type per frame
+        def sample_types_for_frame(): return {random.choices(keys, weights=probs, k=1)[0]}
+        
+        # Generate prompts
         for t in range(T):
             mask_slice = masks[t]
-            # If has an extra channel dimension, squeeze it out
+            # If mask has an extra channel dimension, squeeze it out
             if mask_slice.ndim == 3 and mask_slice.size(0) == 1:
-              mask_slice = mask_slice.squeeze(0) # now [H,W]
-            prompt = generate_prompt(mask_slice, prompt_type=prompt_type)
-            if 'points' in prompt:
-                pt_list.append(prompt['points'])     # Tensor[n,2]
-                label_list.append(prompt['labels'])  # Tensor[n]
-                # Empty bbox tensor so default_collate can stack
-                bbox_list.append(torch.empty((0, 4), dtype=torch.int64))
+                mask_slice = mask_slice.squeeze(0) # now [H,W]
+            
+            if t in prompt_frames:
+                want_types = sample_types_for_frame()
+
+                # Accumulators for this frame (start empty)
+                pts_t   = torch.empty((0, 2),   dtype=torch.int64)
+                lbls_t  = torch.empty((0,),     dtype=torch.int64)
+                bbox_t  = torch.empty((0, 4),   dtype=torch.int64)
+                mask_t  = torch.empty((0, H, W),dtype=torch.uint8)
+
+                # 1) Clicks (pos + optional negatives)
+                if "click" in want_types:
+                    p_click = generate_prompt(
+                        mask_slice,
+                        prompt_type="click",
+                        num_pos=self.num_pos_clicks,
+                        num_neg=(self.num_neg_clicks if self.enable_negative_clicks else 0),
+                        neg_margin_frac=self.neg_margin_frac
+                    )
+                    if 'points' in p_click:
+                        pts_t  = p_click['points']
+                        lbls_t = p_click['labels']
+
+                # 2) Bounding box
+                if "bbox" in want_types:
+                    p_box = generate_prompt(mask_slice, prompt_type="bbox")
+                    if 'bbox' in p_box:
+                        bbox_t = p_box['bbox'].to(torch.int64).view(1,4)
+
+                # 3) Mask
+                if "mask" in want_types:
+                    p_mask = generate_prompt(mask_slice, prompt_type="mask")
+                    if 'mask' in p_mask:
+                        m_bin = p_mask['mask'].to(torch.uint8)        # [H,W]
+                        mask_t = m_bin.unsqueeze(0)                   # [1,H,W]
+
+                # Push per-type (leave empty tensors if that type wasn't selected / invalid)
+                pt_list.append(pts_t)
+                label_list.append(lbls_t)
+                bbox_list.append(bbox_t if bbox_t.numel() > 0 else torch.empty((0,4), dtype=torch.int64))
+                m_prompt_list.append(mask_t if mask_t.numel() > 0 else torch.empty((0,H,W), dtype=torch.uint8))
             else:
-                # Empty point tensor so default_collate can stack
-                pt_list.append(torch.empty((0, 2), dtype=torch.int64))
-                label_list.append(torch.empty((0,),   dtype=torch.int64))
-                bbox_list.append(prompt['bbox'])       # Tensor[4]
+                pt_list.append(torch.empty((0, 2),   dtype=torch.int64))
+                label_list.append(torch.empty((0,),  dtype=torch.int64))
+                bbox_list.append(torch.empty((0, 4), dtype=torch.int64))
+                m_prompt_list.append(torch.empty((0, H, W), dtype=torch.uint8))
 
         # Only unsqueeze if needed
         mask_seq = masks
         if mask_seq.ndim == 3:              # [T,H,W]
             mask_seq = mask_seq.unsqueeze(1)
 
-        return {
-            'image':      imgs,                 # Tensor[T,C,H,W]
-            'mask':       mask_seq,             # Tensor[T,1,H,W]
-            'pt_list':    pt_list,              # List[T] of Tensor[n,2]
-            'p_label':    label_list,           # List[T] of Tensor[n]
-            'bbox':       bbox_list,            # List[T] of Tensor[4]
-            'dataset':    ds_name,              # Dataset name
-            'subdataset': sub_name,             # Subdataset name
-            'seq_idx':    idx                   # Index of the sequence (for debugging)
+        # Convert only if axis_lengths is not None and we are not truncating. Otherwise, return None.
+        axis_lengths_i = tuple(map(int, axis_lengths)) if axis_lengths and not self.truncate else None
+
+        # Return
+        output = {
+            'image':        imgs,               # Tensor[T,C,H,W]
+            'mask':         mask_seq,           # Tensor[T,1,H,W]
+            'pt_list':      pt_list,            # List[T] of Tensor[n,2]
+            'p_label':      label_list,         # List[T] of Tensor[n]
+            'bbox':         bbox_list,          # List[T] of Tensor[4]
+            'm_prompt':     m_prompt_list,      # List[T] of Tensor[1,H,W]
+            'dataset':      ds_name,            # Dataset name
+            'subdataset':   sub_name,           # Subdataset name
+            'seq_idx':      idx,                # Index of the sequence (for debugging)
         }
+
+        # Keep axis_lengths only when we did NOT truncate and lengths match the 6-orientation build
+        if (axis_lengths is not None) and (not self.truncate) and (imgs.shape[0] == 2 * sum(axis_lengths)):
+            output['axis_lengths'] = axis_lengths_i
+        return output
 
     def _load_2d_sequence(self, seq):
         """
@@ -172,11 +273,14 @@ class SegmentationSequenceDataset(Dataset):
             mask_path (str): Path to the 3D mask.
 
         Returns:
-            tuple: (seq_imgs, seq_masks) where seq_imgs is a sequence of 2D images and seq_masks is
-                the corresponding sequence of 2D masks.
+            tuple: (seq_imgs, seq_masks, axis_lengths)
+                seq_imgs (torch.Tensor): A sequence of 2D images (Tensor[T,C,H,W]).
+                seq_masks (torch.Tensor): A sequence of 2D masks (Tensor[T,1,H,W]).
+                axis_lengths (tuple): A tuple containing the lengths of the 3D volume along each axis (D, H, W).
         """
         img_vol = sitk.GetArrayFromImage(sitk.ReadImage(img_path)) # [D, H, W]
         msk_vol = sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
+        D, H, W = img_vol.shape
         _, H0, W0 = self._to_tensor(img_vol[0], msk_vol[0])[0].shape
 
         seq_imgs, seq_masks = [], []
@@ -209,7 +313,7 @@ class SegmentationSequenceDataset(Dataset):
                                          interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
                 seq_imgs.append(im_t)
                 seq_masks.append(ms_t)
-        return torch.stack(seq_imgs, dim=0), torch.stack(seq_masks, dim=0)
+        return torch.stack(seq_imgs, dim=0), torch.stack(seq_masks, dim=0), (D, H, W)
 
     def _slice(self, vol, axis, idx):
         """
@@ -438,52 +542,92 @@ class SequenceTransform:
             return orig_image, orig_mask
         return image, mask
 
-def generate_prompt(mask_tensor, prompt_type='click'):
+def generate_prompt(mask_2d, prompt_type='click', num_pos=1, num_neg=0, neg_margin_frac=0.1):
     """
-    Generate a prompt from a given binary mask tensor.
-
-    Prompt types:
-        - 'click': Sample one random foreground pixel and return it as a single
-        point with label 1. If the mask is empty, return an empty tensor with
-        shape (0, 2) and an empty tensor with shape (0,).
-        - 'bbox': Return the bounding box of the foreground region. If the mask
-        is empty, return a bounding box covering the full image.
+    Create a prompt from a binary mask.
 
     Args:
-        mask_tensor (torch.Tensor): Binary mask tensor with shape (H, W).
+        mask_2d (Tensor[H,W] or np.ndarray): binary mask
+        prompt_type (str): "click", "bbox", or "mask"
+        num_pos (int): number of positive clicks (for "click")
+        num_neg (int): number of negative clicks (for "click")
+        neg_margin_frac (float): margin to expand bbox when sampling negatives
 
     Returns:
-        dict: A dictionary containing the prompt. The structure of the
-        dictionary depends on the prompt type.
-
-    Raises:
-        ValueError: If the prompt type is unknown.
+        dict with one of:
+          - {"points": Tensor[n,2], "labels": Tensor[n]}   # n = num_pos + num_neg
+          - {"bbox":   Tensor[4]}                          # [x0,y0,x1,y1]
+          - {"mask":   Tensor[H,W]}                        # binary mask
+        If mask is empty and prompt cannot be formed, returns {}.
     """
-    # Ensure binary mask
-    fg = (mask_tensor > 0).nonzero(as_tuple=False)
-
-    # Generate prompt based on prompt type
-    if prompt_type == 'click':
-        if fg.numel() == 0:
-            # Fallback: no clicks
-            return {
-                'points': torch.empty((0, 2), dtype=torch.int64),
-                'labels': torch.empty((0,), dtype=torch.int64)
-            }
-        # Sample one random foreground pixel
-        idx = random.randint(0, fg.size(0) - 1)
-        y, x = fg[idx].tolist()
-        points = torch.tensor([[x, y]], dtype=torch.int64)
-        labels = torch.tensor([1], dtype=torch.int64)
-        return { 'points': points, 'labels': labels }
-    elif prompt_type == 'bbox':
-        if fg.numel() == 0:
-            # Fallback: full coverage
-            H, W = mask_tensor.shape
-            return {'bbox': torch.tensor([0, 0, W-1, H-1], dtype=torch.int64)}
-        ys, xs = fg.unbind(1)
-        y1, y2 = int(ys.min()), int(ys.max())
-        x1, x2 = int(xs.min()), int(xs.max())
-        return {'bbox': torch.tensor([x1, y1, x2, y2], dtype=torch.int64)}
+    if isinstance(mask_2d, torch.Tensor):
+        m = mask_2d.detach().cpu()
     else:
-        raise ValueError(f'Unknown prompt type: {prompt_type}')
+        m = torch.from_numpy(mask_2d)
+
+    m = (m > 0).to(torch.uint8)
+    H, W = int(m.shape[-2]), int(m.shape[-1])
+
+    ys, xs = torch.where(m > 0)
+    if prompt_type == "mask":
+        if ys.numel() == 0:
+            return {}
+        return {"mask": m}
+    
+    if prompt_type == "bbox":
+        if ys.numel() == 0:
+            return {}
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        return {"bbox": torch.tensor([x0, y0, x1, y1], dtype=torch.int64)}
+    
+    if prompt_type == "click":
+        points, labels = [], []
+
+        # Positives
+        if ys.numel() > 0 and num_pos > 0:
+            idx = torch.randperm(ys.numel())[:num_pos]
+            pos_xy = torch.stack([xs[idx], ys[idx]], dim=1).to(torch.int64)
+            points.append(pos_xy)
+            labels.append(torch.ones(pos_xy.size(0), dtype=torch.int64))
+        elif num_pos > 0:
+            # No positives found, return empty prompt
+            return {}
+        
+        # Negatives near bbox
+        if num_neg > 0:
+            if ys.numel() > 0:
+                # Bounding box around positives
+                y0, y1 = int(ys.min()), int(ys.max())
+                x0, x1 = int(xs.min()), int(xs.max())
+
+                # Expand bounding box by margin
+                dy = max(1, int((y1 - y0 + 1) * neg_margin_frac))
+                dx = max(1, int((x1 - x0 + 1) * neg_margin_frac))
+                y0n = max(0, y0 - dy)
+                y1n = min(H - 1, y1 + dy)
+                x0n = max(0, x0 - dx)
+                x1n = min(W - 1, x1 + dx)
+
+                # Select candidate negatives inside expanded window but outside mask
+                YY, XX = torch.meshgrid(torch.arange(y0n, y1n + 1), torch.arange(x0n, x1n + 1), indexing='ij')
+                cand = (m[YY, XX] == 0)
+                cy, cx = YY[cand], XX[cand]
+                if cy.numel() == 0:
+                    cy, cx = torch.where(m == 0) # Fallback anywhere off-mask
+            else:
+                cy, cx = torch.where(m == 0)
+
+            if cy.numel() > 0:
+                idx = torch.randperm(cy.numel())[:num_neg]
+                neg_xy = torch.stack([cx[idx], cy[idx]], dim=1).to(torch.int64)
+                points.append(neg_xy)
+                labels.append(torch.zeros(neg_xy.size(0), dtype=torch.int64))
+
+        if points:
+            pts  = torch.cat(points, dim=0)
+            lbls = torch.cat(labels, dim=0)
+            return {"points": pts, "labels": lbls}
+
+        # No positives or negatives found, return empty prompt
+        return {}
