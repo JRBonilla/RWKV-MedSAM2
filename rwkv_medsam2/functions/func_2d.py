@@ -424,80 +424,82 @@ def validate_step_2d(student, batch, config, return_logits=False):
 
     Args:
         student (SAM2VideoPredictor): The student model.
-        batch (dict): Batch dict with keys 'image', 'mask', 'pt_list', 'p_label'.
+        batch (dict): Batch dict with keys 'image', 'mask', 'pt_list', 'p_label', 'bbox', 'm_prompt' (optional).
         config (DictConfig): Config with .training.device and .training.out_size.
         return_logits (bool): Whether to return the predicted logits. Default is False.
 
     Returns:
         if return_logits is True:
             dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
-            torch.Tensor: Predicted logits for the batch.
+            torch.Tensor: Predicted logits for the batch as [B,T,H_out,W_out].
         else:
             dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
     """
     device   = config.training.device
-    out_size = config.training.out_size
+    out_size = int(config.training.out_size)
 
     # 1) Unpack all frames & flatten batch/time
-    B,T,C,H,W  = batch['image'].shape
-    imgs       = batch['image'].view(B*T, C, H, W).to(device)   # [B*T, C, H, W]
-    masks      = batch['mask'].view( B*T, 1, H, W).to(device)   # [B*T, 1, H, W]
-    batch_size = B * T
+    B, T, C, H, W = batch['image'].shape
+    imgs   = batch['image'].view(B * T, C, H, W).to(device)    # [B*T, C, H, W]
+    masks  = batch['mask'].view(  B * T, 1, H, W).to(device)   # [B*T, 1, H, W]
+    N      = B * T
 
-    # 2) Build sparse prompts over all T frames (flattened to B*T images)
-    raw_pt_list  = batch['pt_list']    # List[T] of length-B lists of point Tensors
-    raw_lbl_list = batch['p_label']    # List[T] of length-B lists of label Tensors
-    points, labels = [], []
+    # 2) Build per-image prompts (points / boxes / masks / none) in B*T order
+    raw_pt_list  = batch['pt_list']                 # List[T] of length-B lists
+    raw_lbl_list = batch['p_label']                 # List[T] of length-B lists
+    raw_box_list = batch.get('bbox', None)          # List[T] of length-B lists (optional but expected)
+    raw_m_prompt = batch.get('m_prompt', None)      # List[T] of length-B lists (optional)
+
+    pts_all, lbs_all, box_all, msk_all = [], [], [], []
     for t in range(T):
         for b in range(B):
-            pts = raw_pt_list[t][b]
-            lbs = raw_lbl_list[t][b]
-            if pts is not None and pts.numel() > 0:
-                points.append(pts.to(device).unsqueeze(0).float())  # [1,n,2]
-                labels.append(lbs.to(device).unsqueeze(0).long())   # [1,n]
-    if points:
-        sparse_points = torch.cat(points, dim=0)
-        sparse_labels = torch.cat(labels, dim=0)
-    else:
-        sparse_points = sparse_labels = None
+            # Points / labels
+            pts = raw_pt_list[t][b]  if isinstance(raw_pt_list[t],  list) else raw_pt_list[t][b]
+            lbs = raw_lbl_list[t][b] if isinstance(raw_lbl_list[t], list) else raw_lbl_list[t][b]
+            # Bounding box
+            if raw_box_list is not None:
+                bx = raw_box_list[t][b] if isinstance(raw_box_list[t], list) else raw_box_list[t][b]
+            else:
+                bx = None
+            # Mask-prompt
+            if raw_m_prompt is not None:
+                mp = raw_m_prompt[t][b] if isinstance(raw_m_prompt[t], list) else raw_m_prompt[t][b]
+            else:
+                mp = None
 
-    # 3) Prompt‑encode, forward backbone, prepare features & decode mask
-    with torch.no_grad():
-        # If no clicks *or* fewer clicks than images, use full-image boxes
-        if sparse_points is None or sparse_points.shape[0] < batch_size:
-            # Build [batch_size, 4] tensor: [x1,y1,x2,y2] = full image
-            full_box = torch.tensor([0, 0, W-1, H-1], device=device, dtype=torch.int64)
-            boxes    = full_box.unsqueeze(0).repeat(batch_size, 1)
-            sparse_embs, dense_embs = student.sam_prompt_encoder(
-                points=None,
-                boxes=boxes,
-                masks=None
-            )
-        else:
-            sparse_embs, dense_embs = student.sam_prompt_encoder(
-                points=(sparse_points, sparse_labels),
-                boxes=None,
-                masks=None
-            )
+            pts_all.append(pts)
+            lbs_all.append(lbs)
+            box_all.append(bx)
+            msk_all.append(mp)
 
+    # 3) Encode mixed prompts per image
+    with torch.inference_mode():
+        sparse_embs, dense_embs, _ = _encode_mixed_prompts(
+            student.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs, device
+        )
         image_pe = student.sam_prompt_encoder.get_dense_pe()
 
+        # 4) Forward backbone and prep features (no memory bank for val)
         backbone_out = student.forward_image(imgs)
         _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
 
-        # No memory bank so add zeros
+        # Keep shapes identical to training path (no-op placeholders for memory)
         vision_feats[-1] = vision_feats[-1] + torch.zeros_like(vision_feats[-1])
         vision_pos[-1]   = vision_pos[-1]   + torch.zeros_like(vision_pos[-1])
 
+        # Rebuild pyramid to match decoder expectations
         feat_sizes = config.decoder.feat_sizes
         feats = [
-            feat.permute(1,2,0).view(batch_size, -1, *sz)
+            feat.permute(1, 2, 0).view(N, -1, *sz)
             for feat, sz in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
         hires_feats = feats[:-1]
 
+        # Align dense prompts spatially to the image embedding
         dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
+
+        # 5) Decode masks
         logits, _, *_ = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=image_pe,
@@ -508,39 +510,35 @@ def validate_step_2d(student, batch, config, return_logits=False):
             high_res_features=hires_feats
         )
 
-        # a) Up-sample the raw logits to output size -> flat [B*T,1,H_out,W_out]
-        logits_up_flat = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False)
-        # b) Reshape flat logits into sequence [B, T, H_out, W_out] for per-frame metrics
+        # 6) Up-sample logits to output grid and reshape back to [B,T,H_out,W_out]
+        logits_up_flat = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False)  # [B*T,1,H_out,W_out]
         _, _, Hout, Wout = logits_up_flat.shape
-        logits_up_seq = logits_up_flat.view(B, T, Hout, Wout)  # [B,T,H,W]
+        logits_up_seq = logits_up_flat.view(B, T, Hout, Wout)  # drop channel
 
-        # c) Compute probabilities and hard predictions: [B,T,H,W]
-        probs      = torch.sigmoid(logits_up_seq)
-        preds_seq  = (probs > 0.5).long().cpu()
+        # 7) Threshold predictions
+        probs_seq = torch.sigmoid(logits_up_seq)               # [B,T,H_out,W_out]
+        preds_seq = (probs_seq > 0.5).long().cpu()             # to CPU for metrics
 
-        # d) Up-sample masks to match out_size, then reshape to [B, T, H_out, W_out]
-        masks_seq = masks
+        # 8) Resize GT masks to the same grid (nearest) and drop channel
+        masks_up_flat = F.interpolate(masks.float(), size=(Hout, Wout), mode='nearest')
+        masks_up_seq  = masks_up_flat.view(B, T, 1, Hout, Wout).cpu()
+        preds_flat = preds_seq.view(N, Hout, Wout)
+        masks_flat = masks_up_seq.view(N, Hout, Wout).long()
 
-        # e) Flatten to [B*T, H_out, W_out] for per-frame metrics
-        preds_flat = preds_seq.view(B * T, Hout, Wout)
-        masks_flat = masks_seq.view(B * T, Hout, Wout)
-
-    # 4) Metrics
+    # 9) Metrics per image, averaged over B*T
     iou_list, dice_list, hd95_list = [], [], []
-    for i in range(batch_size):
-        iou_list.append(compute_iou(  preds_flat[i], masks_flat[i]))
-        dice_list.append(compute_dice(preds_flat[i], masks_flat[i]))
-        hd95_list.append(compute_hd95(preds_flat[i], masks_flat[i]))
+    for i in range(N):
+        iou_list.append( compute_iou(  preds_flat[i], masks_flat[i]) )
+        dice_list.append(compute_dice(preds_flat[i], masks_flat[i]) )
+        hd95_list.append(compute_hd95(preds_flat[i], masks_flat[i]) )
 
-    # Compute averages of all metrics
     metrics = {
-        'iou':  sum(iou_list)  / batch_size,
-        'dice': sum(dice_list) / batch_size,
-        'hd95': sum(hd95_list) / batch_size,
+        'iou':  sum(iou_list)  / max(1, N),
+        'dice': sum(dice_list) / max(1, N),
+        'hd95': sum(hd95_list) / max(1, N),
     }
 
     if return_logits:
-        # Return up-sampled raw logits (on CPU) so validate_epoch can visualize them
-        return metrics, logits_up_seq.cpu() # [B,T,H,W]
+        return metrics, logits_up_seq.cpu()  # [B,T,H_out,W_out]
     else:
         return metrics

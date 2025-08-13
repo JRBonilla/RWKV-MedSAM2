@@ -53,8 +53,12 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
             img = img.transpose(1,2,0)
         img = (img - img.min()) / (img.max() - img.min() + 1e-8)
 
-        gt    = np.squeeze(mask_seq[t])
-        pred  = (1/(1+np.exp(-np.squeeze(pred_logits_seq[t])))) >= threshold
+        # Binarize GT
+        gt_raw   = np.squeeze(mask_seq[t])
+        gt       = (gt_raw > 0).astype(np.uint8)
+        logits_t = torch.as_tensor(np.squeeze(pred_logits_seq[t]), dtype=torch.float32)
+        prob     = torch.sigmoid(logits_t).cpu().numpy()
+        pred     = (prob >= threshold).astype(np.uint8)
         frames.append((img, gt, pred))
 
     # 3) set up figure & initial images
@@ -67,11 +71,15 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
         im0 = ax0.imshow(img0, cmap='gray', animated=True)
     else:
         im0 = ax0.imshow(img0, animated=True)
-    im1 = ax1.imshow(frames[0][1], cmap='gray', animated=True)
-    im2 = ax2.imshow(frames[0][2], cmap='gray', animated=True)
+    im1 = ax1.imshow(frames[0][1], cmap='gray', vmin=0, vmax=1, animated=True)
+    im2 = ax2.imshow(frames[0][2], cmap='gray', vmin=0, vmax=1, animated=True)
 
     # 4) ping-pong frame indices & interval
-    seq = list(range(T)) + list(range(T-2, 0, -1))
+    forward  = list(range(T))
+    backward = list(range(T-2, 0, -1))
+    full_seq = forward + backward
+    pos = full_seq.index(0)
+    seq = full_seq[pos:] + full_seq[:pos]
     interval = 1000 / fps  # ms per frame
 
     def _update(i):

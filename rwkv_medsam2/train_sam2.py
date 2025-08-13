@@ -17,6 +17,7 @@ import random
 import logging
 import argparse
 import pickle
+import sys
 
 from collections import defaultdict
 
@@ -43,6 +44,7 @@ from .functions.func_3d import train_step_3d, validate_step_3d
 
 from .dataset import SegmentationSequenceDataset, BalancedTaskSampler, SequenceTransform
 from .utils.vis import visualize_sequence, view_triplanar_interactive, montage_overlays
+from .utils.preprocessing import check_mask_quality, check_masks_quality_gpu
 
 def load_config(config_path):
     """
@@ -125,6 +127,7 @@ def setup_logger(log_cfg):
 
     return logger
 
+
 class CheckpointManager:
     def __init__(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
@@ -188,8 +191,17 @@ def get_pairings(out_dir, datasets, split="train"):
               mask paths.
     """
     # Find all image and mask pairs for each dataset and collect them
-    _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
-    all_pairs = []
+    _idx_pattern      = re.compile(r"_(?:img|frame|slice)(\d+)")
+    _mask_idx_pattern = re.compile(r"_mask(\d+)") # Prefer this for WSI tiles like PAIP2019
+    all_pairs         = []
+    total_kept_global = 0  # Global count of kept pairs
+
+    # Quality control config
+    use_gpu_qc     = True
+    qc_device      = "cuda" if torch.cuda.is_available() else "cpu"
+    qc_batch       = 16
+    quality_params = {"min_voxels": 64, "min_slices_any_axis": 2, "min_slice_area_px": 32, "downsample": 2}
+
     for ds in datasets:
         # Check if dataset grouping json exists
         ds_dir = os.path.join(out_dir, ds)
@@ -209,10 +221,18 @@ def get_pairings(out_dir, datasets, split="train"):
                 entries.append(entry)
         print(f"Found {len(entries)} '{split}' entries in {grp_file}")
 
+        # Initialize progress bar
+        # Count all masks; entries are already from sub.get(split, [])
+        total_candidates = sum(len(e.get("proc_masks", [])) for e in entries)
+        pbar = tqdm(total=total_candidates, desc=f"[{ds}] masks→pairs", unit="mask", leave=False, file=sys.stdout)
+
         # Iterate through the groupings and create image/mask pairs
+        ds_kept = 0     # Per-dataset kept count
+        ds_skipped = 0  # Per-dataset skipped count
+
         for entry in entries:
-            # Skip entries that don't match the split
-            if entry.get('split') != split:
+            # Tolerate missing 'split' field (default to current split)
+            if entry.get('split', split) != split:
                 continue
 
             imgs = entry.get('proc_images', [])
@@ -221,26 +241,58 @@ def get_pairings(out_dir, datasets, split="train"):
             # Create a map from index to image
             idx_map = {}
             for img_path in imgs:
-                m = _idx_pattern.search(os.path.basename(img_path))
+                base = os.path.basename(img_path)
+                m = _idx_pattern.search(base)
                 if m:
                     idx_map[int(m.group(1))] = img_path
-            
+
+            # Build a fallback image-key map by normalized basename
+            img_by_key = {}
+            for ip in imgs:
+                nm = os.path.basename(ip).lower()
+                stem = os.path.splitext(nm)[0]
+                stem = re.sub(r'(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)', '', stem)
+                stem = re.sub(r'[^a-z0-9]+', '_', stem).strip('_')
+                img_by_key[stem] = ip
+
             # Pair each mask with its corresponding image and add to the list of pairs
             # Each list of pairs corresponds to a single grouping
             pairs = []
             for mask in msks:
+                pbar.update(1)  # Update progress bar
                 msk_path = mask['path']
                 cls_name = mask['class']
-                m = _idx_pattern.search(os.path.basename(msk_path))
-                if not m or cls_name is None: # Skip if no index or class
+                if cls_name is None:
                     continue
-                img_path = idx_map.get(int(m.group(1)))
-                if img_path:
-                    pairs.append({
-                        'image': img_path,
-                        'mask':  msk_path,
-                        'class': cls_name
-                    })
+
+                base = os.path.basename(msk_path)
+
+                # Prefer _mask#### first (PAIP2019 writes ..._img000_mask2272_...)
+                m = _mask_idx_pattern.search(base)
+                if m:
+                    idx = int(m.group(1))
+                    ip = idx_map.get(idx)
+                    if ip:
+                        pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
+                        continue
+
+                # Fallback: use _(img|frame|slice)####
+                m = _idx_pattern.search(base)
+                if m:
+                    idx = int(m.group(1))
+                    ip = idx_map.get(idx)
+                    if ip:
+                        pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
+                        continue
+
+                # Last resort: normalized key match
+                nm = base.lower()
+                stem = os.path.splitext(nm)[0]
+                stem = re.sub(r'(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)', '', stem)
+                stem = re.sub(r'[^a-z0-9]+', '_', stem).strip('_')
+                ip = img_by_key.get(stem)
+                if ip:
+                    pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
 
             # If no pairs found, skip
             if not pairs:
@@ -248,29 +300,91 @@ def get_pairings(out_dir, datasets, split="train"):
 
             # Add the pairs to the raw list
             # Sort the pairs to ensure temporal order
-            pairs.sort(key=lambda x: int(_idx_pattern.search(os.path.basename(x['image'])).group(1)))
-            # For multiple pairs, split the pairs into separate entries in the raw list
+            def _sort_idx(pth):  # Inline sorter tolerant to either token
+                b = os.path.basename(pth).lower()
+                mm = _mask_idx_pattern.search(b) or _idx_pattern.search(b)
+                return int(mm.group(1)) if mm else 0
+            pairs.sort(key=lambda x: _sort_idx(x['image']))
+
+            # Build index lists for 3D and 2D
+            dims   = [2 if os.path.splitext(p['image'])[1].lower() == '.png' else 3 for p in pairs]
+            idx_3d = [i for i, d in enumerate(dims) if d == 3]
+
+            # Check quality of 3D masks
+            qc_ok = {}
+            if idx_3d:
+                mask_paths_3d = [pairs[i]['mask'] for i in idx_3d]
+                if use_gpu_qc and qc_device != "cpu":
+                    qc_results = check_masks_quality_gpu(
+                        mask_paths_3d,
+                        min_voxels=quality_params["min_voxels"],
+                        min_slices_any_axis=quality_params["min_slices_any_axis"],
+                        min_slice_area_px=quality_params["min_slice_area_px"],
+                        downsample=quality_params.get("downsample", 2),
+                        batch_size=qc_batch,
+                        device=qc_device,
+                    )
+                else:
+                    # Fallback to single-file CPU check
+                    qc_results = [check_mask_quality(p, quality_params["min_voxels"],
+                                                        quality_params["min_slices_any_axis"],
+                                                        quality_params["min_slice_area_px"]) for p in mask_paths_3d]
+                # Add quality check results to qc_ok
+                for i_local, (ok, info) in enumerate(qc_results):
+                    qc_ok[idx_3d[i_local]] = (ok, info)
+
+            # Now build outputs while consulting qc_ok for 3D pairs
             if len(pairs) > 1:
-                for pair in pairs:
+                for i, pair in enumerate(pairs):
+                    dim = dims[i]
+                    if dim == 3:
+                        ok, info = qc_ok.get(i, (False, {"reason": "qc_missing"}))
+                        if not ok:
+                            ds_skipped += 1
+                            continue
                     all_pairs.append({
                         'dataset':      ds,
                         'subdataset':   entry['subdataset_name'],
                         'tasks':        entry['tasks'],
                         'class':        pair['class'],
                         'pair':         (pair['image'], pair['mask']),
-                        'dim':          2 if get_extension(pair['image']) == '.png' else 3
+                        'dim':          dim
                     })
+                    ds_kept += 1
+                    total_kept_global += 1
             else:
-                # For single pair, add to the raw list of pairs
-                all_pairs.append({
-                    'dataset':      ds,
-                    'subdataset':   entry['subdataset_name'],
-                    'tasks':        entry['tasks'],
-                    'mask_classes': pairs[0]['class'],
-                    'pair':         (pairs[0]['image'], pairs[0]['mask']),
-                    'dim':          2 if get_extension(pairs[0]['image']) == '.png' else 3
-                })
-    print(f"Found {len(all_pairs)} pairs for {ds} '{split}' split")
+                dim = dims[0]
+                if dim == 3:
+                    ok, info = qc_ok.get(0, (False, {"reason": "qc_missing"}))
+                    if not ok:
+                        ds_skipped += 1
+                    else:
+                        all_pairs.append({
+                            'dataset':      ds,
+                            'subdataset':   entry['subdataset_name'],
+                            'tasks':        entry['tasks'],
+                            'mask_classes': pairs[0]['class'],
+                            'pair':         (pairs[0]['image'], pairs[0]['mask']),
+                            'dim':          dim
+                        })
+                        ds_kept += 1
+                        total_kept_global += 1
+                else:
+                    all_pairs.append({
+                        'dataset':      ds,
+                        'subdataset':   entry['subdataset_name'],
+                        'tasks':        entry['tasks'],
+                        'mask_classes': pairs[0]['class'],
+                        'pair':         (pairs[0]['image'], pairs[0]['mask']),
+                        'dim':          dim
+                    })
+                    ds_kept += 1
+                    total_kept_global += 1
+        # Close the progress bar and print a summary
+        pbar.close()
+        tqdm.write(f"[{ds}] kept {ds_kept}, skipped {ds_skipped}, total processed {ds_kept + ds_skipped} for '{split}'")
+
+    print(f"Total kept pairs for '{split}': {total_kept_global}")  # Global summary
     return all_pairs
 
 def get_sequences(out_dir, split="train", val_frac=0.1, seed=42, max_frames_per_sequence=8):
@@ -453,7 +567,7 @@ def get_data_loaders(config):
     
     # Val
     val_loader = DataLoader(
-        SegmentationSequenceDataset(val_seqs, transform=SequenceTransform(), truncate=True),
+        SegmentationSequenceDataset(val_seqs, transform=SequenceTransform(), truncate=False),
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=config.training.num_workers,
@@ -462,7 +576,7 @@ def get_data_loaders(config):
     
     # Test
     test_loader = DataLoader(
-        SegmentationSequenceDataset(test_seqs, transform=SequenceTransform(), truncate=True),
+        SegmentationSequenceDataset(test_seqs, transform=SequenceTransform(), truncate=False),
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=config.training.num_workers,
@@ -493,7 +607,6 @@ def save_data_loaders(save_path, train_loaders, val_loaders, test_loaders):
             "test_loaders":  test_loaders,
         }, f)
 
-
 def load_data_loaders(load_path):
     """
     Load train, validation, and test DataLoader collections from a pickle file.
@@ -515,7 +628,6 @@ def load_data_loaders(load_path):
         data["val_loaders"],
         data["test_loaders"],
     )
-
 
 def build_student_predictor(config):
     """
@@ -648,6 +760,21 @@ def setup_optimizer_and_scheduler(model, config, data_dimension):
         'scheduler':  scheduler3d
     }
 
+def _dim_from_batch(b):
+    """
+    Extract the data dimensionality from a batch dict.
+
+    Args:
+        b (dict): The batch dictionary.
+
+    Returns:
+        int: The data dimensionality (2 or 3).
+    """
+    d = b.get('dim', None)
+    if isinstance(d,  (list, tuple)): d = d[0]
+    if torch.is_tensor(d): d = int(d.item()) if d.numel() == 1 else int(d.reshape(-1)[0].item())
+    return d
+
 def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched2d, sched3d, config, scaler, epoch, logger):
     """
     Perform one epoch of training over the dataset.
@@ -689,14 +816,19 @@ def train_epoch(student, teacher, train_loader, optimizer2d, optimizers3d, sched
         if isinstance(sub_name, (list, tuple)): sub_name = sub_name[0]
         pbar.set_description(f"Train Epoch {epoch} - [{ds_name}/{sub_name}]")
 
-        T = batch['image'].shape[1]
-        if T == 1:
+        # Get data dimension from batch
+        data_dim = _dim_from_batch(batch)
+        if data_dim is None:
+            data_dim = 3 if batch['image'].shape[1] > 1 else 2
+
+        if data_dim == 2:
             # 2D step
             loss = train_step_2d(student, teacher, optimizer2d, batch, config, mem_bank, scaler)
             if not first_vis:
                 # Visualize 2D
                 # Get per‐frame logits
                 _, logits_seq = validate_step_2d(student, batch, config, return_logits=True)
+                logits_seq = logits_seq[0] if logits_seq.ndim == 4 else logits_seq
                 visualize_sequence(batch['image'][0], batch['mask'][0].squeeze(1), logits_seq, threshold=0.5, fps=2,)
                 first_vis = True
         else:
@@ -767,11 +899,16 @@ def validate_epoch(student, val_loader, config):
     # 1) Validation loop
     with torch.no_grad():
         for batch in val_loader:
-            T = batch['image'].shape[1]
-            if T == 1:
+            # Get data dimension
+            data_dim = _dim_from_batch(batch)
+            if data_dim is None:
+                data_dim = 3 if batch['image'].shape[1] > 1 else 2
+            # Get per-batch metrics
+            if data_dim == 2:
                 m = validate_step_2d(student, batch, config)
             else:
                 m = validate_step_3d(student, batch, config)
+            # Update totals
             for k in totals:
                 totals[k] += m[k]
             n += 1

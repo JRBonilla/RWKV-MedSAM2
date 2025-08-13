@@ -276,7 +276,7 @@ def validate_step_3d(student, batch, config, return_logits=False):
 
     # 2) Initialize train state and inject prompts
     student.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             eval_state = student.init_state_from_tensor(imgs_tensor=imgs, mode="eval")
             eval_state['storage_device'] = torch.device(device)

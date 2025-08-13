@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 import SimpleITK as sitk
+import numpy as np
 import torchvision.transforms.functional as TF
 
 from dripp.helpers import normalize_path, get_extension
@@ -21,13 +22,15 @@ class SegmentationSequenceDataset(Dataset):
             transform,
             truncate=True,
             max_frames_per_sequence=8,
+            min_fg_frames_in_window=2,
             prompt_mix=None,
             max_prompt_frames=2,
             always_prompt_first=True,
             enable_negative_clicks=True,
             num_pos_clicks=1,
             num_neg_clicks=1,
-            neg_margin_frac=0.1
+            neg_margin_frac=0.1,
+            reverse_prob=0.5
     ):
         """
         Initializes a SegmentationSequenceDataset.
@@ -42,6 +45,7 @@ class SegmentationSequenceDataset(Dataset):
             transform (callable): An optional transformation to be applied to every image and mask pair.
             truncate (bool, optional): Whether to truncate sequences to max_frames_per_sequence. Default is True.
             max_frames_per_sequence (int, optional): Maximum number of frames per sequence. Default is 8.
+            min_fg_frames_in_window (int, optional): Minimum number of foreground frames per window. Default is 2.
             prompt_mix (list[float], optional): List of probabilities for each prompt type. Default is None.
             max_prompt_frames (int, optional): 
             always_prompt_first (bool, optional): Whether to always prompt the first frame. Default is True.
@@ -49,13 +53,15 @@ class SegmentationSequenceDataset(Dataset):
             num_pos_clicks (int, optional): Number of positive clicks per frame. Default is 1.
             num_neg_clicks (int, optional): Number of negative clicks per frame. Default is 1.
             neg_margin_frac (float, optional): Fraction of negative click margin. Default is 0.1.
+            reverse_prob (float, optional): Probability of sampling reverse axis. Default is 0.5.
         """
         self.sequences = sequences
         self.transform = transform
         self.entry_dims = [entry['dim'] for entry in sequences]
         self.truncate = truncate
         
-        self.max_frames_per_sequence = max_frames_per_sequence
+        self.max_frames_per_sequence = int(max_frames_per_sequence)
+        self.min_fg_frames_in_window = int(min_fg_frames_in_window)
 
         self.prompt_mix = prompt_mix or {"mask": 0.5, "click": 0.25, "bbox": 0.25}
 
@@ -70,6 +76,9 @@ class SegmentationSequenceDataset(Dataset):
         self.num_pos_clicks         = num_pos_clicks
         self.num_neg_clicks         = num_neg_clicks
         self.neg_margin_frac        = neg_margin_frac
+
+        # Probability of sampling reverse
+        self.reverse_prob = reverse_prob
 
     def __len__(self):
         """Returns the number of sequences in the dataset."""
@@ -112,28 +121,41 @@ class SegmentationSequenceDataset(Dataset):
             imgs, masks = self._load_2d_sequence(cleaned)
             axis_lengths = None
 
-        # Limit sequence length if too long
-        T_full = imgs.shape[0]
-        if axis_lengths is not None and self.truncate and T_full > self.max_frames_per_sequence:
-            N = self.max_frames_per_sequence
-    
-            # Find indices of frames that actually contain mask pixels
-            # mask[i] is [1,H,W], .any()->Tensor, .item()->bool
-            pos_idxs = [i for i in range(T_full) if masks[i].any().item()]
-    
-            if len(pos_idxs) >= N:
-                # If we have enough positives, just sample N of them
-                selected = random.sample(pos_idxs, N)
-            else:
-                # Otherwise, take all positives and fill the rest from the remaining frames
-                neg_idxs = list(set(range(T_full)) - set(pos_idxs))
-                n_fill   = N - len(pos_idxs)
-                fill     = random.sample(neg_idxs, n_fill)
-                selected = pos_idxs + fill
-    
-            selected.sort()
-            imgs  = imgs[selected]
-            masks = masks[selected]
+        # Truncate if necessary — only use the chosen axis segment
+        if axis_lengths is not None and self.truncate:
+            N = int(self.max_frames_per_sequence)   # Window size
+            L = imgs.shape[0] // 2                  # Length for each direction
+            if L < N:
+                raise ValueError(f"Axis too short: need {N}, have {L}")
+
+            # Randomly sample direction
+            use_reverse = (random.random() < self.reverse_prob)
+            s0 = L if use_reverse else 0
+
+            # Check if there is any foreground
+            seg_masks = masks[s0:s0 + L]
+            fg = seg_masks.reshape(L, -1).any(dim=1)
+
+            # If no foreground, try other direction
+            if int(fg.sum().item()) == 0:
+                # Try reverse direction once
+                s0 = 0 if use_reverse else L
+                seg_masks = masks[s0:s0 + L]
+                fg = seg_masks.reshape(L, -1).any(dim=1)
+
+            if int(fg.sum().item()) == 0:
+                raise ValueError(f'No FG in either direction for idx={idx}')
+
+            # Randomly sample window
+            min_fg = int(self.min_fg_frames_in_window)
+            cs = torch.cat([torch.tensor([0], device=fg.device), torch.cumsum(fg.int(), dim=0)])
+            win_sums = cs[N:] - cs[:-N]
+            valid = torch.nonzero(win_sums >= min_fg).squeeze(1)
+            if valid.numel() == 0:
+                valid = torch.nonzero(win_sums > 0).squeeze(1)
+            i0  = 0 if valid.numel() == 0 else int(valid[torch.randint(0, valid.numel(), (1,))].item())
+            sel = list(range(s0 + i0, s0 + i0 + N))
+            imgs, masks = imgs[sel], masks[sel]
 
         # Generate prompts per slice (return empty tensors if no prompt)
         pt_list, label_list, bbox_list, m_prompt_list = [], [], [], []
@@ -232,6 +254,7 @@ class SegmentationSequenceDataset(Dataset):
             'dataset':      ds_name,            # Dataset name
             'subdataset':   sub_name,           # Subdataset name
             'seq_idx':      idx,                # Index of the sequence (for debugging)
+            'dim':          data_dim,           # 2 or 3
         }
 
         # Keep axis_lengths only when we did NOT truncate and lengths match the 6-orientation build
@@ -278,42 +301,199 @@ class SegmentationSequenceDataset(Dataset):
                 seq_masks (torch.Tensor): A sequence of 2D masks (Tensor[T,1,H,W]).
                 axis_lengths (tuple): A tuple containing the lengths of the 3D volume along each axis (D, H, W).
         """
-        img_vol = sitk.GetArrayFromImage(sitk.ReadImage(img_path)) # [D, H, W]
-        msk_vol = sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
-        D, H, W = img_vol.shape
+        itk_img = sitk.ReadImage(img_path)          # Read 3D image
+        itk_msk = sitk.ReadImage(mask_path)         # Read 3D mask
+        img_vol = sitk.GetArrayFromImage(itk_img)   # [D, H, W]
+        msk_vol = sitk.GetArrayFromImage(itk_msk)
         _, H0, W0 = self._to_tensor(img_vol[0], msk_vol[0])[0].shape
+        
+        # Select the axis with the most foreground
+        msk_np = np.array(msk_vol)
+        min_fg = self.min_fg_frames_in_window
+        chosen_axis = self._choose_axis(msk_np, min_fg) or self._choose_axis(msk_np, 1)
 
+        # Build forward and reverse indices
+        if not self.truncate:
+            # Trim to the first and last slices with foreground for validation and testing
+            has_fg = self._get_fg_slices(msk_np, chosen_axis).astype(bool)
+            if has_fg.any():
+                fg = np.flatnonzero(has_fg)
+                start_k, end_k = fg[0], fg[-1] + 1
+            else:
+                start_k, end_k = 0, msk_np.shape[chosen_axis]
+            idxs_fwd = list(range(start_k, end_k))
+            idxs_rev = list(reversed(idxs_fwd))
+        else:
+            # Otherwise, build full sequence
+            idxs_fwd = list(range(msk_np.shape[chosen_axis]))
+            idxs_rev = list(reversed(idxs_fwd))
+
+        # Build forward + reverse sequence of 2D images and masks on the chosen axis
         seq_imgs, seq_masks = [], []
-        # For each axis, gather slices forward and reverse
-        for axis in (0,1,2):
-            length = msk_vol.shape[axis]
-            for i in range(length):
-                slice_img = self._slice(img_vol, axis, i)
-                slice_msk = self._slice(msk_vol, axis, i)
-                im_t, ms_t = self._to_tensor(slice_img, slice_msk)
-                if self.transform:
-                    im_t, ms_t = self.transform(im_t, ms_t)
-                    # Resize to (H0, W0)
-                    if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
-                        im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
-                        ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0],
-                                         interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
-                seq_imgs.append(im_t)
-                seq_masks.append(ms_t)
-            for i in reversed(range(length)):
-                slice_img = self._slice(img_vol, axis, i)
-                slice_msk = self._slice(msk_vol, axis, i)
-                im_t, ms_t = self._to_tensor(slice_img, slice_msk)
-                if self.transform:
-                    im_t, ms_t = self.transform(im_t, ms_t)
-                    # Resize to (H0, W0)
-                    if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
-                        im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
-                        ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0],
-                                         interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
-                seq_imgs.append(im_t)
-                seq_masks.append(ms_t)
+        for i in idxs_fwd:
+            slice_img = self._slice(img_vol, chosen_axis, i)
+            slice_msk = self._slice(msk_vol, chosen_axis, i)
+            im_t, ms_t = self._to_tensor(slice_img, slice_msk)
+            if self.transform:
+                im_t, ms_t = self.transform(im_t, ms_t)
+                # Resize to (H0, W0)
+                if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
+                    im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
+                    ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0], interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
+            seq_imgs.append(im_t)
+            seq_masks.append(ms_t)
+
+        for i in idxs_rev:
+            slice_img = self._slice(img_vol, chosen_axis, i)
+            slice_msk = self._slice(msk_vol, chosen_axis, i)
+            im_t, ms_t = self._to_tensor(slice_img, slice_msk)
+            if self.transform:
+                im_t, ms_t = self.transform(im_t, ms_t)
+                # Resize to (H0, W0)
+                if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
+                    im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
+                    ms_t = TF.resize(ms_t.unsqueeze(0).float(), [H0, W0], interpolation=TF.InterpolationMode.NEAREST).squeeze(0).long()
+            seq_imgs.append(im_t)
+            seq_masks.append(ms_t)
+
+        D, H, W = img_vol.shape
         return torch.stack(seq_imgs, dim=0), torch.stack(seq_masks, dim=0), (D, H, W)
+    
+    def _get_fg_slices(self, msk_np, axis):
+        """
+        Given a 3D mask and an axis, return a boolean array indicating which slices
+        have any foreground pixels.
+
+        Args:
+            msk_np (numpy.ndarray): The 3D mask.
+            axis (int): The axis along which to take slices.
+
+        Returns:
+            numpy.ndarray: A boolean array indicating which slices have any foreground pixels.
+        """
+        if axis == 0: return np.any(msk_np, axis=(1,2)) # Axial Z
+        if axis == 1: return np.any(msk_np, axis=(0,2)) # Coronal Y
+        return np.any(msk_np, axis=(0,1))               # Sagittal X
+
+    def _choose_axis(self, msk_np, min_fg=1):
+        """
+        Given a 3D mask, choose a viewing axis based on a score computed from:
+
+        - in-plane resolution proxy (higher is better)
+        - fraction of slices with any foreground (higher is better)
+        - mean foreground area (higher is better)
+
+        The score is computed as the product of these three terms, each raised to a power determined
+        by the corresponding hyperparameter. The axis with the highest score is chosen.
+
+        If no axis has any foreground, returns None.
+
+        Hyperparameters:
+
+        - max_frames_per_sequence (int, default=8): maximum number of slices to take in a sequence
+        - axis_min_prob (float, default=0.20): minimum probability assigned to each axis
+        - axis_res_alpha (float, default=1.0): exponent for in-plane resolution proxy
+        - axis_fgfrac_beta (float, default=1.0): exponent for fraction of slices with any foreground
+        - axis_area_gamma (float, default=0.5): exponent for mean foreground area
+
+        Args:
+            msk_np (numpy.ndarray): The 3D mask.
+            min_fg (int, optional): minimum number of foreground slices required in a window of size
+                max_frames_per_sequence. Defaults to 1.
+
+        Returns:
+            int or None: The chosen axis, or None if no axis has any foreground.
+        """
+        assert msk_np.ndim == 3, "msk_np must be [D,H,W]"
+        D, H, W = msk_np.shape
+
+        # Hyperparameters
+        N = self.max_frames_per_sequence
+        p_min = float(getattr(self, "axis_min_prob",    0.2))       # Per-axis floor among candidates
+        alpha = float(getattr(self, "axis_res_alpha",   1.0))       # Weight for in-plane resolution proxy
+        beta  = float(getattr(self, "axis_fgfrac_beta", 1.0))       # Weight for fraction of FG slices
+        gamma = float(getattr(self, "axis_area_gamma",  0.5))       # Weight for mean FG area
+        eps = 1e-8
+
+        # In-plane pixel counts per viewing axis: higher means finer in-plane grid
+        inplane_area = np.array([H * W, D * W, D * H], dtype=np.float64)  # axes 0,1,2
+
+        candidates = []
+        stats = []  # Stores per-axis measurements
+
+        for axis in (0, 1, 2):
+            other = tuple(i for i in (0, 1, 2) if i != axis)
+            per_slice_area = msk_np.sum(axis=other)                 # [L], number of FG pixels per slice
+            pos = per_slice_area > 0                                # [L], slice has any FG
+            L = per_slice_area.shape[0]
+            if L == 0:
+                continue
+
+            # Window constraint: ensure there exists a window of size N with at least min_fg FG slices
+            N_eff = min(N, L)
+            ok = False
+            if min_fg <= 0:
+                ok = pos.any()
+            else:
+                x = pos.astype(np.int32)
+                if N_eff <= L:
+                    cs = np.concatenate([[0], np.cumsum(x)])
+                    win = cs[N_eff:] - cs[:-N_eff]                  # Rolling sum in windows of size N_eff
+                    ok = (win >= min_fg).any()
+                else:
+                    ok = x.sum() >= min_fg
+
+            if not ok:
+                continue
+
+            fg_frac = pos.mean()                                    # Fraction of slices with any FG
+            if pos.any():
+                mean_area_norm = (per_slice_area[pos] / inplane_area[axis]).mean()
+            else:
+                mean_area_norm = 0.0
+
+            candidates.append(axis)
+            stats.append({
+                "axis": axis,
+                "res_proxy": inplane_area[axis],                    # Proxy for in-plane resolution
+                "fg_frac": float(fg_frac),
+                "mean_area": float(mean_area_norm),
+            })
+
+        if not candidates:
+            return None
+
+        # Min-max normalize each feature across candidates
+        def norm(v):
+            v = np.asarray(v, dtype=np.float64)
+            vmin, vmax = v.min(), v.max()
+            return np.ones_like(v) if abs(vmax - vmin) < eps else (v - vmin) / (vmax - vmin)
+
+        res_n   = norm([s["res_proxy"] for s in stats])
+        frac_n  = norm([s["fg_frac"] for s in stats])
+        area_n  = norm([s["mean_area"] for s in stats])
+
+        # Quality score and probabilities
+        quality = (res_n ** alpha) * ((eps + frac_n) ** beta) * ((eps + area_n) ** gamma)
+
+        # Apply per-axis probability floor among the current candidates
+        k = len(candidates)
+
+        # Base distribution from quality
+        s = float(quality.sum())
+        if not np.isfinite(s) or s <= 0:
+            base = np.ones(k, dtype=np.float64) / k                 # Uniform if all qualities are 0
+        else:
+            base = quality / s                                      # Sums to 1 exactly
+
+        # Ensure feasibility: p_min cannot exceed 1/k
+        p_min_eff = min(p_min, 1.0 / k - 1e-6)
+        probs = base * (1.0 - p_min_eff * k) + p_min_eff
+
+        # Sample an axis according to probs
+        idx = np.random.choice(np.arange(k), p=probs)
+        return candidates[idx]
+
 
     def _slice(self, vol, axis, idx):
         """
@@ -506,6 +686,7 @@ class SequenceTransform:
 
         # Keep originals around in case we need to roll back
         orig_image, orig_mask = image.clone(), mask.clone()
+        had_fg = (mask > 0).any()  # True if there is at least one foreground pixel
         
         _, h, w = image.shape
         if self.do_rotate:
@@ -538,7 +719,8 @@ class SequenceTransform:
             image, mask = TF.vflip(image), TF.vflip(mask)
 
         # Safety check: If this transform zeroed out the mask, revert
-        if (mask > 0).sum() == 0:
+        lost_fg = not (mask > 0).any()
+        if had_fg and lost_fg:
             return orig_image, orig_mask
         return image, mask
 
