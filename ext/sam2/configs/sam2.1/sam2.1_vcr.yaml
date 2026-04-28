@@ -2,45 +2,98 @@
 
 _config_path: "sam2.1/sam2.1_vcr.yaml"
 
-# ---- DRIPP config -------------------------------------------------------------------
+cache:
+  path: "/data/Cache"
+
+validation:
+  default_prompt_modes: [box]
+  prompt_modes_by_task: {}
+  prompt_modes_by_dataset: {}
+  hd95_sample: 0
+  compute_global_prob_metrics: false
+
+init:
+  # Load SAM2.1 tiny weights as much as possible
+  student_ckpt_path: "/root/sam2.1_hiera_tiny.pt"
+
+  # We must ignore trunk (and usually neck) because your VCR backbone differs from Hiera.
+  # Start conservative (skip all image_encoder.*). Once stable, you can try narrowing this.
+  ignore_prefixes:
+    - "image_encoder."
+
+  # Now that you patched RoPE repeat logic, you can keep this enabled.
+  use_obj_ptrs_in_encoder: true
+
+  # Optional but recommended: freeze pretrained parts for a few epochs so your trunk/adapters
+  # learn to feed them, without immediately destroying them.
+  freeze_pretrained_epochs: 0
+  freeze_modules:
+    - "sam_prompt_encoder"
+    - "sam_mask_decoder"
+    - "memory_attention"
+    - "memory_encoder"
+    - "obj_ptr_proj"
+    - "mask_downsample"
+
+# ---- DRIPP config ------------------------------------------------------------------
 dripp:
   output_dir: "/data/Preprocessed"
   tasks_file: "/data/DatasetIndexes/Tasks/datasets_tasks.json"
 
-# ---- Sequence sampler config -----------------------------------------------------------------
+# ---- Sequence sampler config -------------------------------------------------------
 sampler:
-  seq_len: 8             # Number of frames per training sample
-  max_random: 2          # Maximum number of random frames to drop
+  seq_len: 8                            # Number of frames per training sample
+  max_random: 0                         # Maximum number of random frames to drop
+  min_fg_frames_in_window: 7            # Minimum number of foreground frames per window
+  fg_min_pixels_frac: 0.0002            # Minimum number of pixels in foreground for window to be considered.
 
 # ---- Training config ----------------------------------------------------------------
 training:
-  device: "cuda"         # Device
-  batch_size: 4          # Batch size
-  num_workers: 8         # Number of dataloader workers
-  lr: 1e-4               # Default Learning rate
-  mem_lr: 1e-4           # Memory learning rate\
-  mask_lr: 1e-8          # Mask learning rate
-  weight_decay: 0.0      # Weight decay
-  warmup_epochs: 5       # Number of warmup epochs
-  seed: 42               # Random seed
-  val_frac: 0.1          # Validation fraction
-  val_freq: 5            # Validation frequency
-  dist_weight: 1.0       # Weight for distillation term (if you prefer seg + dist_weight*distill)
-  epochs: 20             # Number of epochs
-  out_size: 512          # Output mask H/W
-  pos_weight: 2.0        # Positive‐pixel weight for BCEWithLogitsLoss
-  alpha: 0.8             # Mix between seg_loss (alpha) and distill_loss (1-alpha)
+  device: "cuda"                        # Device
+  batch_size: 3                         # Batch size
+  num_workers: 2                        # Number of dataloader workers
 
-# ---- Memory bank config -------------------------------------------------------------
-memory_bank:
-  capacity: 16           # Number of previous embeddings to store
-  c_thresh: 0.5          # Confidence threshold
+  lr: 1e-4                              # Default Learning rate
+  mem_lr: 1e-5                          # Memory learning rate
+  mask_lr: 1e-4                         # Mask learning rate
+  weight_decay: 0.0                     # Weight decay
+  warmup_epochs: 8                      # Number of warmup epochs
+  
+  seed: 42                              # Random seed
+  val_frac: 0.1                         # Validation fraction
+  val_freq: 5                           # Validation frequency
+  epochs: 20                            # Number of epochs
+  
+  out_size: 512                         # Output mask H/W
+
+  pos_weight: 1.0                       # Positive‐pixel weight for BCEWithLogitsLoss
+  pos_weight_max: 8.0                   # Maximum positive‐pixel weight
+
+  lambda_distill_2d: 0.05               # Current weight for 2D distillation  
+  lambda_distill_3d: 0.1                # Current weight for 3D distillation
+  distill_temperature: 4.0              # Temperature for distillation
+  distill_heavy_mult: 10.0              # Multiplier for distillation
+
+  bce_weight: 1.5                       # Weight for BCE loss
+  dice_weight: 1.0                      # Weight for Dice loss
+
+  focal_weight: 0.70                    # Weight for Focal loss
+  focal_gamma: 2.0                      # Gamma for Focal loss
+  focal_alpha: 0.75                     # Alpha for Focal loss
+
+  logit_clip: 12.0                      # Maximum logit value
+  frame_loss_clip: 5.0                  # Maximum frame loss value
+
+  nonprompt_scale: 1.0                  # Scale for non-prompt loss
+
+  vis_threshold: 0.50                   # Threshold for visualization
+
 
 # ---- Prompt config ------------------------------------------------------------------
 prompt:
-  max_per_seq: 2         # Maximum number of prompt frames per sequence
-  mask_prob: 0.5         # Probability of generating a full mask (if used)
-  click_prob: 0.25       # Probability of generating a positive click
+  max_per_seq: 2                        # Maximum number of prompt frames per sequence
+  mask_prob: 0.5                        # Probability of generating a full mask (if used)
+  click_prob: 0.0                       # Probability of generating a positive click
 
 # ---- Logging config -----------------------------------------------------------------
 logging:
@@ -50,6 +103,7 @@ logging:
   file_level: "DEBUG"
   interval: 5
   backups: 7
+  train_vis_prompt_mode: box
 
 # ---- Checkpoint config --------------------------------------------------------------
 ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
@@ -57,7 +111,7 @@ ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
 # ---- Teacher settings ---------------------------------------------------------------
 teacher:
   _config_path: "sam2/sam2_hiera_t_512.yaml"
-  ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/MedSAM2_pretrain.pth"
+  ckpt_path: "/data/jrbonill/oxford_refine_runs/oxford_refine_20260312_023627/checkpoints/epoch_004.pth"
 
 # ---- Model config -------------------------------------------------------------------
 model:
@@ -175,7 +229,7 @@ model:
   image_size: 512
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0
-  use_mask_input_as_output_without_sam: true
+  use_mask_input_as_output_without_sam: false
   directly_add_no_mem_embed: true
   no_obj_embed_spatial: true
   use_high_res_features_in_sam: true
@@ -195,6 +249,7 @@ model:
   multimask_max_pt_num: 1
   use_mlp_for_obj_ptr_proj: true
   compile_image_encoder: false
+
 
 # ---- Mask Decoder config -------------------------------------------------------------
 decoder:

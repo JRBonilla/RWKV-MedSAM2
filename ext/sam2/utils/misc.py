@@ -209,42 +209,87 @@ def load_video_frames(
             "Only MP4 video and JPEG folder are supported at this moment"
         )
 
-# Adapted from the official Medical SAM-2 code
-# https://github.com/SuperMedIntel/Medical-SAM2/blob/main/sam2_train/utils/misc.py
+
+@torch.no_grad()
 def load_video_frames_from_data(
     imgs_tensor: torch.Tensor,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     offload_video_to_cpu: bool = False,
+    fixed_window: tuple | None = None, # e.g., (-1000, 3000) for CT; None = no window
 ) -> torch.Tensor:
     """
-    Normalize an in-memory video tensor for SAM2 training.
+    Load the video frames from an in-memory tensor.
 
-    Args:
-        imgs_tensor: torch.Tensor of shape [T, C, H, W] with values in [0, 255].
-        img_mean: 3-tuple of per-channel mean (0-1 scale).
-        img_std: 3-tuple of per-channel std (0-1 scale).
-        offload_video_to_cpu: if True, keep frames on CPU; otherwise move to model device.
+    Inputs:
+    - imgs_tensor: A tensor of shape (T, C, H, W) where C is 1 or 3. The values can be
+                   z-scored floats, floats in [0, 1], or values in the 0..255 range.
+    - img_mean: A 3-tuple for per-channel mean used for normalization in the 0..1 domain.
+    - img_std: A 3-tuple for per-channel std used for normalization in the 0..1 domain.
+    - offload_video_to_cpu: If False, move the result to CUDA; if True, keep on CPU.
 
     Returns:
-        Normalized video tensor of shape [T, C, H, W] on the appropriate device.
+    - images: A float32 tensor of shape (T, 3, H, W) normalized by mean and std,
+              ready for SAM 2.
     """
-    # Convert mean/std to tensors
-    mean = torch.tensor(img_mean, device=imgs_tensor.device).view(1, -1, 1, 1)
-    std = torch.tensor(img_std, device=imgs_tensor.device).view(1, -1, 1, 1)
+    assert imgs_tensor.dim() == 4, f"Expected shape (T, C, H, W), got {tuple(imgs_tensor.shape)}"
+    T, C, H, W = imgs_tensor.shape
 
-    # Scale to [0,1]
-    imgs = imgs_tensor.float() / 255.0
+    images = imgs_tensor.to(torch.float32)
 
-    # Move to CUDA if desired
+    # Ensure 3 channels
+    if C == 1:
+        images = images.repeat(1, 3, 1, 1)
+
+    # Map inputs to [0,255] with bit-depth aware heuristics (no per-frame drift)
+    vmin = float(images.amin().item())
+    vmax = float(images.amax().item())
+    if fixed_window is not None:
+        lo, hi = fixed_window
+        images = ((images - lo) / max(hi - lo, 1e-6)).clamp_(0.0, 1.0) * 255.0
+    else:
+        # Common cases:
+        #  - [0,1] floats
+        #  - [0,255] floats
+        #  - [0,4095] (12-bit) or [0,65535] (16-bit) floats/ints
+        #  - signed CT-like values (e.g., HU with negatives)
+        if 0.0 <= vmin and vmax <= 1.5:
+            images = images * 255.0
+        elif 0.0 <= vmin and vmax <= 255.0:
+            # already byte-like range
+            pass
+        elif vmin >= 0.0 and vmax <= 4095.0 * 1.5:
+            images = (images / 4095.0) * 255.0
+        elif vmin >= 0.0 and vmax <= 65535.0 * 1.5:
+            images = (images / 65535.0) * 255.0
+        else:
+            # Signed or unknown extreme range: gentle, global percentile clip once
+            # (prevents full saturation without per-sample drift).
+            # Tighten tails slightly vs p1/p99 to be more "raw-ish".
+            with torch.no_grad():
+                flat = images.reshape(-1)
+                # compute on CPU if huge
+                sample = flat[:: max(1, flat.numel() // 2_000_000)]
+                if sample.is_cuda:
+                    sample = sample.detach().to("cpu")
+                q = torch.quantile(sample, torch.tensor([0.005, 0.995]))
+                lo = float(q[0].item())
+                hi = float(q[1].item())
+                if hi <= lo + 1e-6:
+                    lo, hi = float(images.min().item()), float(images.max().item())
+            images = ((images - lo) / max(hi - lo, 1e-6)).clamp_(0.0, 1.0) * 255.0
+
+    # Optionally move to CUDA
     if not offload_video_to_cpu:
-        imgs = imgs.cuda(non_blocking=True)
-        mean = mean.cuda(non_blocking=True)
-        std = std.cuda(non_blocking=True)
+        images = images.to("cuda", non_blocking=True)
 
-    # Normalize
-    imgs = (imgs - mean) / std
-    return imgs
+    # Normalize by mean and std in the 0..1 domain
+    mean = torch.tensor(img_mean, dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor(img_std, dtype=torch.float32, device=images.device).view(1, 3, 1, 1)
+    images = images / 255.0
+    images = (images - mean) / std
+
+    return images
 
 def load_video_frames_from_jpg_images(
     video_path,

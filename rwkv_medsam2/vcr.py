@@ -1,3 +1,5 @@
+"""VCR CNN/RWKV backbone components for RWKV-MedSAM2."""
+
 import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
@@ -12,10 +14,30 @@ from .refinement import RefinementModule, UncertaintyHead
 from ext.vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
 from ext.vrwkv.utils import resize_pos_embed, DropPath
 
+def GroupNorm2d(num_channels: int, eps: float = 1e-6, num_groups: int = 32) -> nn.Module:
+    """
+    Creates a GroupNorm module that normalizes across feature channels in groups.
+
+    Args:
+        num_channels (int): The number of channels in the input data.
+        eps (float, optional): The epsilon value used in the normalization formula.
+            Default is 1e-6.
+        num_groups (int, optional): The number of groups to divide the channels into.
+            Default is 32.
+
+    Returns:
+        nn.Module: The GroupNorm module.
+    """
+    # Find the largest group size that evenly divides num_channels
+    g = min(num_groups, num_channels)
+    while num_channels % g != 0 and g > 1:
+        g //= 2
+    return nn.GroupNorm(num_groups=g, num_channels=num_channels, eps=eps)
+
 class VCRStem(nn.Module):
     """
     Initial stem block that processes raw input images.
-    
+
     Reduces spatial dimensions by 2x while increasing channels through:
     - First 3x3 strided convolution (stride=2)
     - Batch normalization + activation
@@ -25,7 +47,7 @@ class VCRStem(nn.Module):
         in_channels (int): Number of input channels. Default: 3
         out_channels (int): Number of output channels. Default: 32
         act_layer (nn.Module): Activation layer. Default: nn.ReLU
-        norm_layer (nn.Module): Normalization layer. Default: nn.BatchNorm2d
+        norm_layer (nn.Module): Normalization layer. Default: GroupNorm2d
         norm_eps (float): Epsilon for normalization. Default: 1e-6
         bias (bool): Whether to use bias in convolutions. Default: False
     """
@@ -34,10 +56,24 @@ class VCRStem(nn.Module):
             in_channels=3,
             out_channels=32,
             act_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm2d,
+            norm_layer=GroupNorm2d,
             norm_eps=1e-6,
             bias=False
         ):
+        """
+        Initialize stem convolutions, normalization, and activation.
+
+        Args:
+            in_channels (int): Number of input image channels.
+            out_channels (int): Number of output feature channels.
+            act_layer (type): Activation module class.
+            norm_layer (callable): Normalization layer factory.
+            norm_eps (float): Normalization epsilon.
+            bias (bool): Whether convolutions use bias.
+
+        Returns:
+            None.
+        """
         super().__init__()
 
         self.conv1 = nn.Conv2d(
@@ -60,8 +96,17 @@ class VCRStem(nn.Module):
 
         self.norm = norm_layer(out_channels, eps=norm_eps)
         self.act = act_layer(inplace=False)
-    
+
     def forward(self, x):
+        """
+        Apply the stem convolutions to an input image batch.
+
+        Args:
+            x (torch.Tensor): Input image tensor of shape ``[B, C, H, W]``.
+
+        Returns:
+            torch.Tensor: Stem features with reduced spatial resolution.
+        """
         # Process input through stem block with 2x spatial reduction
         x = self.conv1(x)
         x = self.norm(x)
@@ -82,7 +127,7 @@ class FusedMbConv(nn.Module):
         - stride (int, optional): Convolution stride. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
-        - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
+        - norm_layer (nn.Module, optional): Normalization layer. Default is GroupNorm2d.
     """
     def __init__(
         self,
@@ -91,8 +136,22 @@ class FusedMbConv(nn.Module):
         stride=1,
         expand_ratio=4.0,
         act_layer=nn.ReLU,
-        norm_layer=nn.BatchNorm2d
+        norm_layer=GroupNorm2d
     ):
+        """
+        Initialize a fused MBConv block.
+
+        Args:
+            in_channels (int): Input channel count.
+            out_channels (int): Output channel count.
+            stride (int): Spatial stride.
+            expand_ratio (float): Hidden-channel expansion ratio.
+            act_layer (type): Activation module class.
+            norm_layer (callable): Normalization layer factory.
+
+        Returns:
+            None.
+        """
         super().__init__()
         hidden_dim = int(in_channels * expand_ratio)
         self.stride = stride
@@ -127,6 +186,15 @@ class FusedMbConv(nn.Module):
             self.project_conv = None
 
     def forward(self, x):
+        """
+        Apply the fused MBConv block.
+
+        Args:
+            x (torch.Tensor): Input feature map.
+
+        Returns:
+            torch.Tensor: Output feature map.
+        """
         identity = x
         if self.expand:
             x = self.fused_conv(x)
@@ -157,7 +225,7 @@ class FusedMbConvStage(nn.Module):
         - stride (int, optional): Stride for first block. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
-        - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
+        - norm_layer (nn.Module, optional): Normalization layer. Default is GroupNorm2d.
     """
     def __init__(
         self,
@@ -167,8 +235,23 @@ class FusedMbConvStage(nn.Module):
         stride=1,
         expand_ratio=4.0,
         act_layer=nn.ReLU,
-        norm_layer=nn.BatchNorm2d
+        norm_layer=GroupNorm2d
     ):
+        """
+        Initialize a stage of fused MBConv blocks.
+
+        Args:
+            in_channels (int): Input channel count.
+            out_channels (int): Output channel count.
+            depth (int): Number of blocks.
+            stride (int): Stride for the first block.
+            expand_ratio (float): Hidden-channel expansion ratio.
+            act_layer (type): Activation module class.
+            norm_layer (callable): Normalization layer factory.
+
+        Returns:
+            None.
+        """
         super().__init__()
         self.blocks = nn.Sequential(
             *[
@@ -185,6 +268,15 @@ class FusedMbConvStage(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Apply all fused MBConv blocks in the stage.
+
+        Args:
+            x (torch.Tensor): Input feature map.
+
+        Returns:
+            torch.Tensor: Stage output feature map.
+        """
         return self.blocks(x)
 
 class MbConv(nn.Module):
@@ -198,7 +290,7 @@ class MbConv(nn.Module):
         - stride (int, optional): Stride for depthwise conv. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
-        - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
+        - norm_layer (nn.Module, optional): Normalization layer. Default is GroupNorm2d.
     """
     def __init__(
         self,
@@ -207,8 +299,22 @@ class MbConv(nn.Module):
         stride=1,
         expand_ratio=4.0,
         act_layer=nn.ReLU,
-        norm_layer=nn.BatchNorm2d
+        norm_layer=GroupNorm2d
     ):
+        """
+        Initialize an MBConv block.
+
+        Args:
+            in_channels (int): Input channel count.
+            out_channels (int): Output channel count.
+            stride (int): Depthwise convolution stride.
+            expand_ratio (float): Hidden-channel expansion ratio.
+            act_layer (type): Activation module class.
+            norm_layer (callable): Normalization layer factory.
+
+        Returns:
+            None.
+        """
         super().__init__()
         hidden_dim = int(in_channels * expand_ratio)
         self.stride = stride
@@ -250,6 +356,15 @@ class MbConv(nn.Module):
         self.project_bn = norm_layer(out_channels)
 
     def forward(self, x):
+        """
+        Apply the MBConv block.
+
+        Args:
+            x (torch.Tensor): Input feature map.
+
+        Returns:
+            torch.Tensor: Output feature map.
+        """
         identity = x
 
         if self.expand:
@@ -281,7 +396,7 @@ class MbConvStage(nn.Module):
         - stride (int, optional): Stride for first block. Default is 1.
         - expand_ratio (float, optional): Expansion factor for hidden layer. Default is 4.0.
         - act_layer (nn.Module, optional): Activation layer. Default is nn.ReLU.
-        - norm_layer (nn.Module, optional): Normalization layer. Default is nn.BatchNorm2d.
+        - norm_layer (nn.Module, optional): Normalization layer. Default is GroupNorm2d.
     """
     def __init__(
         self,
@@ -291,8 +406,23 @@ class MbConvStage(nn.Module):
         stride=1,
         expand_ratio=4.0,
         act_layer=nn.ReLU,
-        norm_layer=nn.BatchNorm2d
+        norm_layer=GroupNorm2d
     ):
+        """
+        Initialize a stage of MBConv blocks.
+
+        Args:
+            in_channels (int): Input channel count.
+            out_channels (int): Output channel count.
+            depth (int): Number of blocks.
+            stride (int): Stride for the first block.
+            expand_ratio (float): Hidden-channel expansion ratio.
+            act_layer (type): Activation module class.
+            norm_layer (callable): Normalization layer factory.
+
+        Returns:
+            None.
+        """
         super().__init__()
         self.blocks = nn.Sequential(
             *[
@@ -309,6 +439,15 @@ class MbConvStage(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Apply all MBConv blocks in the stage.
+
+        Args:
+            x (torch.Tensor): Input feature map.
+
+        Returns:
+            torch.Tensor: Stage output feature map.
+        """
         return self.blocks(x)
 
 class RWKVBlock(nn.Module):
@@ -354,6 +493,27 @@ class RWKVBlock(nn.Module):
         layer_scale_init_value: float = 1e-2,
         with_cp: bool = False
     ):
+        """
+        Initialize an RWKV residual block.
+
+        Args:
+            embed_dim (int): Token embedding dimension.
+            total_layer (int): Total RWKV block count.
+            layer_id (int): Index of this block.
+            mlp_ratio (float): Channel-mix expansion ratio.
+            drop_path (float): Stochastic depth rate.
+            shift_mode (str): Shift mode for VRWKV modules.
+            channel_gamma (float): Fraction of channels shifted.
+            shift_pixel (int): Pixel shift amount.
+            init_mode (str): VRWKV initialization mode.
+            key_norm (bool): Whether VRWKV modules use key normalization.
+            use_layer_scale (bool): Whether to use learnable layer scales.
+            layer_scale_init_value (float): Initial layer-scale value.
+            with_cp (bool): Whether to use gradient checkpointing.
+
+        Returns:
+            None.
+        """
         super().__init__()
         self.embed_dim = embed_dim
         self.with_cp = with_cp
@@ -395,7 +555,18 @@ class RWKVBlock(nn.Module):
             self.gamma2 = nn.Parameter(layer_scale_init_value * torch.ones((embed_dim)), requires_grad=True)
 
     def forward(self, x: torch.Tensor, patch_resolution: tuple) -> torch.Tensor:
+        """
+        Apply spatial and channel RWKV mixing with residual connections.
+
+        Args:
+            x (torch.Tensor): Token tensor of shape ``[B, N, C]``.
+            patch_resolution (tuple): Spatial token grid as ``(H, W)``.
+
+        Returns:
+            torch.Tensor: Mixed token tensor with the same shape as ``x``.
+        """
         def _inner_forward(t):
+            """Apply RWKV sub-blocks without checkpointing."""
             # --- Sub-block A: Spatial Mix with residual (out-of-place) ---
             t_norm = self.norm1(t)
             out_spatial = self.spatial_mix(t_norm, patch_resolution)
@@ -457,6 +628,25 @@ class VCRBackbone(nn.Module):
         use_uncertainty: bool = False,
         use_refinement: bool = False,
     ):
+        """
+        Initialize the CNN/RWKV backbone and optional heads.
+
+        Args:
+            in_channels (int): Number of input image channels.
+            embed_dim (int): Token embedding dimension kept for config compatibility.
+            rwkv_depth (int): Number of RWKV blocks.
+            mlp_ratio (float): Channel-mix expansion ratio.
+            drop_path (float): Stochastic depth rate.
+            with_pos_embed (bool): Whether to add positional embeddings.
+            init_patch_size (tuple[int, int]): Initial positional embedding grid.
+            fused_stage_cfg (dict | None): Fused stage configuration.
+            mbconv_stage_cfg (dict | None): MBConv stage configuration.
+            use_uncertainty (bool): Whether to add the uncertainty head.
+            use_refinement (bool): Whether to add the refinement module.
+
+        Returns:
+            None.
+        """
         super().__init__()
 
         stem_out_channels = (fused_stage_cfg or {}).get('out_ch', 112)
@@ -469,7 +659,7 @@ class VCRBackbone(nn.Module):
             'stride': 2,
             'expand_ratio': 4.0
         }
-        
+
         mbconv_cfg = mbconv_stage_cfg or {
             'out_ch': 224,
             'depth': 2,
@@ -493,7 +683,7 @@ class VCRBackbone(nn.Module):
             stride=fused_cfg['stride'],
             expand_ratio=fused_cfg['expand_ratio'],
             act_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm2d,
+            norm_layer=GroupNorm2d,
         )
 
         # Stages 1-3: MbConv stages with increasing channels
@@ -504,7 +694,7 @@ class VCRBackbone(nn.Module):
             stride=mbconv_cfg['stride'],
             expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm2d,
+            norm_layer=GroupNorm2d,
         )
 
         self.stage2 = MbConvStage(
@@ -514,7 +704,7 @@ class VCRBackbone(nn.Module):
             stride=mbconv_cfg['stride'],
             expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm2d,
+            norm_layer=GroupNorm2d,
         )
 
         self.stage3 = MbConvStage(
@@ -524,7 +714,7 @@ class VCRBackbone(nn.Module):
             stride=mbconv_cfg['stride'],
             expand_ratio=mbconv_cfg['expand_ratio'],
             act_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm2d,
+            norm_layer=GroupNorm2d,
         )
 
         # Positional embedding for final scale
@@ -579,10 +769,10 @@ class VCRBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
         Forward pass through backbone.
-        
+
         Args:
             x: Input tensor of shape (B, C, H, W)
-            
+
         Returns:
             List of feature maps [feat0, feat1, feat2, feat3_rnn] with channels
             [112, 224, 448, 896] and progressively halved spatial resolution:
@@ -593,10 +783,10 @@ class VCRBackbone(nn.Module):
         """
         # Initial stem block reduces spatial dims by 2x while increasing channels
         x = self.stem(x)
-        
+
         # Process through CNN stages with progressively increasing channels and decreasing resolution
         feat0 = self.stage0(x)      # (B, 112, H/2, W/2)
-        feat1 = self.stage1(feat0)  # (B, 224, H/4, W/4) 
+        feat1 = self.stage1(feat0)  # (B, 224, H/4, W/4)
         feat2 = self.stage2(feat1)  # (B, 448, H/8, W/8)
         feat3 = self.stage3(feat2)  # (B, 896, H/16, W/16)
 

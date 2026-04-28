@@ -1,302 +1,272 @@
-# functions/func_2d.py
-# Implements the per-batch 2D training and validation steps for
-# student-teacher distillation in the RWKV-MedSAM2 model.
+# Per-batch 2D training and validation steps for RWKV-MedSAM2.
+#
+# Includes input normalization, mixed prompt encoding, student/teacher
+# distillation training, and prompt-cache validation.
 
+import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from .func_metrics import compute_iou, compute_dice, compute_hd95
+from .func_metrics import (
+    tversky_loss_from_logits,
+    binary_focal_loss_with_logits,
+    safe_float,
+)
 
-def train_step_2d(student, teacher, optimizer, batch, config, memory_bank, scaler):
+def normalize_sam2_input(x: torch.Tensor, img_mean=(0.485, 0.456, 0.406), img_std=(0.229, 0.224, 0.225)) -> torch.Tensor:
     """
-    Perform a single training step for a 2D model using student-teacher distillation.
-
-    This function processes a batch of 2D images through a student model and a 
-    teacher model to compute segmentation and distillation losses. It updates 
-    the model parameters using these losses and manages a memory bank for 
-    storing encoded features.
+    Normalize raw 2D inputs to the ImageNet scale expected by SAM2.
 
     Args:
-        student (SAM2VideoPredictor): The student model for training.
-        teacher (SAM2VideoPredictor): The teacher model for distillation.
-        optimizer (torch.optim.Optimizer): The optimizer for updating the student model.
-        batch (dict): A batch of input data containing images, masks, and prompts.
-        config (DictConfig): Configuration parameters for the training process.
-        memory_bank (list): A list to store memory features and positions for attention.
-        scaler (torch.cuda.amp.GradScaler): Gradient scaler for mixed precision training.
+        x (torch.Tensor): Input tensor of shape ``[B, C, H, W]``.
+        img_mean (tuple[float, float, float]): Channel means.
+        img_std (tuple[float, float, float]): Channel standard deviations.
 
     Returns:
-        float: The computed loss value for the training step.
+        torch.Tensor: Normalized three-channel tensor.
     """
-    # Device and config setup
+    x = x.to(torch.float32)
+
+    if x.shape[1] == 1:
+        x = x.repeat(1, 3, 1, 1)
+
+    vmin = float(x.amin().item())
+    vmax = float(x.amax().item())
+
+    def _robust_01(t: torch.Tensor, qlo=0.01, qhi=0.99):
+        """Robustly rescale a tensor to [0, 1]."""
+        flat = t.reshape(-1)
+        qs = torch.quantile(flat, torch.tensor([qlo, qhi], device=flat.device, dtype=flat.dtype))
+        lo, hi = qs[0], qs[1]
+        if (not torch.isfinite(lo)) or (not torch.isfinite(hi)) or float((hi - lo).item()) <= 1e-6:
+            return torch.zeros_like(t)
+        return ((t - lo) / (hi - lo)).clamp_(0.0, 1.0)
+
+    if (-6.5 <= vmin <= 0.0) and (0.0 <= vmax <= 6.5):
+        x = _robust_01(x) * 255.0
+    elif 0.0 <= vmin and vmax <= 1.5:
+        x = x * 255.0
+    else:
+        x = x.clamp_(0.0, 255.0)
+
+    mean = torch.tensor(img_mean, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor(img_std, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+
+    x = x / 255.0
+    x = (x - mean) / std
+    return x
+
+def train_step_2d(student, teacher, optimizer, batch, config, scaler):
+    """
+    Run one 2D student training step with optional teacher distillation.
+
+    Args:
+        student (SAM2VideoPredictor): Student predictor to optimize.
+        teacher (SAM2VideoPredictor | None): Optional teacher predictor.
+        optimizer (torch.optim.Optimizer): Optimizer for the student.
+        batch (dict): Collated single-frame 2D batch.
+        config (OmegaConf.DictConfig): Training configuration.
+        scaler (object | None): AMP scaler placeholder; bf16 autocast is used directly.
+
+    Returns:
+        dict: Step status and loss values, including skip diagnostics on failure.
+    """
     device     = config.training.device
-    feat_sizes = config.decoder.feat_sizes  # [H, W]
-    out_size   = config.training.out_size
-    pos_weight = config.training.pos_weight
-    alpha      = config.training.alpha
-    capacity   = config.memory_bank.capacity
-    c_thresh   = config.memory_bank.c_thresh
+    feat_sizes = config.decoder.feat_sizes
+    out_size   = int(config.training.out_size)
 
-    # 1) Unpack all frames & flatten batch/time
-    B,T,C,H,W  = batch['image'].shape
-    imgs       = batch['image'].view(B*T, C, H, W).to(device)   # [B*T, C, H, W]
-    masks      = batch['mask'].view( B*T, 1, H, W).to(device)   # [B*T, 1, H, W]
-    batch_size = B * T
+    # Loss weights
+    bce_w    = float(getattr(config.training, "bce_weight",   1.0))
+    dice_w   = float(getattr(config.training, "dice_weight",  1.0))
+    focal_w  = float(getattr(config.training, "focal_weight", 0.0))
+    f_gamma  = float(getattr(config.training, "focal_gamma",  2.0))
+    f_alpha  = float(getattr(config.training, "focal_alpha", -1.0))
 
-    # 2) Build sparse prompts per flattened frame (B*T total)
-    raw_pt_list  = batch['pt_list']    # List[T] of length-B lists of point Tensors
-    raw_lbl_list = batch['p_label']    # List[T] of length-B lists of label Tensors
-    raw_box_list = batch['bbox']
-    raw_m_prompt = batch.get('m_prompt', None)
+    # Distillation
+    lam_base   = float(getattr(config.training, "lambda_distill_2d", 0.0))
+    heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
+    lam        = lam_base * heavy_mult
+    tau        = float(getattr(config.training, "distill_temperature", 1.0))
+    logit_clip = float(getattr(config.training, "logit_clip", 12.0))
 
-    # Flatten B,T into B*T order
-    pts_all, lbs_all, box_all, msk_all = [], [], [], []
-    for t in range(T):
-        for b in range(B):
-            # Points
-            pts = raw_pt_list[t][b] if isinstance(raw_pt_list[t], list) else raw_pt_list[t][b]
-            lbs = raw_lbl_list[t][b] if isinstance(raw_lbl_list[t], list) else raw_lbl_list[t][b]
-            # Bounding box
-            bx = raw_box_list[t][b] if isinstance(raw_box_list[t], list) else raw_box_list[t][b]
-            # Mask
-            if raw_m_prompt is not None:
-                mp = raw_m_prompt[t][b] if isinstance(raw_m_prompt[t], list) else raw_m_prompt[t][b]
-            else:
-                mp = None
+    imgs_all = batch["image"].to(device=device, non_blocking=True)  # [B,1,C,H,W]
+    msks_all = batch["mask"].to(device=device, non_blocking=True)   # [B,1,1,H,W]
+    B, T, C, H, W = imgs_all.shape
+    if T != 1:
+        raise ValueError(f"2D training expects single-frame sequences, got T={T}")
 
-            pts_all.append(pts)
-            lbs_all.append(lbs)
-            box_all.append(bx)
-            msk_all.append(mp)
+    raw_pts = batch["pt_list"]
+    raw_lbl = batch["p_label"]
+    raw_box = batch["bbox"]
+    raw_mpr = batch.get("m_prompt", None)
 
-    # 3) Mixed prompting: encode per-subset and stitch back (student)
-    student_sparse_embs, student_dense_embs, _ = _encode_mixed_prompts(
-        student.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs, device
-    )
-    image_pe = student.sam_prompt_encoder.get_dense_pe()
-
-    # 4) Enable TF32 matmuls on Ampere+ GPUs while using bfloat16 autocast
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # Turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
     student.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
-    torch.autograd.set_detect_anomaly(True)
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        # 5) Forward + memory attention
-        backbone_out = student.forward_image(imgs)
-        _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
+    pe_student = student.sam_prompt_encoder.get_dense_pe()
+    pe_teacher = None
+    if teacher is not None and lam > 0.0:
+        teacher.eval()
+        pe_teacher = teacher.sam_prompt_encoder.get_dense_pe()
 
-        if memory_bank:
-            # Gather saved memory features & positions -> [bank_size, P, C, H, W]
-            mem_feats = torch.cat([m[0] for m in memory_bank], dim=0)
-            mem_pos   = torch.cat([m[1] for m in memory_bank], dim=0)
-            # Sample one entry per batch by similarity
-            curr  = vision_feats[-1].permute(1,0,2).reshape(batch_size, -1)
-            banks = torch.stack([e[3] for e in memory_bank], dim=0)
-            banks = F.normalize(banks, p=2, dim=1)
-            sims  = (banks @ F.normalize(curr, p=2, dim=1).t()).t()
-            
-            # Compute softmax
-            probs = F.softmax(sims, dim=1)
-            K     = config.memory_bank.capacity
+    imgs_t = imgs_all[:, 0]
+    msks_t = msks_all[:, 0]
 
-            # a) Draw K indices per example (with replacement)
-            idxs = torch.multinomial(probs, num_samples=K, replacement=True) # [B, K]
+    imgs_t = normalize_sam2_input(imgs_t)
 
-            # b) Gather K features & positions per example -> [B,K,C,H,W]
-            batch_mem_feats = mem_feats[idxs]
-            batch_mem_pos   = mem_pos[idxs]
-            
-            # c) Flatten into KxHxW tokens: [B,K,C,H,W] -> [K*H*W,B,C]
-            B,K,C,H,W = batch_mem_feats.shape
-            S = H * W
-            sel_f = (
-                batch_mem_feats         # [B,K,C,H,W]
-                    .reshape(B,K,C,S)   # [B,K,C,S]
-                    .permute(1,3,0,2)   # [K,S,B,C]
-                    .reshape(K*S,B,C)   # [K*S,B,C]
-            )
-            sel_p = (
-                batch_mem_pos           # [B,K,C,H,W]
-                    .reshape(B,K,C,S)   # [B,K,C,S]
-                    .permute(1,3,0,2)   # [K,S,B,C]
-                    .reshape(K*S,B,C)   # [K*S,B,C]
-            )
+    pts_all = raw_pts[0]
+    lbs_all = raw_lbl[0]
+    box_all = raw_box[0]
+    msk_all = (raw_mpr[0] if raw_mpr is not None else [None] * B)
 
-            # d) Memory attention
-            updated_feats = student.memory_attention(
-                curr=[vision_feats[-1]],
-                curr_pos=[vision_pos[-1]],
-                memory=sel_f,
-                memory_pos=sel_p,
-                num_obj_ptr_tokens=0
-            )
-            vision_feats[-1] = updated_feats
-        else:
-            # If no memory yet, add a zero key/value so memory_attention always has something to attend to
-            zeros_f = torch.zeros_like(vision_feats[-1])
-            zeros_p = torch.zeros_like(vision_pos[-1])
-            vision_feats[-1] = (vision_feats[-1] + zeros_f).clone()
-            vision_pos[-1]   = (vision_pos[-1]   + zeros_p).clone()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        student_sparse, student_dense, _ = _encode_mixed_prompts(
+            student.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs_t, device
+        )
 
-        # 6) Decode mask
+        bb_out = student.forward_image(imgs_t)
+        _, vision_feats, _vision_pos, _ = student._prepare_backbone_features(bb_out)
+
         feats = [
-            feat.permute(1,2,0).view(batch_size, -1, *size)
+            feat.permute(1, 2, 0).reshape(B, -1, *size)
             for feat, size in zip(vision_feats[::-1], feat_sizes[::-1])
         ][::-1]
         image_embed = feats[-1]
-        hires_feats = feats[:-1] # [feat_hr, feat_mr]
+        hires_feats = feats[:-1]
 
-        image_embed = image_embed.clone()
-        hires_feats = [hf.clone() for hf in hires_feats]
-        if student_sparse_embs is not None:
-            student_sparse_embs = student_sparse_embs.clone()
+        student_dense = F.interpolate(
+            student_dense, size=image_embed.shape[-2:], mode="bilinear", align_corners=False
+        )
+        image_pe = pe_student
+        if image_pe.shape[-2:] != image_embed.shape[-2:]:
+            image_pe = F.interpolate(image_pe, size=image_embed.shape[-2:], mode="bilinear", align_corners=False)
+        image_pe = image_pe.to(image_embed.dtype)
 
-        # Resize dense prompt embeddings
-        student_dense_embs = F.interpolate(student_dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False).clone()
-
-        image_pe = image_pe.clone()
-        
-        student_logits, student_iou, _, student_object_score_logits = student.sam_mask_decoder(
+        student_logits, _student_iou, _, _student_obj_score_logits = student.sam_mask_decoder(
             image_embeddings=image_embed,
             image_pe=image_pe,
-            sparse_prompt_embeddings=student_sparse_embs,
-            dense_prompt_embeddings=student_dense_embs,
+            sparse_prompt_embeddings=student_sparse,
+            dense_prompt_embeddings=student_dense,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=hires_feats
+            high_res_features=hires_feats,
         )
-        student_pred = F.interpolate(student_logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B*T,1,H,W]
 
-        # 7) Teacher distillation
+        student_logits = student_logits.clamp(-logit_clip, logit_clip)
+        stud_up = F.interpolate(student_logits, size=(out_size, out_size), mode="bilinear", align_corners=False)
+        gt_up   = F.interpolate(msks_t.float(),    size=(out_size, out_size), mode="nearest")
+
+    with torch.amp.autocast("cuda", enabled=False):
+        gm = gt_up.float()
+        sp = stud_up.float()
+
+        pos = gm.flatten(1).sum(1)
+        tot = torch.full_like(pos, gm[0].numel(), dtype=gm.dtype)
+        neg = tot - pos
+        dyn_pw = ((neg + 1.0) / (pos + 1.0)).clamp(1.0, float(getattr(config.training, "pos_weight_max", 8.0)))
+        dyn_pw_pix = dyn_pw.view(B, 1, 1, 1)
+
+        bce_raw = F.binary_cross_entropy_with_logits(sp, gm, reduction="none")
+        pixel_w = 1.0 + (dyn_pw_pix - 1.0) * gm
+        bce = (bce_raw * pixel_w).mean()
+
+        tv  = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
+        foc = binary_focal_loss_with_logits(sp, gm, gamma=f_gamma, alpha=f_alpha)
+
+        seg_loss = (bce_w * bce) + (dice_w * tv) + (focal_w * foc)
+
+    if teacher is not None and lam > 0.0:
         with torch.no_grad():
-            teacher_backbone = teacher.forward_image(imgs)
-            # Get both feats and spatial sizes
-            _, t_feats, t_pos, t_sizes = teacher._prepare_backbone_features(teacher_backbone)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                t_bb = teacher.forward_image(imgs_t)
+                _, t_feats, _, t_sizes = teacher._prepare_backbone_features(t_bb)
 
-            # Rebuild the same feats list the student uses
-            feats_t = [
-                feat.permute(1, 2, 0).view(batch_size, -1, *size)
-                for feat, size in zip(t_feats[::-1], t_sizes[::-1])
-            ][::-1]
-            teacher_embed       = feats_t[-1]
-            teacher_hires_feats = feats_t[:-1]
+                t_list = [
+                    feat.permute(1, 2, 0).reshape(B, -1, *sz)
+                    for feat, sz in zip(t_feats[::-1], t_sizes[::-1])
+                ][::-1]
+                t_embed = t_list[-1]
 
-            # Encode the exact same (mixed) prompts for teacher
-            teacher_sparse_embs, teacher_dense_embs, _ = _encode_mixed_prompts(
-                teacher.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs, device
-            )
-            # Resize dense prompts to match teacher_embed's HxW
-            teacher_dense_embs = F.interpolate(teacher_dense_embs, size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
+                t_sparse, t_dense, _ = _encode_mixed_prompts(
+                    teacher.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs_t, device
+                )
+                t_dense = F.interpolate(t_dense, size=t_embed.shape[-2:], mode="bilinear", align_corners=False)
 
-            # Get & resize the image positional encoding
-            teacher_image_pe = F.interpolate(teacher.sam_prompt_encoder.get_dense_pe(), size=teacher_embed.shape[-2:], mode='bilinear', align_corners=False)
+                t_pe = pe_teacher if pe_teacher is not None else teacher.sam_prompt_encoder.get_dense_pe()
+                if t_pe.shape[-2:] != t_embed.shape[-2:]:
+                    t_pe = F.interpolate(t_pe, size=t_embed.shape[-2:], mode="bilinear", align_corners=False)
+                t_pe = t_pe.to(t_embed.dtype)
 
-            # Forward through exactly the same mask‐decoder call
-            teacher_logits, _, *_ = teacher.sam_mask_decoder(
-                image_embeddings=teacher_embed,
-                image_pe=teacher_image_pe,
-                sparse_prompt_embeddings=teacher_sparse_embs,
-                dense_prompt_embeddings=teacher_dense_embs,
-                multimask_output=False,
-                repeat_image=False,
-                high_res_features=teacher_hires_feats
-            )
-            teacher_pred = F.interpolate(teacher_logits, size=(out_size, out_size), mode='bilinear', align_corners=False) # [B*T,1,H,W]
+                t_logits, *_ = teacher.sam_mask_decoder(
+                    image_embeddings=t_embed,
+                    image_pe=t_pe,
+                    sparse_prompt_embeddings=t_sparse,
+                    dense_prompt_embeddings=t_dense,
+                    multimask_output=False,
+                    repeat_image=False,
+                    high_res_features=t_list[:-1],
+                )
+                t_logits = t_logits.clamp(-logit_clip, logit_clip)
+                t_up = F.interpolate(t_logits, size=(out_size, out_size), mode="bilinear", align_corners=False)
 
-        # 8) Compute losses
-        # a) Segmentation loss (BCE)
-        mask_target = masks.to(student_pred.dtype).clone()
-        if mask_target.dim() == student_pred.dim() + 1:
-          mask_target = mask_target.squeeze(2) # [B*T,1,1,H,W] -> [B*T,1,W,H]
-        pw = torch.tensor(pos_weight, device=device, dtype=student_pred.dtype)
-        seg_loss = F.binary_cross_entropy_with_logits(student_pred, mask_target, pos_weight=pw)
+        with torch.amp.autocast("cuda", enabled=False):
+            tp = torch.sigmoid(t_up.float() / tau).clamp(1e-4, 1.0 - 1e-4)
+            dis = F.binary_cross_entropy_with_logits(stud_up.float(), tp, reduction="mean")
 
-        # b) Distillation loss (KL-divergence)
-        with torch.no_grad():
-            teacher_target = torch.sigmoid(teacher_pred) # [B*T,1,H,W] in [0,1]
-        dis_loss = F.binary_cross_entropy_with_logits(student_pred, teacher_target, reduction='mean')
-        
-        # c) Total loss (weighted sum of both losses)
-        loss = alpha * seg_loss + (1-alpha) * dis_loss
+        loss = seg_loss + lam * dis
+    else:
+        loss = seg_loss
+    loss_value = safe_float(loss)
 
-    # 9) Memory encode and update (IoU-gated + Top-K by dissimilarity)
-    new_feats, new_pos = student._encode_new_memory(
-        current_vision_feats=vision_feats,
-        feat_sizes=feat_sizes,
-        pred_masks_high_res=F.interpolate(
-            student_logits,
-            size=(config.model.image_size, config.model.image_size),
-            mode='bilinear',
-            align_corners=False
-        ).to(torch.float32),
-        object_score_logits=student_object_score_logits,
-        is_mask_from_pts=(student_sparse_embs is not None)
-    )
-    new_feats = new_feats.to(torch.bfloat16).to(device)
-    new_pos   = new_pos[0].to(torch.bfloat16).to(device)
+    if not torch.isfinite(loss.detach()).all():
+        optimizer.zero_grad(set_to_none=True)
+        return {
+            "ok": False,
+            "skip_reason": "nonfinite_2d_loss",
+            "loss": loss_value,
+        }
 
-    # Helper to prune to Top-K by total dissimilarity
-    def _prune_topk_dissim(bank_entries, cap):
-        """
-        bank_entries: list of entries where entry[3] is a flat image embedding vector (1D tensor)
-        cap: maximum size to keep
-        """
-        if not bank_entries:
-            return bank_entries
+    loss.backward()
 
-        # Stack embedding vectors -> [N, D]
-        vecs = torch.stack([e[3] for e in bank_entries], dim=0)
-        vecs = vecs.to(device)
-        vecs = F.normalize(vecs, p=2, dim=1)
+    try:
+        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+    except RuntimeError as e:
+        bad = []
+        max_items = 50
+        for name, p in student.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            if g.numel() == 0:
+                continue
+            if not torch.isfinite(g).all():
+                finite = g[torch.isfinite(g)]
+                bad.append({
+                    "name": name,
+                    "shape": tuple(g.shape),
+                    "grad_absmax_finite": float(finite.abs().max().item()) if finite.numel() else None,
+                    "grad_min_finite": float(finite.min().item()) if finite.numel() else None,
+                    "grad_max_finite": float(finite.max().item()) if finite.numel() else None,
+                })
+                if len(bad) >= max_items:
+                    break
 
-        # Cosine similarity matrix [N, N]
-        sim = vecs @ vecs.t()
-        # Dissimilarity = 1 - sim, zero out diagonal
-        dis = 1.0 - sim
-        dis.fill_diagonal_(0.0)
-        # Total dissimilarity per entry
-        total_dis = dis.sum(dim=1)  # [N]
+        optimizer.zero_grad(set_to_none=True)
 
-        Kkeep = min(cap, len(bank_entries))
-        # Indices of Top-K by total dissimilarity
-        topk_idx = torch.topk(total_dis, k=Kkeep, largest=True).indices.tolist()
-        # Keep order stable: sort indices ascending
-        topk_idx.sort()
-        return [bank_entries[i] for i in topk_idx]
+        return {
+            "ok": False,
+            "skip_reason": "nonfinite_2d_grad_norm",
+            "loss": loss_value,
+            "exception": repr(e),
+            "bad_grad_params": bad,
+        }
 
-    # Build candidate entries (only if above IoU threshold) and prune globally
-    candidates_changed = False
-    for i in range(batch_size):
-        conf_i = float(student_iou[i, 0].item()) if student_iou.ndim >= 2 else float(student_iou[i].item())
-        if conf_i < c_thresh:
-            continue  # Gate by confidence
+    optimizer.step()
 
-        entry = [
-            new_feats[i:i+1].detach(),          # 0: Features   [1,C,H,W]
-            new_pos[i:i+1].detach(),            # 1: Pos embeds [1,C,H,W]
-            conf_i,                             # 2: IoU scalar
-            image_embed[i].reshape(-1).detach() # 3: Flat image embedding vector
-        ]
-
-        # Add the new entry to the candidate set
-        memory_bank.append(entry)
-        candidates_changed = True
-
-    # If memory bank changed, prune to Top-K by dissimilarity
-    if candidates_changed:
-        memory_bank[:] = _prune_topk_dissim(memory_bank, capacity)
-
-    # 10) Backward and step
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-
-    return loss.item()
+    return {
+        "ok": True,
+        "loss": float(loss.detach().item()),
+    }
 
 def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, device):
     """
@@ -337,16 +307,39 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
 
     # Gather helpers
     def _gather_points(idxs):
+        """Gather and pad point prompts."""
         if not idxs: return None
-        pts = torch.stack([pts_all[i].to(device).to(torch.float32) for i in idxs], dim=0)  # [k, n, 2]
-        lbs = torch.stack([lbs_all[i].to(device).to(torch.long)    for i in idxs], dim=0)  # [k, n]
+        # Variable num clicks -> pad to Nmax with label -1
+        Ns = [int(pts_all[i].shape[0]) for i in idxs]
+        Nmax = max(Ns)  # >=1 because has_p checked above
+        pts_pad, lbs_pad = [], []
+        for i, n in zip(idxs, Ns):
+            p = pts_all[i].to(device).to(torch.float32)
+            if p.ndim == 1:
+                p = p.reshape(-1, 2)
+            l = lbs_all[i].to(device).to(torch.long).reshape(-1)
+            if n < Nmax:
+                pp = torch.zeros((Nmax, 2), device=device, dtype=torch.float32)
+                ll = torch.full((Nmax,), -1, device=device, dtype=torch.long)
+                if n > 0:
+                    pp[:n] = p[:n]
+                    ll[:n] = l[:n]
+                pts_pad.append(pp)
+                lbs_pad.append(ll)
+            else:
+                pts_pad.append(p[:Nmax])
+                lbs_pad.append(l[:Nmax])
+        pts = torch.stack(pts_pad, dim=0)  # [k, Nmax, 2]
+        lbs = torch.stack(lbs_pad, dim=0)  # [k, Nmax]
         return (pts, lbs)
 
     def _gather_boxes(idxs):
+        """Gather box prompts."""
         if not idxs: return None
-        return torch.stack([box_all[i].to(device).to(torch.int64).view(4) for i in idxs], dim=0)  # [k,4]
+        return torch.stack([box_all[i].to(device).to(torch.int64).reshape(4) for i in idxs], dim=0)  # [k,4]
 
     def _gather_masks(idxs):
+        """Gather mask prompts."""
         if not idxs: return None
         return torch.stack([msk_all[i].to(device).to(torch.float32) for i in idxs], dim=0)       # [k,1,H,W]
 
@@ -418,127 +411,158 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
     image_pe = None  # Caller pulls prompter.get_dense_pe()
     return sparse_full, dense_full, image_pe
 
-def validate_step_2d(student, batch, config, return_logits=False):
+@torch.inference_mode()
+def validate_step_2d(
+    predictor,
+    video_tchw: torch.Tensor,
+    gt_thw: torch.Tensor,
+    *,
+    prompt_cache: dict,
+    prompt_mode: str,
+    normalize_coords: bool,
+):
     """
-    Single validation step for 2D data.
+    Validate a single 2D sequence using cached prompts.
 
     Args:
-        student (SAM2VideoPredictor): The student model.
-        batch (dict): Batch dict with keys 'image', 'mask', 'pt_list', 'p_label', 'bbox', 'm_prompt' (optional).
-        config (DictConfig): Config with .training.device and .training.out_size.
-        return_logits (bool): Whether to return the predicted logits. Default is False.
+        predictor (SAM2VideoPredictor): Predictor in evaluation mode.
+        video_tchw (torch.Tensor): Sequence tensor with shape ``[T, C, H, W]``.
+        gt_thw (torch.Tensor): Ground-truth masks with shape ``[T, H, W]``.
+        prompt_cache (dict): Dataset-produced prompt cache.
+        prompt_mode (str): Prompt mode, one of point, box, or mask.
+        normalize_coords (bool): Whether SAM2 should normalize point/box coordinates.
 
     Returns:
-        if return_logits is True:
-            dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
-            torch.Tensor: Predicted logits for the batch as [B,T,H_out,W_out].
-        else:
-            dict: Average metrics {'iou', 'dice', 'hd95'} for the batch.
+        dict | None: Logits and prompt metadata, or None if no prompt is available.
     """
-    device   = config.training.device
-    out_size = int(config.training.out_size)
+    device = predictor.device
+    use_amp = (device.type == "cuda")
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.no_grad()
 
-    # 1) Unpack all frames & flatten batch/time
-    B, T, C, H, W = batch['image'].shape
-    imgs   = batch['image'].view(B * T, C, H, W).to(device)    # [B*T, C, H, W]
-    masks  = batch['mask'].view(  B * T, 1, H, W).to(device)   # [B*T, 1, H, W]
-    N      = B * T
+    if prompt_cache is None:
+        return None
 
-    # 2) Build per-image prompts (points / boxes / masks / none) in B*T order
-    raw_pt_list  = batch['pt_list']                 # List[T] of length-B lists
-    raw_lbl_list = batch['p_label']                 # List[T] of length-B lists
-    raw_box_list = batch.get('bbox', None)          # List[T] of length-B lists (optional but expected)
-    raw_m_prompt = batch.get('m_prompt', None)      # List[T] of length-B lists (optional)
-
-    pts_all, lbs_all, box_all, msk_all = [], [], [], []
-    for t in range(T):
-        for b in range(B):
-            # Points / labels
-            pts = raw_pt_list[t][b]  if isinstance(raw_pt_list[t],  list) else raw_pt_list[t][b]
-            lbs = raw_lbl_list[t][b] if isinstance(raw_lbl_list[t], list) else raw_lbl_list[t][b]
-            # Bounding box
-            if raw_box_list is not None:
-                bx = raw_box_list[t][b] if isinstance(raw_box_list[t], list) else raw_box_list[t][b]
-            else:
-                bx = None
-            # Mask-prompt
-            if raw_m_prompt is not None:
-                mp = raw_m_prompt[t][b] if isinstance(raw_m_prompt[t], list) else raw_m_prompt[t][b]
-            else:
-                mp = None
-
-            pts_all.append(pts)
-            lbs_all.append(lbs)
-            box_all.append(bx)
-            msk_all.append(mp)
-
-    # 3) Encode mixed prompts per image
-    with torch.inference_mode():
-        sparse_embs, dense_embs, _ = _encode_mixed_prompts(
-            student.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs, device
-        )
-        image_pe = student.sam_prompt_encoder.get_dense_pe()
-
-        # 4) Forward backbone and prep features (no memory bank for val)
-        backbone_out = student.forward_image(imgs)
-        _, vision_feats, vision_pos, _ = student._prepare_backbone_features(backbone_out)
-
-        # Keep shapes identical to training path (no-op placeholders for memory)
-        vision_feats[-1] = vision_feats[-1] + torch.zeros_like(vision_feats[-1])
-        vision_pos[-1]   = vision_pos[-1]   + torch.zeros_like(vision_pos[-1])
-
-        # Rebuild pyramid to match decoder expectations
-        feat_sizes = config.decoder.feat_sizes
-        feats = [
-            feat.permute(1, 2, 0).view(N, -1, *sz)
-            for feat, sz in zip(vision_feats[::-1], feat_sizes[::-1])
-        ][::-1]
-        image_embed = feats[-1]
-        hires_feats = feats[:-1]
-
-        # Align dense prompts spatially to the image embedding
-        dense_embs = F.interpolate(dense_embs, size=image_embed.shape[-2:], mode='bilinear', align_corners=False)
-
-        # 5) Decode masks
-        logits, _, *_ = student.sam_mask_decoder(
-            image_embeddings=image_embed,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_embs,
-            dense_prompt_embeddings=dense_embs,
-            multimask_output=False,
-            repeat_image=False,
-            high_res_features=hires_feats
-        )
-
-        # 6) Up-sample logits to output grid and reshape back to [B,T,H_out,W_out]
-        logits_up_flat = F.interpolate(logits, size=(out_size, out_size), mode='bilinear', align_corners=False)  # [B*T,1,H_out,W_out]
-        _, _, Hout, Wout = logits_up_flat.shape
-        logits_up_seq = logits_up_flat.view(B, T, Hout, Wout)  # drop channel
-
-        # 7) Threshold predictions
-        probs_seq = torch.sigmoid(logits_up_seq)               # [B,T,H_out,W_out]
-        preds_seq = (probs_seq > 0.5).long().cpu()             # to CPU for metrics
-
-        # 8) Resize GT masks to the same grid (nearest) and drop channel
-        masks_up_flat = F.interpolate(masks.float(), size=(Hout, Wout), mode='nearest')
-        masks_up_seq  = masks_up_flat.view(B, T, 1, Hout, Wout).cpu()
-        preds_flat = preds_seq.view(N, Hout, Wout)
-        masks_flat = masks_up_seq.view(N, Hout, Wout).long()
-
-    # 9) Metrics per image, averaged over B*T
-    iou_list, dice_list, hd95_list = [], [], []
-    for i in range(N):
-        iou_list.append( compute_iou(  preds_flat[i], masks_flat[i]) )
-        dice_list.append(compute_dice(preds_flat[i], masks_flat[i]) )
-        hd95_list.append(compute_hd95(preds_flat[i], masks_flat[i]) )
-
-    metrics = {
-        'iou':  sum(iou_list)  / max(1, N),
-        'dice': sum(dice_list) / max(1, N),
-        'hd95': sum(hd95_list) / max(1, N),
-    }
-
-    if return_logits:
-        return metrics, logits_up_seq.cpu()  # [B,T,H_out,W_out]
+    mode_key = str(prompt_mode).strip().lower()
+    if mode_key in ("click", "clicks", "point", "points"):
+        mode_key = "point"
+    elif mode_key in ("box", "bbox", "boxes"):
+        mode_key = "box"
+    elif mode_key in ("mask", "masks"):
+        mode_key = "mask"
     else:
-        return metrics
+        raise ValueError(f"Unsupported prompt_mode={prompt_mode}")
+
+    mode_payload = prompt_cache.get(mode_key, None)
+    if mode_payload is None:
+        return None
+
+    chosen = [int(x) for x in prompt_cache.get("chosen_frames", [])]
+    forced_first = bool(prompt_cache.get("forced_first", False))
+    T = int(video_tchw.shape[0])
+
+    state = predictor.init_state_from_tensor(
+        imgs_tensor=video_tchw,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        mode="eval",
+    )
+
+    pk_counts = {"point": 0, "box": 0, "mask": 0}
+    prompts_added = 0
+
+    pt_list = mode_payload.get("pt_list", [])
+    p_label = mode_payload.get("p_label", [])
+    bbox = mode_payload.get("bbox", [])
+    m_prompt = mode_payload.get("m_prompt", [])
+
+    for t in chosen:
+        if t < 0 or t >= T:
+            continue
+
+        if mode_key == "point":
+            pts = pt_list[t] if t < len(pt_list) else None
+            lbs = p_label[t] if t < len(p_label) else None
+            if pts is None or lbs is None or pts.numel() == 0 or lbs.numel() == 0:
+                continue
+
+            pts_f = pts.to(device=device, dtype=torch.float32).unsqueeze(0)
+            lbs_i = lbs.to(device=device, dtype=torch.int32).unsqueeze(0)
+
+            with amp_ctx:
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    points=pts_f,
+                    labels=lbs_i,
+                    box=None,
+                    clear_old_points=False,
+                    normalize_coords=bool(normalize_coords),
+                )
+            pk_counts["point"] += int(pts.shape[0])
+            prompts_added += 1
+
+        elif mode_key == "box":
+            bb = bbox[t] if t < len(bbox) else None
+            if bb is None or (hasattr(bb, "numel") and bb.numel() == 0):
+                continue
+
+            if bb.ndim == 2:
+                bb = bb[0]
+            bb = bb.to(device=device, dtype=torch.float32)
+
+            empty_points = torch.empty((1, 0, 2), dtype=torch.float32, device=device)
+            empty_labels = torch.empty((1, 0), dtype=torch.int32, device=device)
+
+            with amp_ctx:
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    points=empty_points,
+                    labels=empty_labels,
+                    box=bb,
+                    clear_old_points=True,
+                    normalize_coords=bool(normalize_coords),
+                )
+            pk_counts["box"] += 1
+            prompts_added += 1
+
+        else:  # mask
+            mm = m_prompt[t] if t < len(m_prompt) else None
+            if mm is None or (hasattr(mm, "numel") and mm.numel() == 0):
+                continue
+
+            if mm.ndim == 3 and mm.shape[0] == 1:
+                mm = mm[0]
+            mm = (mm > 0).to(device=device, dtype=torch.bool)
+
+            with amp_ctx:
+                predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    mask=mm,
+                )
+            pk_counts["mask"] += 1
+            prompts_added += 1
+
+    if prompts_added == 0:
+        return None
+
+    _, _, H, W = video_tchw.shape
+    logits = torch.zeros((T, H, W), device=device, dtype=torch.float32)
+
+    with amp_ctx:
+        for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
+            state, start_frame_idx=0, max_frame_num_to_track=T, reverse=False
+        ):
+            tt = int(frame_idx)
+            logits[tt] = video_res_masks[0, 0].float()
+
+    return {
+        "logits": logits,
+        "chosen_frames": chosen,
+        "forced_first": forced_first,
+        "pk_counts": pk_counts,
+    }

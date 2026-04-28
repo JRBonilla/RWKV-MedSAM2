@@ -15,6 +15,12 @@ from tqdm.auto import tqdm
 config_path = "/RWKV-MedSAM2/ext/sam2/configs/sam2.1/sam2.1_vcr.yaml"
 config = load_config(config_path)
 
+print(f"Using config: {config_path}")
+print(f"Batch size:   {config.training.batch_size}")
+print(f"Val Frac:     {config.training.val_frac}")
+print(f"Seed:         {config.training.seed}")
+print(f"Device:       {config.training.device}")
+
 # Set up logger
 log_cfg = config.logging
 logger = setup_logger(log_cfg)

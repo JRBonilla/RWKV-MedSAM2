@@ -228,12 +228,17 @@ def apply_rotary_enc(
         return xq_out.type_as(xq).to(xq.device), xk
     # repeat freqs along seq_len dim to match k seq_len
     if repeat_freqs_k:
-        r = xk_.shape[-2] // xq_.shape[-2]
+        q_len = xq_.shape[-2]
+        k_len = xk_.shape[-2]
+        r = math.ceil(k_len / q_len)
+
         if freqs_cis.is_cuda:
             freqs_cis = freqs_cis.repeat(*([1] * (freqs_cis.ndim - 2)), r, 1)
         else:
-            # torch.repeat on complex numbers may not be supported on non-CUDA devices
-            # (freqs_cis has 4 dims and we repeat on dim 2) so we use expand + flatten
+            # (keep your existing CPU-safe expand+flatten logic)
             freqs_cis = freqs_cis.unsqueeze(2).expand(-1, -1, r, -1, -1).flatten(2, 3)
+
+        # IMPORTANT: slice down to exactly k_len
+        freqs_cis = freqs_cis[..., :k_len, :]
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq).to(xq.device), xk_out.type_as(xk).to(xk.device)

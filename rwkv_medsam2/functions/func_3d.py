@@ -1,442 +1,508 @@
-# functions/func_3d.py
-# Implements the per-batch 3D training and validation steps for
-# student-teacher distillation in the RWKV-MedSAM2 model.
+# Per-batch 3D-as-sequence training and validation steps for RWKV-MedSAM2.
+#
+# Uses dataset-provided prompts, optional teacher distillation, and SAM2 video
+# propagation over volume slices.
 
+import math
 import torch
 import torch.nn.functional as F
-import random
 
-from .func_metrics import compute_iou, compute_dice, compute_hd95
+from .func_metrics import (
+    tversky_loss_from_logits,
+    binary_focal_loss_with_logits,
+    safe_float,
+)
 
-def train_step_3d(student, teacher, mask_decoder_opt, memory_opt, batch, config, scaler):
+def train_step_3d(student, teacher, optimizer, batch, config, scaler):
     """
-    Single 3D (video) train step with teacher-student distillation
-    using SAM2VideoPredictor's built-in stateful memory bank API.
+    Run one 3D-as-sequence training step with dataset prompts.
 
     Args:
-        student (SAM2VideoPredictor): The student model.
-        teacher (SAM2VideoPredictor): The teacher model.
-        mask_decoder_opt (torch.optim.Optimizer): The optimizer for the mask decoder.
-        memory_opt (torch.optim.Optimizer): The optimizer for the memory encoder.
-        batch (dict): A dictionary containing input tensors and labels, e.g.:
-            'image': Tensor[T, 3, H, W],
-            'mask':  Tensor[T, 1, H, W],
-            'pt_list': list[T] of point-coordinate Tensors or None,
-            'p_label': list[T] of label Tensors or None,
-            'bbox': list[T] of bounding-box Tensors or None
-        config (DictConfig): The configuration dictionary.
-        scaler (torch.cuda.amp.GradScaler): The scaler.
+        student (SAM2VideoPredictor): Student predictor to optimize.
+        teacher (SAM2VideoPredictor | None): Optional teacher predictor.
+        optimizer (torch.optim.Optimizer): Optimizer for the student.
+        batch (dict): Collated 3D sequence batch.
+        config (OmegaConf.DictConfig): Training configuration.
+        scaler (object | None): AMP scaler placeholder; bf16 autocast is used directly.
 
     Returns:
-        tuple:
-            batch_loss (float): Combined loss over all frames.
-            prompt_loss (float): Loss for frames with prompts.
-            non_prompt_loss (Optional[float]): Loss for frames without prompts, or None.
+        dict: Step status, aggregate losses, and skip diagnostics on failure.
     """
-    # 0) Device and config
     device      = config.training.device
-    out_size    = config.training.out_size
-    pos_weight  = config.training.pos_weight
-    alpha       = config.training.alpha
-    max_prompts = config.prompt.max_per_seq
-    image_size  = config.model.image_size
+    out_size    = int(config.training.out_size)
 
-    # 1) Prepare video tensor and mask sequence
-    imgs_seq = batch['image'].to(device) # [B,T,C,H,W]
-    mask_seq = batch['mask'].to(device)  # [B,T,1,H,W]
-    # Remove batch dimension -> [T,C,H,W] and [T,1,H,W]
-    imgs     = imgs_seq.squeeze(0) # [T,C,H,W]
-    mask_seq = mask_seq.squeeze(0) # [T,1,H,W]
+    # Loss weights
+    bce_w    = float(getattr(config.training, "bce_weight", 0.5))
+    dice_w   = float(getattr(config.training, "dice_weight", 1.0))
+    focal_w  = float(getattr(config.training, "focal_weight", 0.0))
+    f_gamma  = float(getattr(config.training, "focal_gamma", 2.0))
+    f_alpha  = float(getattr(config.training, "focal_alpha", -1.0))
 
-    # 2) Initialize state for student and teacher
-    if torch.cuda.get_device_properties(device).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # Distillation heavy
+    lam_base   = float(getattr(config.training, "lambda_distill_3d", 0.0))
+    heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
+    lam        = lam_base * heavy_mult
+    tau        = float(getattr(config.training, "distill_temperature", 1.0))
+
+    # Clip controls
+    posw_max   = float(getattr(config.training, "pos_weight_max", 8.0))
+    logit_clip = float(getattr(config.training, "logit_clip", 12.0))
+    frame_clip = float(getattr(config.training, "frame_loss_clip", 5.0))
+
+    # Nonprompt scaling: fixed, single config value (no override)
+    nonprompt_sf = float(getattr(config.training, "nonprompt_scale", 1.0))
+
+    imgs_seq  = batch["image"]  # [B,T,C,H,W]
+    masks_seq = batch["mask"]   # [B,T,1,H,W]
+    B, T, C, H, W = imgs_seq.shape
+
+    raw_pt  = batch["pt_list"]
+    raw_lb  = batch["p_label"]
+    raw_box = batch["bbox"]
+    raw_mpr = batch.get("m_prompt", None)
+
     student.train()
-    if mask_decoder_opt: mask_decoder_opt.zero_grad()
-    if memory_opt: memory_opt.zero_grad()
-    train_state = student.init_state_from_tensor(imgs_tensor=imgs, mode="train")
-    train_state['storage_device'] = torch.device(device) # Ensure storage is on GPU
+    if teacher is not None:
+        teacher.eval()
+    optimizer.zero_grad(set_to_none=True)
 
-    teacher.eval()
-    with torch.no_grad():
-        teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs, mode="eval")
-        teacher_state['storage_device'] = torch.device(device)
+    def _zero_like_param():
+        """Return a graph-connected zero scalar."""
+        try:
+            return next(student.parameters()).sum() * 0.0
+        except StopIteration:
+            return imgs_seq.sum() * 0.0
 
-    # 3) Inject prompts into student and teacher
-    # Get number of frames
-    T = imgs.shape[0]
-
-    # Helper function to check if a frame has any prompts
-    def _has_any_prompt(i):
-        pts = batch['pt_list'][i]
-        bx  = batch['bbox'][i]
-        mp  = batch.get('m_prompt', None)
-        has_pts = pts is not None and hasattr(pts, 'numel') and pts.numel() > 0
-        has_box = bx  is not None and hasattr(bx,  'numel') and bx.numel() == 4
-        has_msk = (mp is not None) and ((mp[i].numel() > 0) if isinstance(mp, list) else mp.numel() > 0)
+    def _has_any_prompt(i, b):
+        """Return whether a frame has any prompt."""
+        pts = raw_pt[i][b]
+        bx  = raw_box[i][b]
+        mp  = (raw_mpr[i][b] if raw_mpr is not None else None)
+        has_pts = (pts is not None and hasattr(pts, "numel") and pts.numel() > 0)
+        has_box = (bx  is not None and hasattr(bx,  "numel") and bx.numel() == 4)
+        has_msk = (mp  is not None and hasattr(mp,  "numel") and mp.numel() > 0)
         return has_pts or has_box or has_msk
 
-    # List of promptable frames
-    promptable = [i for i in range(T) if _has_any_prompt(i)]
+    seq_losses = []
+    seq_prompt_bucket = []
+    seq_np_bucket = []
+    seq_np_base = []
 
-    prompt_idxs = []
-    # Include first if promptable; otherwise can just force it below
-    if 0 in promptable:
-        prompt_idxs.append(0)
+    for b in range(B):
+        imgs = imgs_seq[b].to(device=device, non_blocking=True)   # [T,C,H,W]
+        gts  = masks_seq[b].to(device=device, non_blocking=True)  # [T,1,H,W]
 
-    # Add one more random promptable (distinct from first) if available
-    others = [i for i in promptable if i != 0]
-    if others and len(prompt_idxs) < config.prompt.max_per_seq:
-        prompt_idxs.append(random.choice(others))
+        if imgs.shape[1] == 1:
+            imgs = imgs.repeat(1, 3, 1, 1)
 
-    # If no real prompts, force a GT-mask prompt on frame with most foreground
-    forced_prompt = None
-    if not prompt_idxs:
-        fg_counts = mask_seq.reshape(T, -1).sum(dim=1)
-        forced_prompt = int(torch.argmax(fg_counts).item())
-        prompt_idxs = [forced_prompt]
+        # Init states
+        train_state = student.init_state_from_tensor(imgs_tensor=imgs.contiguous(), mode="train")
+        train_state["storage_device"] = torch.device(device)
 
-    # Inject prompts (or forced GT prompt)
-    for frame_idx in prompt_idxs:
-        # Force GT prompt if available
-        if forced_prompt is not None and frame_idx == forced_prompt and not _has_any_prompt(frame_idx):
-            gt2d = mask_seq[frame_idx].detach().to(device).squeeze()
-            if gt2d.dim() != 2:
-                H, W = imgs.shape[-2], imgs.shape[-1]
-                gt2d = gt2d.reshape(H, W)
-            gt2d = gt2d.bool()
-            student.train_add_new_mask(train_state, frame_idx, 0, gt2d)
+        teacher_state = None
+        if teacher is not None and lam > 0.0:
             with torch.no_grad():
-                teacher.add_new_mask(teacher_state, frame_idx, 0, gt2d)
+                teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs.contiguous(), mode="eval")
+                teacher_state["storage_device"] = torch.device(device)
+
+        # Base prompt frames from dataset ONLY
+        prompt_idxs = [i for i in range(T) if _has_any_prompt(i, b)]
+        prompt_idxs = sorted(set(prompt_idxs))
+
+        if not prompt_idxs:
+            z = _zero_like_param()
+            seq_losses.append(z)
+            seq_prompt_bucket.append(z)
+            seq_np_bucket.append(None)
+            seq_np_base.append(None)
             continue
 
-        # Add prompt
-        points = batch['pt_list'][frame_idx]
-        labels = batch['p_label'][frame_idx]
-        bbox   = batch['bbox'][frame_idx]
-        mpr    = batch.get('m_prompt', None)
-        mpr    = (mpr[frame_idx] if mpr is not None else None)
+        # ---- Inject prompts (dataset prompts only) ----
+        for t in prompt_idxs:
+            pts = raw_pt[t][b]
+            lbs = raw_lb[t][b]
+            bx  = raw_box[t][b]
+            mp  = (raw_mpr[t][b] if raw_mpr is not None else None)
 
-        # Check if this frame has any prompts
-        has_points = points is not None and hasattr(points, 'numel') and points.numel() > 0
-        has_bbox   = bbox   is not None and hasattr(bbox,   'numel') and bbox.numel() == 4
-        has_mask   = mpr    is not None and hasattr(mpr,    'numel') and mpr.numel() > 0
+            has_pts = (pts is not None and hasattr(pts, "numel") and pts.numel() > 0)
+            has_box = (bx  is not None and hasattr(bx,  "numel") and bx.numel() == 4)
+            has_msk = (mp  is not None and hasattr(mp,  "numel") and mp.numel() > 0)
 
-        if has_points:
-            student.train_add_new_points_or_box(train_state, frame_idx, 0,
-                                                points=points.to(device).float(),
-                                                labels=labels.to(device).long(),
-                                                clear_old_points=False)
+            if has_pts:
+                p = pts.to(device).float()
+                l = lbs.to(device).long()
+                student.train_add_new_points_or_box(train_state, t, 0, points=p, labels=l, clear_old_points=False)
+                if teacher_state is not None:
+                    with torch.no_grad():
+                        teacher.add_new_points_or_box(teacher_state, t, 0, points=p, labels=l, clear_old_points=False)
+
+            elif has_box:
+                bb = bx.to(device).to(torch.int64).reshape(4)
+                ep = torch.empty((1, 0, 2), device=device, dtype=torch.float32)
+                el = torch.empty((1, 0),    device=device, dtype=torch.int64)
+                student.train_add_new_points_or_box(train_state, t, 0, points=ep, labels=el, box=bb, clear_old_points=True)
+                if teacher_state is not None:
+                    with torch.no_grad():
+                        teacher.add_new_points_or_box(teacher_state, t, 0, points=ep, labels=el, box=bb, clear_old_points=True)
+
+            elif has_msk:
+                mm = mp.to(device).float()
+                mm = F.interpolate(mm.unsqueeze(0), size=(H, W), mode="nearest").squeeze(0).squeeze(0).bool()
+                student.train_add_new_mask(train_state, t, 0, mm)
+                if teacher_state is not None:
+                    with torch.no_grad():
+                        teacher.add_new_mask(teacher_state, t, 0, mm)
+
+        # ---- Propagate ----
+        s_preds = {}
+        start = min(prompt_idxs)
+
+        for ti, _, mlog in student.train_propagate_in_video(train_state, start_frame_idx=start):
+            s_preds[ti] = mlog[0]
+
+        t_preds = {}
+        if teacher_state is not None:
             with torch.no_grad():
-                teacher.add_new_points_or_box(teacher_state, frame_idx, 0,
-                                            points=points.to(device).float(),
-                                            labels=labels.to(device).long(),
-                                            clear_old_points=False)
-        elif has_bbox:
-            bbox_t = bbox.to(device).to(torch.int64).reshape(4)
-            empty_pts = torch.empty((1, 0, 2), device=device, dtype=torch.float32)
-            empty_lbl = torch.empty((1, 0),    device=device, dtype=torch.int64)
-            student.train_add_new_points_or_box(train_state, frame_idx, 0,
-                                                points=empty_pts, labels=empty_lbl,
-                                                box=bbox_t, clear_old_points=True)
-            with torch.no_grad():
-                teacher.add_new_points_or_box(teacher_state, frame_idx, 0,
-                                              points=empty_pts, labels=empty_lbl,
-                                              box=bbox_t, clear_old_points=True)
-        elif has_mask:
-            mask_2d = mpr.detach()
-            if mask_2d.dim() == 4: mask_2d = mask_2d.squeeze(0).squeeze(0)
-            elif mask_2d.dim() == 3: mask_2d = mask_2d.squeeze(0)
-            mask_t = mask_2d.to(device).to(torch.bool)
-            student.train_add_new_mask(train_state, frame_idx, 0, mask_t)
-            with torch.no_grad():
-                teacher.add_new_mask(teacher_state, frame_idx, 0, mask_t)
+                for ti, _, mlog in teacher.propagate_in_video(teacher_state, start_frame_idx=start):
+                    t_preds[ti] = mlog[0]
 
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        # 5) Propagate through video
-        student_preds = {}
-        for frame_idx, obj_ids, mask_logits in student.train_propagate_in_video(train_state, start_frame_idx=0):
-            # Mask logits: [num_objs, Hf, Wf]
-            student_preds[frame_idx] = mask_logits[0].unsqueeze(0)
+        frames = sorted(s_preds.keys())
+        if len(frames) == 0:
+            z = _zero_like_param()
+            seq_losses.append(z)
+            seq_prompt_bucket.append(z)
+            seq_np_bucket.append(None)
+            seq_np_base.append(None)
+            continue
 
-        teacher_preds = {}
-        with torch.no_grad():
-            for frame_idx, obj_ids, mask_logits in teacher.propagate_in_video(teacher_state, start_frame_idx=0):
-                # Mask logits: [num_objs, Hf, Wf]
-                teacher_preds[frame_idx] = mask_logits[0].unsqueeze(0)
+        prompt_set = set(prompt_idxs)
+        p_losses = []
+        np_losses = []
 
-        # 6) Compute loss
-        p_seg_losses, p_dis_losses   = [], [] # Losses for frames with prompts
-        np_seg_losses, np_dis_losses = [], [] # Losses for frames without prompts
-        for frame_idx in range(T):
-            student_logit = student_preds[frame_idx]            # [1,Hf,Wf]
-            teacher_logit = teacher_preds[frame_idx]            # [1,Hf,Wf]
+        base_zero = _zero_like_param()
 
-            # Resize to out_size
-            student_pred = F.interpolate(student_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
-            teacher_pred = F.interpolate(teacher_logit, size=(out_size, out_size), mode='bilinear', align_corners=False) # [1,1,out_size,out_size]
-
-            gt_mask = mask_seq[frame_idx].float().unsqueeze(0)  # [1,1,H,W]
-
-            with torch.no_grad():
-                teacher_target = torch.sigmoid(teacher_pred)    # [!,1,H,W] in [0,1]
-
-            frame_seg_loss = F.binary_cross_entropy_with_logits(student_pred, gt_mask, pos_weight=torch.tensor(pos_weight, device=device))
-            frame_dis_loss = F.binary_cross_entropy_with_logits(student_pred, teacher_target, reduction='mean')
-
-            if frame_idx in prompt_idxs:
-                p_seg_losses.append(frame_seg_loss)
-                p_dis_losses.append(frame_dis_loss)
+        for ti in frames:
+            slog = s_preds[ti]
+            if slog.dim() == 2:
+                slog = slog.unsqueeze(0).unsqueeze(0)
+            elif slog.dim() == 3:
+                slog = slog.unsqueeze(0)
+            elif slog.dim() == 4:
+                pass
             else:
-                np_seg_losses.append(frame_seg_loss)
-                np_dis_losses.append(frame_dis_loss)
+                continue
 
-        # 7) Combine and normalize each loss bucket
-        avg_p_seg_loss = torch.stack(p_seg_losses).mean()
-        avg_p_dis_loss = torch.stack(p_dis_losses).mean()
-        prompt_loss    = alpha * avg_p_seg_loss + (1-alpha) * avg_p_dis_loss
-        if len(np_seg_losses) > 0:
-            avg_np_seg_loss = torch.stack(np_seg_losses).mean()
-            avg_np_dis_loss = torch.stack(np_dis_losses).mean()
-            non_prompt_loss = alpha * avg_np_seg_loss + (1-alpha) * avg_np_dis_loss
-        else:
-            non_prompt_loss = None
+            slog = slog.clamp(-logit_clip, logit_clip)
 
-    # 8) Compute overall combined batch_loss (all frames)
-    all_seg_losses = p_seg_losses + np_seg_losses
-    all_dis_losses = p_dis_losses + np_dis_losses
-    avg_b_seg_loss = torch.stack(all_seg_losses).mean()
-    avg_b_dis_loss = torch.stack(all_dis_losses).mean()
-    batch_loss     = alpha * avg_b_seg_loss + (1-alpha) * avg_b_dis_loss
+            gt = gts[ti].float().unsqueeze(0)
 
-    # 9) Backpropagation and optimizer updates
-    # a) Non-prompt -> memory modules
-    do_np = (non_prompt_loss is not None) and getattr(non_prompt_loss, "requires_grad", False)
-    do_p  = getattr(prompt_loss, "requires_grad", False)
+            stud_up = F.interpolate(slog, size=(out_size, out_size), mode="bilinear", align_corners=False)
+            gt_up   = F.interpolate(gt,   size=(out_size, out_size), mode="nearest")
 
-    # Scale loss according to available gradients
-    if do_np and do_p:
-        # Two passes over the same graph
-        scaler.scale(non_prompt_loss).backward(retain_graph=True)
-        scaler.scale(prompt_loss).backward()
-    elif do_np and not do_p:
-        # Only non-prompt carries grad in this batch
-        scaler.scale(non_prompt_loss).backward()
-    elif not do_np and do_p:
-        # Only prompt carries grad in this batch
-        scaler.scale(prompt_loss).backward()
-    else:
-        # Fallback: neither per-bucket loss has grad (edge case) — use combined loss
-        scaler.scale(batch_loss).backward()
+            with torch.amp.autocast("cuda", enabled=False):
+                sp = stud_up.float()
+                gm = gt_up.float()
 
-    # b) Update optimizers
-    if memory_opt is not None and do_np:
-        scaler.step(memory_opt)
-    if mask_decoder_opt is not None and (do_p or not do_np):
-        scaler.step(mask_decoder_opt)
-    scaler.update()
+                pos = gm.flatten(1).sum(1)
+                tot = torch.full_like(pos, gm[0].numel(), dtype=gm.dtype)
+                neg = tot - pos
+                dyn_pw = ((neg + 1.0) / (pos + 1.0)).clamp(1.0, posw_max)
 
-    # Return all losses
-    return batch_loss.item(), prompt_loss.item(), non_prompt_loss.item() if non_prompt_loss is not None else None
+                bce_raw = F.binary_cross_entropy_with_logits(sp, gm, reduction="none")
+                pixel_w = 1.0 + (dyn_pw.view(1, 1, 1, 1) - 1.0) * gm
+                bce = (bce_raw * pixel_w).mean()
 
-def validate_step_3d(student, batch, config, return_logits=False):
-    """
-    Single validation step for 3D (video) data.
+                tv  = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
+                foc = binary_focal_loss_with_logits(sp, gm, gamma=f_gamma, alpha=float(f_alpha))
 
-    Args:
-        student (SAM2VideoPredictor): The student model.
-        batch (dict): A batch dict containing:
-            'image':   Tensor[1,T,C,H,W]
-            'mask':    Tensor[1,T,1,H',W']
-            'pt_list': list[T] of Tensor[n,2] or None
-            'p_label': list[T] of Tensor[n] or None
-            'bbox':    list[T] of Tensor[4] or None
-        config (DictConfig): Config with .training.device, .training.out_size, .prompt.max_per_seq
-        return_logits (bool): Whether to return the predicted logits.
+                seg_loss = (bce_w * bce) + (dice_w * tv) + (focal_w * foc)
+                seg_loss = seg_loss.clamp_max(frame_clip)
 
-    Returns:
-        if return_logits:
-            dict: Average metrics {'iou', 'dice', 'hd95'} over all frames.
-            torch.Tensor: Predicted logits for each frame.
-        else:
-            dict: Average metrics {'iou', 'dice', 'hd95'} over all frames.
-    """
-    device      = config.training.device
-    out_size    = config.training.out_size
-    max_prompts = config.prompt.max_per_seq
+            dis_loss = base_zero
+            if teacher_state is not None and (ti in t_preds):
+                tlog = t_preds[ti]
+                if tlog.dim() == 2:
+                    tlog = tlog.unsqueeze(0).unsqueeze(0)
+                elif tlog.dim() == 3:
+                    tlog = tlog.unsqueeze(0)
 
-    # 1) Prepare video frames [T,C,H,W]
-    imgs_seq = batch['image'].to(device) # [1,T,C,H,W]
-    mask_seq = batch['mask'].to(device)  # [1,T,1,H,W]
-    imgs     = imgs_seq.squeeze(0)       # [T,C,H,W]
-    mask_seq = mask_seq.squeeze(0)       # [T,1,H,W]
-    T        = imgs.shape[0]             # T = num_frames
+                tlog = tlog.clamp(-logit_clip, logit_clip)
+                t_up = F.interpolate(tlog, size=(out_size, out_size), mode="bilinear", align_corners=False)
 
-    # 2) Initialize train state and inject prompts
-    student.eval()
-    with torch.inference_mode():
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            eval_state = student.init_state_from_tensor(imgs_tensor=imgs, mode="eval")
-            eval_state['storage_device'] = torch.device(device)
+                with torch.amp.autocast("cuda", enabled=False):
+                    tp = torch.sigmoid(t_up.float() / tau).clamp(1e-4, 1.0 - 1e-4)
+                    dis_loss = F.binary_cross_entropy_with_logits(stud_up.float(), tp, reduction="mean")
+                    dis_loss = dis_loss.clamp_max(frame_clip)
 
-            # Inject prompts once on the first frame (Q1), then propagate to all t>0
-            q1 = 0
-            points = batch['pt_list'][q1]
-            labels = batch['p_label'][q1]
-            bbox   = batch['bbox'][q1]
-            mpr    = batch.get('m_prompt', None)
-            cand   = (mpr[q1] if isinstance(mpr, list) else mpr) if mpr is not None else None
-            mask   = cand if (torch.is_tensor(cand) and cand.numel() > 0) else mask_seq[q1]
+            total_frame = seg_loss + lam * dis_loss
 
-            if points is not None and hasattr(points, "numel") and points.numel() > 0:
-                student.add_new_points_or_box(
-                    inference_state=eval_state,
-                    frame_idx=q1, obj_id=0,
-                    points=points.to(device).float(),
-                    labels=labels.to(device).long(),
-                    clear_old_points=True
-                )
-            elif bbox is not None and hasattr(bbox, "numel") and bbox.numel() == 4:
-                empty_pts = torch.empty((1, 0, 2), device=device, dtype=torch.float32)
-                empty_lbl = torch.empty((1, 0),    device=device, dtype=torch.int64)
-                student.add_new_points_or_box(
-                    inference_state=eval_state,
-                    frame_idx=q1, obj_id=0,
-                    points=empty_pts, labels=empty_lbl,
-                    box=bbox.to(device).to(torch.int64).reshape(4),
-                    clear_old_points=True
-                )
+            if ti in prompt_set:
+                p_losses.append(total_frame)
             else:
-                # Fallback: mask prompt on Q1  -> must be [H, W] bool on CUDA
-                mask_2d = mask.to(device).squeeze()
-                # If no mask prompt, use mask on Q1
-                if mask_2d.numel() == 0:
-                    mask_2d = mask_seq[q1].to(device).squeeze()
-                # Resize if needed
-                if mask_2d.dim() != 2:
-                    H, W = imgs.shape[-2], imgs.shape[-1]
-                    mask_2d = mask_2d.reshape(H, W)
-                student.add_new_mask(eval_state, q1, 0, mask_2d.bool())
+                np_losses.append(total_frame)
 
-            # 3) Propagate using the first frame as the start
-            preds = {}
-            for frame_idx, obj_ids, mask_logits in student.propagate_in_video(eval_state, start_frame_idx=q1):
-                # mask_logits: [num_objs, Hf, Wf]
-                preds[frame_idx] = mask_logits[0].squeeze(0)
+        if len(p_losses) == 0 and len(np_losses) == 0:
+            z = _zero_like_param()
+            seq_losses.append(z)
+            seq_prompt_bucket.append(z)
+            seq_np_bucket.append(None)
+            seq_np_base.append(None)
+            continue
 
-    # 4) Assemble raw logits volume and upsample each frame for visualization
-    raw_logits_vol = torch.stack([preds[t] for t in sorted(preds.keys())], dim=0) # [T, Hf, Wf]
-    logits_up = F.interpolate(
-        raw_logits_vol.unsqueeze(1), # [T,Hf,Wf]
-        size=(out_size, out_size),
-        mode='bilinear', align_corners=False
-    ) # [T,1,H,W]
+        prompt_bucket = torch.stack(p_losses).mean() if len(p_losses) > 0 else base_zero
+        np_bucket_base = torch.stack(np_losses).mean() if len(np_losses) > 0 else None
+        np_bucket_scaled = (np_bucket_base * nonprompt_sf) if np_bucket_base is not None else None
 
-    # 4b) Optional: Aggregate six orientations into a single 3D probability volume only if all dims > 0
-    aggregated_prob = None
-    axis_lengths = batch.get('axis_lengths', None)
-    if axis_lengths is not None and logits_up.shape[0] == 2 * sum(axis_lengths):
-        aggregated_prob = _aggregate_six_orientations(logits_up, axis_lengths) # [D, H, W]
+        total = base_zero
+        if np_bucket_scaled is None:
+            total = prompt_bucket
+        elif len(p_losses) == 0:
+            total = np_bucket_scaled
+        else:
+            total = 0.5 * prompt_bucket + 0.5 * np_bucket_scaled
 
-    # 5) Compute per-frame metrics
-    ious, dices, hd95s = [], [], []
-    for t in range(T):
-        # Compute predicted mask
-        pred_logit = preds[t].unsqueeze(0).unsqueeze(0)  # [1,1,Hf,Wf]
-        pred_prob  = torch.sigmoid(F.interpolate(pred_logit, size=(out_size, out_size), mode='bilinear', align_corners=False))
-        pred_mask = (pred_prob > 0.5).long().squeeze(0).squeeze(0)  # [H,W]
+        seq_losses.append(total)
+        seq_prompt_bucket.append(prompt_bucket)
+        seq_np_bucket.append(np_bucket_scaled)
+        seq_np_base.append(np_bucket_base)
 
-        # Compute ground truth mask
-        gt_mask = mask_seq[t].unsqueeze(0) # [1,1,H,W]
-        gt_up = F.interpolate(gt_mask.float(), size=(out_size, out_size), mode='nearest').long().squeeze(0).squeeze(0)
+    loss = torch.stack([x for x in seq_losses]).mean()
 
-        # Compute metrics
-        ious.append( compute_iou( pred_mask, gt_up))
-        dices.append(compute_dice(pred_mask, gt_up))
-        hd95s.append(compute_hd95(pred_mask, gt_up))
+    prompt_avg_t  = torch.stack([x for x in seq_prompt_bucket]).mean() if len(seq_prompt_bucket) else None
+    np_avg_t      = torch.stack([x for x in [x for x in seq_np_bucket if x is not None]]).mean() if any(x is not None for x in seq_np_bucket) else None
+    np_base_avg_t = torch.stack([x for x in [x for x in seq_np_base   if x is not None]]).mean() if any(x is not None for x in seq_np_base)   else None
 
-    # 6) Compute average metrics
-    metrics = {
-        'iou':  sum(ious)  / T,
-        'dice': sum(dices) / T,
-        'hd95': sum(hd95s) / T,
+    bad = []
+    if not torch.isfinite(loss.detach()).all():
+        bad.append(("loss", safe_float(loss)))
+    if prompt_avg_t is not None and not torch.isfinite(prompt_avg_t.detach()).all():
+        bad.append(("prompt_loss", safe_float(prompt_avg_t)))
+    if np_avg_t is not None and not torch.isfinite(np_avg_t.detach()).all():
+        bad.append(("non_prompt_loss", safe_float(np_avg_t)))
+    if np_base_avg_t is not None and not torch.isfinite(np_base_avg_t.detach()).all():
+        bad.append(("non_prompt_loss_base", safe_float(np_base_avg_t)))
+
+    if bad:
+        optimizer.zero_grad(set_to_none=True)
+        return {
+            "ok": False,
+            "skip_reason": "nonfinite_3d_loss",
+            "loss": safe_float(loss),
+            "prompt_loss": safe_float(prompt_avg_t),
+            "non_prompt_loss": safe_float(np_avg_t),
+            "non_prompt_loss_base": safe_float(np_base_avg_t),
+            "bad_losses": bad,
+        }
+
+    loss.backward()
+
+    try:
+        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+    except RuntimeError as e:
+        bad = []
+        max_items = 50
+        for name, p in student.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            if g.numel() == 0:
+                continue
+            if not torch.isfinite(g).all():
+                finite = g[torch.isfinite(g)]
+                bad.append({
+                    "name": name,
+                    "shape": tuple(g.shape),
+                    "grad_absmax_finite": float(finite.abs().max().item()) if finite.numel() else None,
+                    "grad_min_finite": float(finite.min().item()) if finite.numel() else None,
+                    "grad_max_finite": float(finite.max().item()) if finite.numel() else None,
+                })
+                if len(bad) >= max_items:
+                    break
+
+        optimizer.zero_grad(set_to_none=True)
+
+        return {
+            "ok": False,
+            "skip_reason": "nonfinite_3d_grad_norm",
+            "loss": safe_float(loss),
+            "prompt_loss": safe_float(prompt_avg_t),
+            "non_prompt_loss": safe_float(np_avg_t),
+            "non_prompt_loss_base": safe_float(np_base_avg_t),
+            "exception": repr(e),
+            "bad_grad_params": bad,
+        }
+
+    optimizer.step()
+
+    def _avg_or_none(xs):
+        """Average non-None tensors as a float."""
+        xs = [x for x in xs if x is not None]
+        return float(torch.stack(xs).mean().detach().item()) if xs else None
+
+    prompt_avg = float(torch.stack([x for x in seq_prompt_bucket]).mean().detach().item()) if len(seq_prompt_bucket) else 0.0
+    np_avg     = _avg_or_none(seq_np_bucket)
+    np_base_avg= _avg_or_none(seq_np_base)
+
+    return {
+        "ok": True,
+        "loss": float(loss.detach().item()),
+        "prompt_loss": float(prompt_avg),
+        "non_prompt_loss": np_avg,
+        "non_prompt_loss_base": np_base_avg,
     }
 
-    if return_logits:
-        out = {'metrics': metrics, 'per_frame_logits': logits_up.squeeze(1).cpu()} #[T,H,W]
-        if aggregated_prob is not None:
-            out['aggregated_prob'] = aggregated_prob.detach().cpu() # [D,H,W] sigmoid probs
-        return out
-    return metrics
-
-def _aggregate_six_orientations(pred_seq_logits, axis_lengths):
+@torch.inference_mode()
+def validate_step_3d(
+    predictor,
+    video_tchw: torch.Tensor,
+    gt_thw: torch.Tensor,
+    *,
+    prompt_cache: dict,
+    prompt_mode: str,
+    normalize_coords: bool,
+):
     """
-    Aggregate a sequence of 2D prediction logits, each with size (Hs, Ws), into a 3D volume
-    of size (D, H, W) by averaging 6 orientations.
+    Validate a single 3D volume represented as a sequence of slices.
 
     Args:
-        pred_seq_logits (Tensor): [T, 1, Hs, Ws] sequence of 2D prediction logits.
-        axis_lengths (Tuple[int, int, int]): (D, H, W) size of the output 3D volume.
+        predictor (SAM2VideoPredictor): Predictor in evaluation mode.
+        video_tchw (torch.Tensor): Sequence tensor with shape ``[T, C, H, W]``.
+        gt_thw (torch.Tensor): Ground-truth masks with shape ``[T, H, W]``.
+        prompt_cache (dict): Dataset-produced prompt cache.
+        prompt_mode (str): Prompt mode, one of point, box, or mask.
+        normalize_coords (bool): Whether SAM2 should normalize point/box coordinates.
 
     Returns:
-        vol_prob (Tensor): [D, H, W] 3D volume of aggregated probabilities.
+        dict | None: Logits and prompt metadata, or None if no prompt is available.
     """
-    D, H, W = map(int, (axis_lengths.detach().cpu().reshape(-1).tolist() if torch.is_tensor(axis_lengths) else axis_lengths))
-    T, _, Hs, Ws = pred_seq_logits.shape
-    assert T == 2*(D + H + W), "Sequence length does not match 6-orientation layout"
+    device = predictor.device
+    use_amp = (device.type == "cuda")
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.no_grad()
 
-    probs     = torch.sigmoid(pred_seq_logits.squeeze(1)) # [T, Hs, Ws]
-    device    = probs.device
-    vol_sum   = torch.zeros((D,H,W), device=device, dtype=probs.dtype)
-    vol_count = torch.zeros((D,H,W), device=device, dtype=probs.dtype)
+    if prompt_cache is None:
+        return None
 
-    idx = 0
+    mode_key = str(prompt_mode).strip().lower()
+    if mode_key in ("click", "clicks", "point", "points"):
+        mode_key = "point"
+    elif mode_key in ("box", "bbox", "boxes"):
+        mode_key = "box"
+    elif mode_key in ("mask", "masks"):
+        mode_key = "mask"
+    else:
+        raise ValueError(f"Unsupported prompt_mode={prompt_mode}")
 
-    # Axial forward: z planes of shape (H, W)
-    for z in range(D):
-        p = F.interpolate(probs[idx+z].unsqueeze(0).unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[z, :, :] += p
-        vol_count[z, :, :] += 1
-    idx += D
+    mode_payload = prompt_cache.get(mode_key, None)
+    if mode_payload is None:
+        return None
 
-    # Axial reverse
-    for zi in range(D):
-        z = D - 1 - zi
-        p = F.interpolate(probs[idx+zi].unsqueeze(0).unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[z, :, :] += p
-        vol_count[z, :, :] += 1
-    idx += D
+    chosen = [int(x) for x in prompt_cache.get("chosen_frames", [])]
+    forced_first = bool(prompt_cache.get("forced_first", False))
+    T = int(video_tchw.shape[0])
 
-    # Coronal forward: y planes of shape (z, x) -> size (D, W)
-    for y in range(H):
-        p = F.interpolate(probs[idx+y].unsqueeze(0).unsqueeze(0), size=(D, W), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[:, y, :] += p
-        vol_count[:, y, :] += 1
-    idx += H
+    state = predictor.init_state_from_tensor(
+        imgs_tensor=video_tchw,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        mode="eval",
+    )
 
-    # Coronal reverse
-    for yi in range(H):
-        y = H - 1 - yi
-        p = F.interpolate(probs[idx+yi].unsqueeze(0).unsqueeze(0), size=(D, W), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[:, y, :] += p
-        vol_count[:, y, :] += 1
-    idx += H
+    pk_counts = {"point": 0, "box": 0, "mask": 0}
+    prompts_added = 0
 
-    # Sagittal forward: x planes of shape (z, y) -> size (D, H)
-    for x in range(W):
-        p = F.interpolate(probs[idx+x].unsqueeze(0).unsqueeze(0), size=(D, H), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[:, :, x] += p
-        vol_count[:, :, x] += 1
-    idx += W
+    pt_list = mode_payload.get("pt_list", [])
+    p_label = mode_payload.get("p_label", [])
+    bbox = mode_payload.get("bbox", [])
+    m_prompt = mode_payload.get("m_prompt", [])
 
-    # Sagittal reverse
-    for xi in range(W):
-        x = W - 1 - xi
-        p = F.interpolate(probs[idx+xi].unsqueeze(0).unsqueeze(0), size=(D, H), mode='bilinear', align_corners=False).squeeze(0).squeeze()
-        vol_sum[:, :, x] += p
-        vol_count[:, :, x] += 1
+    for t in chosen:
+        if t < 0 or t >= T:
+            continue
 
-    vol_prob = vol_sum / (vol_count.clamp_min(1))
-    return vol_prob
+        if mode_key == "point":
+            pts = pt_list[t] if t < len(pt_list) else None
+            lbs = p_label[t] if t < len(p_label) else None
+            if pts is None or lbs is None or pts.numel() == 0 or lbs.numel() == 0:
+                continue
+
+            pts_f = pts.to(device=device, dtype=torch.float32).unsqueeze(0)
+            lbs_i = lbs.to(device=device, dtype=torch.int32).unsqueeze(0)
+
+            with amp_ctx:
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    points=pts_f,
+                    labels=lbs_i,
+                    box=None,
+                    clear_old_points=False,
+                    normalize_coords=bool(normalize_coords),
+                )
+            pk_counts["point"] += int(pts.shape[0])
+            prompts_added += 1
+
+        elif mode_key == "box":
+            bb = bbox[t] if t < len(bbox) else None
+            if bb is None or (hasattr(bb, "numel") and bb.numel() == 0):
+                continue
+
+            if bb.ndim == 2:
+                bb = bb[0]
+            bb = bb.to(device=device, dtype=torch.float32)
+
+            empty_points = torch.empty((1, 0, 2), dtype=torch.float32, device=device)
+            empty_labels = torch.empty((1, 0), dtype=torch.int32, device=device)
+
+            with amp_ctx:
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    points=empty_points,
+                    labels=empty_labels,
+                    box=bb,
+                    clear_old_points=True,
+                    normalize_coords=bool(normalize_coords),
+                )
+            pk_counts["box"] += 1
+            prompts_added += 1
+
+        else:  # mask
+            mm = m_prompt[t] if t < len(m_prompt) else None
+            if mm is None or (hasattr(mm, "numel") and mm.numel() == 0):
+                continue
+
+            if mm.ndim == 3 and mm.shape[0] == 1:
+                mm = mm[0]
+            mm = (mm > 0).to(device=device, dtype=torch.bool)
+
+            with amp_ctx:
+                predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=int(t),
+                    obj_id=1,
+                    mask=mm,
+                )
+            pk_counts["mask"] += 1
+            prompts_added += 1
+
+    if prompts_added == 0:
+        return None
+
+    _, _, H, W = video_tchw.shape
+    logits = torch.zeros((T, H, W), device=device, dtype=torch.float32)
+
+    with amp_ctx:
+        for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
+            state, start_frame_idx=0, max_frame_num_to_track=T, reverse=False
+        ):
+            tt = int(frame_idx)
+            logits[tt] = video_res_masks[0, 0].float()
+
+    return {
+        "logits": logits,
+        "chosen_frames": chosen,
+        "forced_first": forced_first,
+        "pk_counts": pk_counts,
+    }

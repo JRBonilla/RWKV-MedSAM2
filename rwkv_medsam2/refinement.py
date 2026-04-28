@@ -1,14 +1,29 @@
+"""Uncertainty and feature refinement heads for the VCR backbone."""
+
 import torch
 import torch.nn as nn
 
 class UncertaintyHead(nn.Module):
+    """
+    Predict a per-pixel uncertainty map from feature tensors.
+
+    Args:
+        nn.Module (type): PyTorch module base class.
+
+    Returns:
+        None.
+    """
+
     def __init__(self, in_channels, out_channels):
         """
-        Generates an uncertainty map from input features.
-        
+        Initialize the uncertainty head layers.
+
         Args:
             in_channels (int): Numbers of channels in the input feature map.
-            out_channels (int): Number of output channels. Default: 1
+            out_channels (int): Number of output channels.
+
+        Returns:
+            None.
         """
         super().__init__()
         self.conv1  = nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
@@ -17,6 +32,15 @@ class UncertaintyHead(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        """
+        Generate uncertainty probabilities for input features.
+
+        Args:
+            x (torch.Tensor): Feature map of shape ``[B, C, H, W]``.
+
+        Returns:
+            torch.Tensor: Uncertainty map of shape ``[B, out_channels, H, W]``.
+        """
         x = self.conv1(x)
         x = self.relu(x)
         x = self.conv2(x)
@@ -24,14 +48,27 @@ class UncertaintyHead(nn.Module):
         return uncertainty
 
 class RefinementModule(nn.Module):
+    """
+    Refine features by amplifying uncertain regions before convolution.
+
+    Args:
+        nn.Module (type): PyTorch module base class.
+
+    Returns:
+        None.
+    """
+
     def __init__(self, in_channels, mid_channels, out_channels):
         """
-        Refines segmentation features by focusing on regions of high uncertainty.
+        Initialize refinement convolutions.
 
         Args:
             in_channels (int): Number of channels of the input feature map.
             mid_channels (int): Number of channels in the intermediate representation.
             out_channels (int): Number of channels for the refined output.
+
+        Returns:
+            None.
         """
         super().__init__()
         # Two convolutional layers for refinement
@@ -42,6 +79,8 @@ class RefinementModule(nn.Module):
 
     def forward(self, x, uncertainty_map=None):
         """
+        Refine feature maps with an optional uncertainty gate.
+
         Args:
             x (Tensor): Input feature map (e.g., segmentation features).
             uncertainty_map (Tensor, optional): Uncertainty map indicating regions to refine.
