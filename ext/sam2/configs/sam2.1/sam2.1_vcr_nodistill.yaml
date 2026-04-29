@@ -1,0 +1,260 @@
+# @package _global_
+
+_config_path: "sam2.1/sam2.1_vcr_nodistill.yaml"
+
+cache:
+  path: "/data/Cache"
+
+validation:
+  default_prompt_modes: [box]
+  prompt_modes_by_task: {}
+  prompt_modes_by_dataset: {}
+  hd95_sample: 0
+  compute_global_prob_metrics: false
+
+init:
+  # Load SAM2.1 tiny weights as much as possible
+  student_ckpt_path: "/root/sam2.1_hiera_tiny.pt"
+
+  # We must ignore trunk (and usually neck) because your VCR backbone differs from Hiera.
+  # Start conservative (skip all image_encoder.*). Once stable, you can try narrowing this.
+  ignore_prefixes:
+    - "image_encoder."
+
+  # Now that you patched RoPE repeat logic, you can keep this enabled.
+  use_obj_ptrs_in_encoder: true
+
+  # Optional but recommended: freeze pretrained parts for a few epochs so your trunk/adapters
+  # learn to feed them, without immediately destroying them.
+  freeze_pretrained_epochs: 0
+  freeze_modules:
+    - "sam_prompt_encoder"
+    - "sam_mask_decoder"
+    - "memory_attention"
+    - "memory_encoder"
+    - "obj_ptr_proj"
+    - "mask_downsample"
+
+# ---- DRIPP config ------------------------------------------------------------------
+dripp:
+  output_dir: "/data/Preprocessed"
+  tasks_file: "/data/DatasetIndexes/Tasks/datasets_tasks.json"
+
+# ---- Sequence sampler config -------------------------------------------------------
+sampler:
+  seq_len: 8                            # Number of frames per training sample
+  max_random: 0                         # Maximum number of random frames to drop
+  min_fg_frames_in_window: 7            # Minimum number of foreground frames per window
+  fg_min_pixels_frac: 0.0002            # Minimum number of pixels in foreground for window to be considered.
+
+# ---- Training config ----------------------------------------------------------------
+training:
+  device: "cuda"                        # Device
+  batch_size: 3                         # Batch size
+  num_workers: 2                        # Number of dataloader workers
+
+  lr: 1e-4                              # Default Learning rate
+  mem_lr: 1e-5                          # Memory learning rate
+  mask_lr: 1e-4                         # Mask learning rate
+  weight_decay: 0.0                     # Weight decay
+  warmup_epochs: 8                      # Number of warmup epochs
+  
+  seed: 42                              # Random seed
+  val_frac: 0.1                         # Validation fraction
+  val_freq: 5                           # Validation frequency
+  epochs: 20                            # Number of epochs
+  
+  out_size: 512                         # Output mask H/W
+
+  pos_weight: 1.0                       # Positive‐pixel weight for BCEWithLogitsLoss
+  pos_weight_max: 8.0                   # Maximum positive‐pixel weight
+
+  lambda_distill_2d: 0.0                # Current weight for 2D distillation  
+  lambda_distill_3d: 0.0                # Current weight for 3D distillation
+  distill_temperature: 4.0              # Temperature for distillation
+  distill_heavy_mult: 10.0              # Multiplier for distillation
+
+  bce_weight: 1.5                       # Weight for BCE loss
+  dice_weight: 1.0                      # Weight for Dice loss
+
+  focal_weight: 0.70                    # Weight for Focal loss
+  focal_gamma: 2.0                      # Gamma for Focal loss
+  focal_alpha: 0.75                     # Alpha for Focal loss
+
+  logit_clip: 12.0                      # Maximum logit value
+  frame_loss_clip: 5.0                  # Maximum frame loss value
+
+  nonprompt_scale: 1.0                  # Scale for non-prompt loss
+
+  vis_threshold: 0.50                   # Threshold for visualization
+
+
+# ---- Prompt config ------------------------------------------------------------------
+prompt:
+  max_per_seq: 2                        # Maximum number of prompt frames per sequence
+  mask_prob: 0.5                        # Probability of generating a full mask (if used)
+  click_prob: 0.0                       # Probability of generating a positive click
+
+# ---- Logging config -----------------------------------------------------------------
+logging:
+  output_dir: "/data/TrainingLogs"
+  level: "INFO"
+  filename: "sam2.1_vcr.log"
+  file_level: "DEBUG"
+  interval: 5
+  backups: 7
+  train_vis_prompt_mode: box
+
+# ---- Checkpoint config --------------------------------------------------------------
+ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr_nodistill.pth"
+
+# ---- Teacher settings ---------------------------------------------------------------
+teacher:
+  _config_path: "sam2/sam2_hiera_t_512.yaml"
+  ckpt_path: "/data/jrbonill/oxford_refine_runs/oxford_refine_20260312_023627/checkpoints/epoch_004.pth"
+
+# ---- Model config -------------------------------------------------------------------
+model:
+  _target_: sam2.modeling.sam2_base.SAM2Base
+
+  # ---------------------------
+  # 1) Image Encoder
+  # ---------------------------
+  image_encoder:
+    _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+    scalp: 1
+
+    trunk:
+      _target_: rwkv_medsam2.vcr.VCRBackbone
+      in_channels: 3
+      fused_stage_cfg:
+        out_ch: 112
+        depth: 2
+        stride: 2
+        expand_ratio: 4.0
+      mbconv_stage_cfg:
+        out_ch: 64
+        depth: 2
+        stride: 2
+        expand_ratio: 4.0
+      embed_dim: 256
+      rwkv_depth: 4
+      mlp_ratio: 4.0
+      drop_path: 0.0
+      with_pos_embed: true
+      init_patch_size: [16, 16]
+      use_uncertainty: false
+      use_refinement: false
+    neck:
+      _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+      position_encoding:
+        _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+        num_pos_feats: 256
+        normalize: true
+        scale: null
+        temperature: 10000
+      d_model: 256
+      backbone_channel_list: [256, 128, 64, 112]
+      fpn_top_down_levels: [2, 3]
+      fpn_interp_model: nearest
+
+  # ---------------------------
+  # 2) Memory Attention
+  # ---------------------------
+  memory_attention:
+    _target_: sam2.modeling.memory_attention.MemoryAttention
+    d_model: 256
+    pos_enc_at_input: true
+    layer:
+      _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+      activation: relu
+      dim_feedforward: 2048
+      dropout: 0.1
+      pos_enc_at_attn: false
+      self_attention:
+        _target_: sam2.modeling.sam.transformer.RoPEAttention
+        rope_theta: 10000.0
+        feat_sizes: [64, 64]
+        embedding_dim: 256
+        num_heads: 1
+        downsample_rate: 1
+        dropout: 0.1
+      d_model: 256
+      pos_enc_at_cross_attn_keys: true
+      pos_enc_at_cross_attn_queries: false
+      cross_attention:
+        _target_: sam2.modeling.sam.transformer.RoPEAttention
+        rope_theta: 10000.0
+        feat_sizes: [64, 64]
+        rope_k_repeat: true
+        embedding_dim: 256
+        num_heads: 1
+        downsample_rate: 1
+        dropout: 0.1
+        kv_in_dim: 64
+    num_layers: 4
+
+  # ---------------------------
+  # 3) Memory Encoder
+  # ---------------------------
+  memory_encoder:
+    _target_: sam2.modeling.memory_encoder.MemoryEncoder
+    out_dim: 64
+    position_encoding:
+      _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+      num_pos_feats: 64
+      normalize: true
+      scale: null
+      temperature: 10000
+    mask_downsampler:
+      _target_: sam2.modeling.memory_encoder.MaskDownSampler
+      kernel_size: 3
+      stride: 2
+      padding: 1
+    fuser:
+      _target_: sam2.modeling.memory_encoder.Fuser
+      layer:
+        _target_: sam2.modeling.memory_encoder.CXBlock
+        dim: 256
+        kernel_size: 7
+        padding: 3
+        layer_scale_init_value: 1e-6
+        use_dwconv: true
+      num_layers: 2
+
+  # ---------------------------
+  # 6) Additional Model Settings
+  # ---------------------------
+  num_maskmem: 7
+  image_size: 512
+  sigmoid_scale_for_mem_enc: 20.0
+  sigmoid_bias_for_mem_enc: -10.0
+  use_mask_input_as_output_without_sam: false
+  directly_add_no_mem_embed: true
+  no_obj_embed_spatial: true
+  use_high_res_features_in_sam: true
+  multimask_output_in_sam: true
+  iou_prediction_use_sigmoid: true
+  use_obj_ptrs_in_encoder: true
+  add_tpos_enc_to_obj_ptrs: true
+  proj_tpos_enc_in_obj_ptrs: true
+  use_signed_tpos_enc_to_obj_ptrs: true
+  only_obj_ptrs_in_the_past_for_eval: true
+  pred_obj_scores: true
+  pred_obj_scores_mlp: true
+  fixed_no_obj_ptr: true
+  multimask_output_for_tracking: true
+  use_multimask_token_for_obj_ptr: true
+  multimask_min_pt_num: 0
+  multimask_max_pt_num: 1
+  use_mlp_for_obj_ptr_proj: true
+  compile_image_encoder: false
+
+
+# ---- Mask Decoder config -------------------------------------------------------------
+decoder:
+  # Spatial resolutions of the feature‐maps fed into the mask‐decoder
+  feat_sizes:
+    - [128, 128] # High-resolution feature map
+    - [ 64,  64] # Middle-resolution feature map
+    - [ 32,  32] # Coarsest-resolution feature map
