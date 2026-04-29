@@ -860,6 +860,40 @@ def build_teacher_predictor(config):
     video_predictor.use_obj_ptrs_in_encoder = True
     return video_predictor
 
+def get_effective_distill_weight(config, dim=None):
+    """
+    Return the effective distillation weight after applying the shared multiplier.
+
+    Args:
+        config (OmegaConf.DictConfig): Training configuration.
+        dim (int | str | None): ``2``/``"2d"`` or ``3``/``"3d"`` for a single
+            branch. ``None`` returns the maximum enabled branch weight.
+
+    Returns:
+        float: Effective distillation weight.
+    """
+    training = getattr(config, "training", {})
+    heavy_mult = float(getattr(training, "distill_heavy_mult", 1.0))
+
+    def _weight(name):
+        return float(getattr(training, name, 0.0)) * heavy_mult
+
+    if dim in (2, "2", "2d", "2D"):
+        return _weight("lambda_distill_2d")
+    if dim in (3, "3", "3d", "3D"):
+        return _weight("lambda_distill_3d")
+
+    return max(_weight("lambda_distill_2d"), _weight("lambda_distill_3d"))
+
+def distillation_enabled(config, dim=None):
+    """
+    Return whether teacher distillation should run for the requested branch.
+
+    This treats zero or negative effective weights as disabled, which lets
+    training skip teacher construction and teacher image/video forward passes.
+    """
+    return get_effective_distill_weight(config, dim=dim) > 0.0
+
 def _trainable(params):
     """
     Filter parameters to those that are trainable.
@@ -1285,6 +1319,11 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     writer.add_scalar("train/nonprompt_scale", nonprompt_scale, epoch)
     writer.add_scalar("train/distill_heavy_mult", heavy_mult, epoch)
     writer.add_scalar("train/distill_temperature", tau, epoch)
+    writer.add_scalar("train/effective_lambda_distill_2d", get_effective_distill_weight(config, dim=2), epoch)
+    writer.add_scalar("train/effective_lambda_distill_3d", get_effective_distill_weight(config, dim=3), epoch)
+
+    teacher_2d = teacher if distillation_enabled(config, dim=2) else None
+    teacher_3d = teacher if distillation_enabled(config, dim=3) else None
 
     pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", unit="batch", dynamic_ncols=True)
 
@@ -1338,7 +1377,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             _t0 = time.perf_counter()
 
             try:
-                step_out = train_step_2d(student, teacher, optimizer, batch, config, scaler)
+                step_out = train_step_2d(student, teacher_2d, optimizer, batch, config, scaler)
             except Exception as e:
                 _save_and_log_fatal_crash(
                     stage="train2d/exception",
@@ -1462,7 +1501,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             _t0 = time.perf_counter()
 
             try:
-                step_out = train_step_3d(student, teacher, optimizer, batch, config, scaler)
+                step_out = train_step_3d(student, teacher_3d, optimizer, batch, config, scaler)
             except Exception as e:
                 _save_and_log_fatal_crash(
                     stage="train3d/exception",
@@ -2262,7 +2301,15 @@ def main(config_path, resume, multi_gpu, amp):
     train_loader, val_loader, test_loader = get_data_loaders(config)
 
     student = build_student_predictor(config, logger=logger).to(config.training.device)
-    teacher = build_teacher_predictor(config).to(config.training.device)
+    if distillation_enabled(config):
+        teacher = build_teacher_predictor(config).to(config.training.device)
+    else:
+        teacher = None
+        logger.info(
+            "Teacher distillation disabled "
+            f"(effective lambda 2D={get_effective_distill_weight(config, dim=2):.6g}, "
+            f"3D={get_effective_distill_weight(config, dim=3):.6g}); skipping teacher model build."
+        )
 
     opt_all = setup_optimizer_and_scheduler(student, config)
     optimizer, scheduler = opt_all["optimizer"], opt_all["scheduler"]
@@ -2286,7 +2333,8 @@ def main(config_path, resume, multi_gpu, amp):
     scaler = None
     if multi_gpu and torch.cuda.device_count() > 1:
         student = torch.nn.DataParallel(student)
-        teacher = torch.nn.DataParallel(teacher)
+        if teacher is not None:
+            teacher = torch.nn.DataParallel(teacher)
 
     ckpt_mgr = CheckpointManager(config.ckpt_path)
     start_ep = 0

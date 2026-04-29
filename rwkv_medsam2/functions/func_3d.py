@@ -42,6 +42,7 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
     lam_base   = float(getattr(config.training, "lambda_distill_3d", 0.0))
     heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
     lam        = lam_base * heavy_mult
+    use_teacher = teacher is not None and lam > 0.0
     tau        = float(getattr(config.training, "distill_temperature", 1.0))
 
     # Clip controls
@@ -62,7 +63,7 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
     raw_mpr = batch.get("m_prompt", None)
 
     student.train()
-    if teacher is not None:
+    if use_teacher:
         teacher.eval()
     optimizer.zero_grad(set_to_none=True)
 
@@ -100,7 +101,7 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
         train_state["storage_device"] = torch.device(device)
 
         teacher_state = None
-        if teacher is not None and lam > 0.0:
+        if use_teacher:
             with torch.no_grad():
                 teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs.contiguous(), mode="eval")
                 teacher_state["storage_device"] = torch.device(device)

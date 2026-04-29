@@ -86,6 +86,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
     lam_base   = float(getattr(config.training, "lambda_distill_2d", 0.0))
     heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
     lam        = lam_base * heavy_mult
+    use_teacher = teacher is not None and lam > 0.0
     tau        = float(getattr(config.training, "distill_temperature", 1.0))
     logit_clip = float(getattr(config.training, "logit_clip", 12.0))
 
@@ -105,7 +106,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
 
     pe_student = student.sam_prompt_encoder.get_dense_pe()
     pe_teacher = None
-    if teacher is not None and lam > 0.0:
+    if use_teacher:
         teacher.eval()
         pe_teacher = teacher.sam_prompt_encoder.get_dense_pe()
 
@@ -175,7 +176,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
 
         seg_loss = (bce_w * bce) + (dice_w * tv) + (focal_w * foc)
 
-    if teacher is not None and lam > 0.0:
+    if use_teacher:
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 t_bb = teacher.forward_image(imgs_t)
