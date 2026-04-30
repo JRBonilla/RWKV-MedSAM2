@@ -9,7 +9,7 @@ from matplotlib.widgets import Slider
 from IPython.display import display, HTML
 import numpy as np
 import torch
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_dilation, binary_erosion
 import SimpleITK as sitk
 from PIL import Image
 
@@ -314,14 +314,14 @@ def _prob_to_rgb(prob_01: np.ndarray, cmap_name: str = "magma") -> np.ndarray:
     rgb  = (rgba[..., :3] * 255.0).astype(np.uint8)
     return rgb
 
-def _make_gt_pred_overlay(image_rgb, gt_mask, pred_mask, alpha=0.45):
+def _make_gt_pred_overlay(image_rgb, gt_mask, pred_mask, alpha=0.78):
     """
     Overlay GT and prediction masks on an RGB display image.
 
     Colors:
-      - GT only: green
-      - Prediction only: red
-      - Overlap: yellow
+      - GT only: cyan fill with blue outline
+      - Prediction only: orange fill with red outline
+      - Overlap: yellow fill with alternating blue/red outline
     """
     base = np.asarray(image_rgb, dtype=np.float32)
     if base.ndim == 2:
@@ -338,13 +338,34 @@ def _make_gt_pred_overlay(image_rgb, gt_mask, pred_mask, alpha=0.45):
         pred = _to_hw(pred, reduce="max").astype(bool)
 
     color = np.zeros_like(base, dtype=np.float32)
-    color[gt] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    color[pred] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    color[gt] = np.array([0.0, 0.85, 1.0], dtype=np.float32)
+    color[pred] = np.array([1.0, 0.35, 0.0], dtype=np.float32)
     color[gt & pred] = np.array([1.0, 1.0, 0.0], dtype=np.float32)
 
     mask = gt | pred
     out = base.copy()
     out[mask] = (1.0 - float(alpha)) * base[mask] + float(alpha) * color[mask]
+
+    gt_edge = binary_dilation(_contour(gt), iterations=2)
+    pred_edge = binary_dilation(_contour(pred), iterations=2)
+    both_edge = gt_edge & pred_edge
+    gt_only_edge = gt_edge & ~both_edge
+    pred_only_edge = pred_edge & ~both_edge
+
+    halo = binary_dilation(gt_edge | pred_edge, iterations=1)
+    out[halo] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+    gt_color = np.array([0.0, 0.25, 1.0], dtype=np.float32)
+    pred_color = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    out[gt_only_edge] = gt_color
+    out[pred_only_edge] = pred_color
+
+    if np.any(both_edge):
+        yy, xx = np.indices(both_edge.shape)
+        stripe = ((yy + xx) % 2) == 0
+        out[both_edge & stripe] = gt_color
+        out[both_edge & ~stripe] = pred_color
+
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 def _to_hw(arr: np.ndarray, reduce="max") -> np.ndarray:
