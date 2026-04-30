@@ -13,10 +13,10 @@ from scipy.ndimage import binary_erosion
 import SimpleITK as sitk
 from PIL import Image
 
-def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=2, figsize=(12,4), ping_pong=False):
+def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=2, figsize=(16,4), ping_pong=False):
     """
     Animate a sequence of 2D frames side-by-side:
-      [Input image | GT mask | Predicted mask]
+      [Input image | GT mask | Predicted mask | Image + GT/Pred overlay]
 
     Plays forward then backward in a loop (optional ping-pong style).
 
@@ -59,14 +59,15 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
         frames.append((img, gt, pred))
 
     # 3) Set up figure & initial images
-    fig, (ax0,ax1,ax2) = plt.subplots(1,3, figsize=figsize)
-    for ax in (ax0,ax1,ax2): ax.axis('off')
-    ax0.set_title('Input'); ax1.set_title('GT'); ax2.set_title('Pred')
+    fig, (ax0,ax1,ax2,ax3) = plt.subplots(1,4, figsize=figsize)
+    for ax in (ax0,ax1,ax2,ax3): ax.axis('off')
+    ax0.set_title('Input'); ax1.set_title('GT'); ax2.set_title('Pred'); ax3.set_title('Overlay')
 
     img0, gt0, pr0 = frames[0]
     im0 = ax0.imshow(img0, cmap=('gray' if img0.ndim==2 else None), animated=True)
     im1 = ax1.imshow(gt0,  cmap='gray', vmin=0, vmax=1, animated=True)
     im2 = ax2.imshow(pr0,  cmap='gray', vmin=0, vmax=1, animated=True)
+    im3 = ax3.imshow(_make_gt_pred_overlay(img0, gt0, pr0), animated=True)
 
     # 4) ping-pong frame indices & interval
     if ping_pong and T > 1:
@@ -79,8 +80,8 @@ def visualize_sequence(image_seq, mask_seq, pred_logits_seq, threshold=0.5, fps=
     def _update(i):
         """Update animation artists for one frame."""
         img, gt, pr = frames[i]
-        im0.set_array(img); im1.set_array(gt); im2.set_array(pr)
-        return im0, im1, im2
+        im0.set_array(img); im1.set_array(gt); im2.set_array(pr); im3.set_array(_make_gt_pred_overlay(img, gt, pr))
+        return im0, im1, im2, im3
 
     ani = animation.FuncAnimation(fig, _update, frames=idx_seq, interval=interval, blit=True, repeat=True)
     plt.close(fig)
@@ -313,6 +314,39 @@ def _prob_to_rgb(prob_01: np.ndarray, cmap_name: str = "magma") -> np.ndarray:
     rgb  = (rgba[..., :3] * 255.0).astype(np.uint8)
     return rgb
 
+def _make_gt_pred_overlay(image_rgb, gt_mask, pred_mask, alpha=0.45):
+    """
+    Overlay GT and prediction masks on an RGB display image.
+
+    Colors:
+      - GT only: green
+      - Prediction only: red
+      - Overlap: yellow
+    """
+    base = np.asarray(image_rgb, dtype=np.float32)
+    if base.ndim == 2:
+        base = np.stack([base, base, base], axis=-1)
+    if base.max() > 1.0:
+        base = base / 255.0
+    base = np.clip(base, 0.0, 1.0)
+
+    gt = np.asarray(gt_mask) > 0
+    pred = np.asarray(pred_mask) > 0
+    if gt.shape != base.shape[:2]:
+        gt = _to_hw(gt, reduce="max").astype(bool)
+    if pred.shape != base.shape[:2]:
+        pred = _to_hw(pred, reduce="max").astype(bool)
+
+    color = np.zeros_like(base, dtype=np.float32)
+    color[gt] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    color[pred] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    color[gt & pred] = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+
+    mask = gt | pred
+    out = base.copy()
+    out[mask] = (1.0 - float(alpha)) * base[mask] + float(alpha) * color[mask]
+    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
 def _to_hw(arr: np.ndarray, reduce="max") -> np.ndarray:
     """
     Robustly convert an array to shape [H,W].
@@ -341,8 +375,7 @@ def _to_hw(arr: np.ndarray, reduce="max") -> np.ndarray:
 
 def make_vis_frames(image_seq, mask_seq, pred_logits_seq, threshold=0.5):
     """
-    Generate side-by-side RGB frames: [Input | GT | Pred-heatmap].
-    `threshold` kept for compatibility, not used.
+    Generate side-by-side RGB frames: [Input | GT | Pred-heatmap | Overlay].
 
     Args:
         image_seq (torch.Tensor | np.ndarray): Image sequence.
@@ -392,11 +425,13 @@ def make_vis_frames(image_seq, mask_seq, pred_logits_seq, threshold=0.5):
         lt = _to_hw(log[t], reduce="max").astype(np.float32)       # [H,W]
         logits = np.clip(lt, -20.0, 20.0)                                 # stability
         prob = 1.0 / (1.0 + np.exp(-logits))                      # [H,W] in [0,1]
+        pred = (prob >= float(threshold)).astype(np.uint8)         # [H,W]
         heat_rgb = _prob_to_rgb(prob, cmap_name="magma")          # [H,W,3] uint8
 
         gt_rgb = (np.stack([gt, gt, gt], axis=-1) * 255).astype(np.uint8)
+        overlay_rgb = _make_gt_pred_overlay(im_rgb, gt, pred)
 
-        panel = np.concatenate([(im_rgb * 255).astype(np.uint8), gt_rgb, heat_rgb], axis=1)
+        panel = np.concatenate([(im_rgb * 255).astype(np.uint8), gt_rgb, heat_rgb, overlay_rgb], axis=1)
         frames.append(panel)
 
     return frames

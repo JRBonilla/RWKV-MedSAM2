@@ -1330,6 +1330,8 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     train_start_time = time.perf_counter()
     last_out_time = train_start_time
     ema = {"2d_data": None, "2d_step": None, "3d_data": None, "3d_step": None}
+    step_time_totals = {2: 0.0, 3: 0.0}
+    step_time_counts = {2: 0, 3: 0}
 
     def _upd(k, v, beta=0.9):
         """Update an exponential moving average."""
@@ -1342,6 +1344,16 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         total_batches = len(train_loader) if hasattr(train_loader, "__len__") else -1
         pct = (100.0 * batches_done / total_batches) if total_batches > 0 else float("nan")
         return elapsed, pct, batches_done, total_batches
+
+    def _record_step_time(data_dim, step_time):
+        """Track and log running average step time for one data dimension."""
+        data_dim = int(data_dim)
+        step_time_totals[data_dim] += float(step_time)
+        step_time_counts[data_dim] += 1
+        avg_step_time = step_time_totals[data_dim] / max(1, step_time_counts[data_dim])
+        if writer is not None:
+            writer.add_scalar(f"train/{data_dim}d_step_time_avg_s", float(avg_step_time), global_step)
+        return avg_step_time
 
     train_vis_prompt_mode = str(
         getattr(getattr(config, "logging", {}), "train_vis_prompt_mode", "box")
@@ -1390,6 +1402,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             step_time = time.perf_counter() - _t0
+            avg_step_time = _record_step_time(2, step_time)
 
             if not step_out["ok"]:
                 _log_nonfinite_skip(
@@ -1468,6 +1481,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 elapsed=f"{elapsed:.1f}s",
                 data2d=f"{ema['2d_data']:.3f}s" if ema["2d_data"] is not None else "n/a",
                 step2d=f"{ema['2d_step']:.3f}s" if ema["2d_step"] is not None else "n/a",
+                avg2d=f"{avg_step_time:.3f}s",
             )
 
             if writer is not None and text_every_steps > 0 and (global_step % text_every_steps == 0):
@@ -1488,10 +1502,14 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                     lines.append(f"ema_2d_data_wait_s={ema['2d_data']:.4f}")
                 if ema.get("2d_step") is not None:
                     lines.append(f"ema_2d_step_s={ema['2d_step']:.4f}")
+                if step_time_counts.get(2, 0) > 0:
+                    lines.append(f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}")
                 if ema.get("3d_data") is not None:
                     lines.append(f"ema_3d_data_wait_s={ema['3d_data']:.4f}")
                 if ema.get("3d_step") is not None:
                     lines.append(f"ema_3d_step_s={ema['3d_step']:.4f}")
+                if step_time_counts.get(3, 0) > 0:
+                    lines.append(f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}")
 
                 writer.add_text("train/progress", _tb_pre("\n".join(lines)), global_step)
 
@@ -1514,6 +1532,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             step_time = time.perf_counter() - _t0
+            avg_step_time = _record_step_time(3, step_time)
 
             if not step_out["ok"]:
                 _log_nonfinite_skip(
@@ -1602,6 +1621,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 elapsed=f"{elapsed:.1f}s",
                 data3d=f"{ema['3d_data']:.3f}s" if ema["3d_data"] is not None else "n/a",
                 step3d=f"{ema['3d_step']:.3f}s" if ema["3d_step"] is not None else "n/a",
+                avg3d=f"{avg_step_time:.3f}s",
             )
 
             if writer is not None and text_every_steps > 0 and (global_step % text_every_steps == 0):
@@ -1622,10 +1642,14 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                     lines.append(f"ema_2d_data_wait_s={ema['2d_data']:.4f}")
                 if ema.get("2d_step") is not None:
                     lines.append(f"ema_2d_step_s={ema['2d_step']:.4f}")
+                if step_time_counts.get(2, 0) > 0:
+                    lines.append(f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}")
                 if ema.get("3d_data") is not None:
                     lines.append(f"ema_3d_data_wait_s={ema['3d_data']:.4f}")
                 if ema.get("3d_step") is not None:
                     lines.append(f"ema_3d_step_s={ema['3d_step']:.4f}")
+                if step_time_counts.get(3, 0) > 0:
+                    lines.append(f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}")
 
                 writer.add_text("train/progress", _tb_pre("\n".join(lines)), global_step)
 
@@ -1638,12 +1662,23 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     except Exception:
         pass
 
+    epoch_time = time.perf_counter() - train_start_time
     avg_loss = total_loss / max(1, len(train_loader))
     logger.info(f"[Epoch {epoch}] Skipped steps: 2D={skipped_2d}, 3D={skipped_3d}")
     writer.add_scalar("train2d/skipped_steps_epoch", skipped_2d, epoch)
     writer.add_scalar("train3d/skipped_steps_epoch", skipped_3d, epoch)
     logger.info(f"[Epoch {epoch}] Train avg loss: {avg_loss:.4f}")
     writer.add_scalar("train/loss", float(avg_loss), epoch)
+    writer.add_scalar("train/epoch_time_s", float(epoch_time), epoch)
+    if step_time_counts.get(2, 0) > 0:
+        writer.add_scalar("train/2d_step_time_avg_s", float(step_time_totals[2] / step_time_counts[2]), epoch)
+    if step_time_counts.get(3, 0) > 0:
+        writer.add_scalar("train/3d_step_time_avg_s", float(step_time_totals[3] / step_time_counts[3]), epoch)
+    logger.info(
+        f"[Epoch {epoch}] Timing: epoch={epoch_time:.2f}s, "
+        f"2D_step_avg={(step_time_totals[2] / step_time_counts[2]) if step_time_counts[2] else float('nan'):.4f}s, "
+        f"3D_step_avg={(step_time_totals[3] / step_time_counts[3]) if step_time_counts[3] else float('nan'):.4f}s"
+    )
 
     if ema.get("2d_data") is not None:
         writer.add_scalar("debug/2d_data_wait_ema_s", float(ema["2d_data"]), epoch)
