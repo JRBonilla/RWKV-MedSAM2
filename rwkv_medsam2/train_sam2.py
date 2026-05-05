@@ -1352,7 +1352,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         step_time_counts[data_dim] += 1
         avg_step_time = step_time_totals[data_dim] / max(1, step_time_counts[data_dim])
         if writer is not None:
-            writer.add_scalar(f"train/{data_dim}d_step_time_avg_s", float(avg_step_time), global_step)
+            writer.add_scalar(f"train_step/{data_dim}d_step_time_avg_s", float(avg_step_time), global_step)
         return avg_step_time
 
     train_vis_prompt_mode = str(

@@ -9,6 +9,7 @@ if __package__ in (None, ""):
     __package__ = "dripp.debugger"
 
 from .common import *
+from .csv_debugger import CsvDebuggerMixin
 from .grouping_debugger import GroupingDebuggerMixin
 from .preprocessing_debugger import PreprocessingDebuggerMixin
 
@@ -69,7 +70,7 @@ class Tooltip:
             self.tipwindow.destroy()
             self.tipwindow = None
 
-class PreprocessingDebuggerApp(GroupingDebuggerMixin, PreprocessingDebuggerMixin):
+class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, PreprocessingDebuggerMixin):
     """
     Run the Tk-based DRIPP grouping and preprocessing debugger.
 
@@ -100,12 +101,18 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, PreprocessingDebuggerMixin
         # Remember which group is currently loaded, so we don't reload it
         self.current_group = None
 
+        self.csv_path = csv_path
+        self.metadata = self._load_metadata_or_prompt_for_csv(csv_path)
+        self.original_regex = None
 
         # Notebook for tabs
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True)
 
-        # Tab 1: Regex Tester
+        # Tab 1: CSV editor
+        self._build_csv_tab()
+
+        # Tab 2: Regex Tester
         self.tab1 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab1, text="Regex Tester")
 
@@ -126,14 +133,6 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, PreprocessingDebuggerMixin
             foreground=fixed_map('foreground'),
             background=fixed_map('background')
         )
-        self.csv_path = csv_path
-        # Load metadata
-        try:
-            self.metadata = load_dataset_metadata(csv_path)
-        except Exception as e:
-            messagebox.showerror("CSV Load Error", f"Failed to load CSV: {e}")
-            self.metadata = {}
-        self.original_regex = None
 
         # Controls frame
         controls = ttk.Frame(self.tab1)
@@ -143,10 +142,10 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, PreprocessingDebuggerMixin
         # Dataset selector
         ttk.Label(controls, text="Dataset:").grid(row=0, column=0, sticky="w")
         self.dataset_var = tk.StringVar()
-        ds_combo = ttk.Combobox(controls, textvariable=self.dataset_var,
-                                values=list(self.metadata.keys()), state="readonly")
-        ds_combo.grid(row=0, column=1, sticky="we", padx=2)
-        ds_combo.bind("<<ComboboxSelected>>", self.on_dataset_select)
+        self.ds_combo = ttk.Combobox(controls, textvariable=self.dataset_var,
+                                     values=list(self.metadata.keys()), state="readonly")
+        self.ds_combo.grid(row=0, column=1, sticky="we", padx=2)
+        self.ds_combo.bind("<<ComboboxSelected>>", self.on_dataset_select)
 
         # Grouping Regex
         ttk.Label(controls, text="Grouping Regex:").grid(row=1, column=0, sticky="nw")
@@ -307,12 +306,9 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, PreprocessingDebuggerMixin
         self._configure_tags(self.test_tree)
         self._add_tree_context_menu(self.test_tree)
 
-        # -- Tab 2: Preprocessing UI -------------------------------------
+        # -- Tab 3: Preprocessing UI -------------------------------------
         self.tab2 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab2, text="Preprocessing")
-
-        # Make "Preprocessing" the initially-selected tab
-        self.notebook.select(self.tab2)
 
         # Header: Dataset dropdown + Preprocess button
         self.preproc_controls = ttk.Frame(self.tab2)

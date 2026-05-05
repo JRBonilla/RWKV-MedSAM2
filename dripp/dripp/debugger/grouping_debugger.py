@@ -14,6 +14,163 @@ class GroupingDebuggerMixin:
         None.
     """
 
+    def _dataset_base_dir(self, dataset_name):
+        """
+        Return the configured base directory for a dataset.
+
+        Args:
+            dataset_name (str): Dataset name from the metadata CSV.
+
+        Returns:
+            str: Normalized dataset base directory.
+        """
+        return normalize_path(os.path.join(BASE_UNPROC, dataset_name))
+
+    def _dataset_dir_from_metadata(self, dataset_name, meta):
+        """
+        Resolve the dataset data directory from metadata.
+
+        Args:
+            dataset_name (str): Dataset name from the metadata CSV.
+            meta (dict): Loaded metadata for the dataset.
+
+        Returns:
+            str: Normalized dataset data directory.
+        """
+        root = meta.get("root_directory") or ""
+        return normalize_path(
+            os.path.join(BASE_UNPROC, dataset_name, root)
+            if root
+            else os.path.join(BASE_UNPROC, dataset_name)
+        )
+
+    def _root_folder_value_for_dataset_dir(self, dataset_name, dataset_dir):
+        """
+        Convert a selected data directory into the CSV Root Folder value.
+
+        Args:
+            dataset_name (str): Dataset name from the metadata CSV.
+            dataset_dir (str): Absolute or relative folder selected in the UI.
+
+        Returns:
+            str: CSV Root Folder value.
+        """
+        dataset_dir = os.path.abspath(os.path.normpath(dataset_dir))
+        dataset_base = os.path.abspath(os.path.normpath(self._dataset_base_dir(dataset_name)))
+
+        if os.path.normcase(dataset_dir) == os.path.normcase(dataset_base):
+            return ""
+
+        try:
+            common = os.path.commonpath([dataset_base, dataset_dir])
+            is_inside_dataset_base = os.path.normcase(common) == os.path.normcase(dataset_base)
+        except ValueError:
+            is_inside_dataset_base = False
+
+        if is_inside_dataset_base:
+            return normalize_path(os.path.relpath(dataset_dir, dataset_base))
+        return normalize_path(dataset_dir)
+
+    def _save_dataset_root_folder(self, dataset_name, dataset_dir, df=None):
+        """
+        Persist the selected data directory as Root Folder in the metadata CSV.
+
+        Args:
+            dataset_name (str): Dataset name from the metadata CSV.
+            dataset_dir (str): Absolute or relative folder selected in the UI.
+            df (pandas.DataFrame, optional): Existing CSV dataframe to update.
+
+        Returns:
+            tuple[pandas.DataFrame, str]: Updated dataframe and saved Root Folder value.
+        """
+        if df is None:
+            df = pd.read_csv(self.csv_path)
+
+        if "Root Folder" not in df.columns:
+            df["Root Folder"] = ""
+
+        root_to_save = self._root_folder_value_for_dataset_dir(dataset_name, dataset_dir)
+        df.loc[df["Dataset Name"] == dataset_name, "Root Folder"] = root_to_save
+        return df, root_to_save
+
+    def _reload_metadata(self):
+        """
+        Reload debugger metadata after updating the CSV.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        self.metadata = load_dataset_metadata(self.csv_path)
+        if hasattr(self, "ds_combo"):
+            self.ds_combo["values"] = list(self.metadata.keys())
+        if hasattr(self, "preproc_ds_combo"):
+            self.preproc_ds_combo["values"] = list(self.metadata.keys())
+        if hasattr(self, "csv_tree"):
+            self._load_csv_table(show_errors=False)
+
+    def _ensure_dataset_dir(self, dataset_name, prompt_if_missing=True):
+        """
+        Ensure the selected dataset has an existing data directory.
+
+        Args:
+            dataset_name (str): Dataset name from the metadata CSV.
+            prompt_if_missing (bool): Whether to ask the user for a replacement.
+
+        Returns:
+            str or None: Existing data directory, or None when unresolved.
+        """
+        meta = self.metadata.get(dataset_name, {})
+        dataset_dir = self._dataset_dir_from_metadata(dataset_name, meta)
+        if os.path.isdir(dataset_dir):
+            return dataset_dir
+
+        if not prompt_if_missing:
+            return None
+
+        messagebox.showwarning(
+            "Dataset Folder Not Found",
+            "DRIPP could not find the configured data folder:\n\n"
+            f"{dataset_dir}\n\n"
+            "Please choose where to look for this dataset."
+        )
+        selected_dir = filedialog.askdirectory(
+            title=f"Locate data folder for {dataset_name}"
+        )
+
+        if not selected_dir:
+            messagebox.showwarning(
+                "Dataset Folder Required",
+                "No replacement folder was selected. DRIPP will not index this dataset until its data folder exists."
+            )
+            return None
+
+        selected_dir = normalize_path(selected_dir)
+        if not os.path.isdir(selected_dir):
+            messagebox.showwarning(
+                "Invalid Dataset Folder",
+                "The selected folder does not exist:\n\n"
+                f"{selected_dir}"
+            )
+            return None
+
+        try:
+            df, _root_to_save = self._save_dataset_root_folder(dataset_name, selected_dir)
+            df.to_csv(self.csv_path, index=False)
+            self._reload_metadata()
+        except Exception as e:
+            messagebox.showerror(
+                "Save Error",
+                "DRIPP found the folder but could not save it to the metadata CSV:\n\n"
+                f"{e}"
+            )
+            return None
+
+        self.base_var.set(selected_dir)
+        return selected_dir
+
     def save_json(self):
         """
         Save the current dataset index and group JSON files.
@@ -142,10 +299,11 @@ class GroupingDebuggerMixin:
         self.strategy_var.set(meta.get('grouping_strategy','regex-file'))
         self.img_ext_var.set(','.join(meta.get('image_file_types',[])))
         self.mask_ext_var.set(','.join(meta.get('mask_file_types',[])))
-        rf = meta.get('root_directory')
-        if not isinstance(rf,str): rf = ''
-        dataset_dir = normalize_path(os.path.join(BASE_UNPROC,name,rf))
+        dataset_dir = self._dataset_dir_from_metadata(name, meta)
         self.base_var.set(dataset_dir)
+        resolved_dir = self._ensure_dataset_dir(name)
+        if resolved_dir:
+            dataset_dir = resolved_dir
         # Resolve folders
         self.train_paths=[]
         self.test_paths=[]
@@ -190,15 +348,6 @@ class GroupingDebuggerMixin:
         new_mask_ext  = self.mask_ext_var.get().strip()
         new_base_full = self.base_var.get().strip()
 
-        # Compute relative root (after "F:/Datasets/")
-        prefix = os.path.normpath("F:/Datasets/").replace("\\","/") + "/"
-        norm_base = os.path.normpath(new_base_full).replace("\\","/")
-        if norm_base.startswith(prefix):
-            rel = norm_base[len(prefix):]
-        else:
-            rel = norm_base
-        rel_to_save = "" if rel == name else rel
-
         try:
             df = pd.read_csv(self.csv_path)
 
@@ -209,13 +358,11 @@ class GroupingDebuggerMixin:
             df.loc[df['Dataset Name'] == name, 'Mask File Type']    = new_mask_ext
 
             # Ensure a 'Root Folder' column exists
-            if 'Root Folder' not in df.columns:
-                df['Root Folder'] = ""
-            df.loc[df['Dataset Name'] == name, 'Root Folder'] = rel_to_save
+            df, root_to_save = self._save_dataset_root_folder(name, new_base_full, df=df)
 
             # Write back and refresh
             df.to_csv(self.csv_path, index=False)
-            self.metadata = load_dataset_metadata(self.csv_path)
+            self._reload_metadata()
             self.original_regex = new_regex
             self.save_btn.state(['disabled'])
 
@@ -225,7 +372,7 @@ class GroupingDebuggerMixin:
                 f" - Grouping Strategy\n"
                 f" - Image File Type\n"
                 f" - Mask File Type\n"
-                f" - Root Folder (rel: '{rel_to_save}')"
+                f" - Root Folder: '{root_to_save}'"
             )
         except Exception as e:
             messagebox.showerror('Save Error', f'Failed to save CSV: {e}')
@@ -241,7 +388,7 @@ class GroupingDebuggerMixin:
             None.
         """
         p=filedialog.askdirectory()
-        if p: self.base_var.set(p)
+        if p: self.base_var.set(normalize_path(p))
 
     def parse_configs(self):
         """
@@ -302,8 +449,14 @@ class GroupingDebuggerMixin:
         # 3) Redirect all helper-logger output into this dataset's own log
         set_indexing_log(INDEX_DIR, dataset_name)
 
-        # 4) Run the central indexing routine
+        # 4) Confirm that indexing will run against an existing folder.
         meta = self.metadata.get(dataset_name, {})
+        dataset_dir = self._ensure_dataset_dir(dataset_name)
+        if not dataset_dir:
+            return
+        meta = self.metadata.get(dataset_name, {})
+
+        # 5) Run the central indexing routine
         result = index_dataset(dataset_name, meta)
         if result is None:
             messagebox.showerror(
@@ -312,9 +465,7 @@ class GroupingDebuggerMixin:
             )
             return
 
-        # 4A) Resolve dataset folder structure
-        root = meta.get('root_directory') or ''
-        dataset_dir = normalize_path(os.path.join(BASE_UNPROC, dataset_name, root))
+        # 5A) Resolve dataset folder structure
         self.train_paths = []
         for fld in meta.get('train_folders', []):
             self.train_paths += resolve_folder(dataset_dir, fld)

@@ -33,8 +33,13 @@ if not main_logger.handlers:
 
     # File handler: logs save to "preprocessor_<date>.log"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs(PREPROCESSING_LOG_DIR, exist_ok=True)
-    log_file_path = os.path.join(PREPROCESSING_LOG_DIR, f"preprocessor_{timestamp}.log")
+    try:
+        os.makedirs(PREPROCESSING_LOG_DIR, exist_ok=True)
+        log_dir = PREPROCESSING_LOG_DIR
+    except OSError:
+        log_dir = os.path.join(os.getcwd(), ".dripp", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
     fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     main_logger.addHandler(fh)
@@ -85,8 +90,8 @@ class Preprocessor:
         self.dataset_name = dataset_name
 
         # File-type constants
-        self.volume_exts = {".dcm", ".dicom", ".nii", ".nii.gz", ".nrrd", ".mhd", ".npy"}
-        self.video_exts = {".avi", ".mp4", ".mov"}
+        self.volume_exts = config.VOLUME_EXTS
+        self.video_exts = config.VIDEO_EXTS
 
         # Modality categories (lowercase)
         self.modalities_3d = {"ct", "mri"}
@@ -1018,7 +1023,7 @@ class Preprocessor:
         """
         Save a processed image (2D slice, video frame, or 3D volume) to disk.
 
-        For 2D and video modes, writes PNGs; for 3D, writes a NIfTI file.
+        Uses configured output formats for 2D images, video frames, and 3D volumes.
 
         Args:
             img (np.ndarray or sitk.Image): Image data to save.
@@ -1033,33 +1038,36 @@ class Preprocessor:
         if mode == '3d':
             # composite_id includes desired suffix (e.g., 'patient_image' or 'patient_modality0')
             sid = self._short_id(composite_id)
+            ext = config.OUTPUT_FORMATS["3d_image"]
             if image_tag is not None:
-                filename = f"{sid}_img{idx:0{3}d}_~{image_tag}~.nii.gz"
+                filename = f"{sid}_img{idx:0{3}d}_~{image_tag}~{ext}"
             else:
-                filename = f"{sid}_img{idx:0{3}d}.nii.gz"
+                filename = f"{sid}_img{idx:0{3}d}{ext}"
             path = os.path.join(out_dir, filename)
             if isinstance(img, sitk.Image):
                 sitk.WriteImage(img, path)
             else:
                 img_np = self.xp.asnumpy(img) if config.GPU_ENABLED else img
                 sitk.WriteImage(sitk.GetImageFromArray(img_np), path)
-            self.dataset_logger.info(f"Saved 3D NIfTI: {filename} to {out_dir}")
+            self.dataset_logger.info(f"Saved 3D image: {filename} to {out_dir}")
             return path
 
-        # 2D or video: save as PNG
+        # 2D or video: save as configured image format
         sid = self._short_id(composite_id)
         token, pad = {
             '2d':    ('img',   3),
             'video': ('frame', 4),
         }[mode]
+        ext = config.OUTPUT_FORMATS["2d_image" if mode == "2d" else "video_frame"]
         if image_tag is not None:
-            filename = f"{sid}_{token}{idx:0{pad}d}_~{image_tag}~.png"
+            filename = f"{sid}_{token}{idx:0{pad}d}_~{image_tag}~{ext}"
         else:
-            filename = f"{sid}_{token}{idx:0{pad}d}.png"
+            filename = f"{sid}_{token}{idx:0{pad}d}{ext}"
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(img)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
-        cv2.imwrite(path, arr8)
+        if not cv2.imwrite(path, arr8):
+            raise IOError(f"OpenCV failed to write image output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 
@@ -1067,7 +1075,7 @@ class Preprocessor:
         """
         Save a processed mask (2D component, video frame, or 3D volume) to disk.
 
-        For 2D and video modes, writes PNGs for each connected component; for 3D, writes a NIfTI file.
+        Uses configured output formats for 2D masks, video masks, and 3D masks.
 
         Args:
             mask (np.ndarray or sitk.Image): Mask data to save.
@@ -1087,34 +1095,37 @@ class Preprocessor:
         if mode == '3d':
             # Composite_id includes desired suffix (e.g., 'patient_mask')
             sid = self._short_id(composite_id)
+            ext = config.OUTPUT_FORMATS["3d_mask"]
             if mask_tag is not None:
-                filename = f"{sid}_img{img_idx:0{3}d}_~{mask_tag}~_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}.nii.gz"
+                filename = f"{sid}_img{img_idx:0{3}d}_~{mask_tag}~_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}{ext}"
             else:
-                filename = f"{sid}_img{img_idx:0{3}d}_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}.nii.gz"
+                filename = f"{sid}_img{img_idx:0{3}d}_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}{ext}"
             path = os.path.join(out_dir, filename)
             if isinstance(mask, sitk.Image):
                 sitk.WriteImage(mask, path)
             else:
-                mask_np = self.xp.asnumpy(mask.astype(self.xp.int32))
+                mask_np = self.xp.asnumpy(mask.astype(self.xp.int32)) if config.GPU_ENABLED else mask.astype(self.xp.int32)
                 sitk.WriteImage(sitk.GetImageFromArray(mask_np), path)
-            self.dataset_logger.info(f"Saved 3D Mask NIfTI: {filename} to {out_dir}")
+            self.dataset_logger.info(f"Saved 3D mask: {filename} to {out_dir}")
             return path
 
-        # 2D or video: save each mask component as PNG
+        # 2D or video: save each mask component as configured image format
         sid = self._short_id(composite_id)
         token, pad = {
             '2d':    ('img',   3),
             'video': ('frame', 4),
         }[mode]
+        ext = config.OUTPUT_FORMATS["2d_mask" if mode == "2d" else "video_mask"]
         # Inject mask tag if provided
         if mask_tag is not None:
-            filename = f"{sid}_{token}{img_idx:0{pad}d}_~{mask_tag}~_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}.png"
+            filename = f"{sid}_{token}{img_idx:0{pad}d}_~{mask_tag}~_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}{ext}"
         else:
-            filename = f"{sid}_{token}{img_idx:0{pad}d}_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}.png"
+            filename = f"{sid}_{token}{img_idx:0{pad}d}_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}{ext}"
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(mask)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
-        cv2.imwrite(path, arr8)
+        if not cv2.imwrite(path, arr8):
+            raise IOError(f"OpenCV failed to write mask output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 

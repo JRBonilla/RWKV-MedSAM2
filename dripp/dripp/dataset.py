@@ -136,9 +136,9 @@ class SegmentationDataset:
         Process each group in the identifiers dictionary by copying and preprocessing the corresponding image and mask files.
 
         For each group, the function extracts and sorts file paths, builds output directories, and calls the preprocess_group method
-        of the preprocessor with the pipeline as the first argument. It then collects all processed image files (PNG) from the image
-        output directory and all processed mask files (either PNG or .nii.gz) from the mask output directory. If preprocess_group
-        returned multiple modality NIfTIs, this function splits the group into separate entries with distinct identifiers.
+        of the preprocessor with the pipeline as the first argument. It then collects all configured processed image and mask
+        output files. If preprocess_group returned multiple modality volumes, this function splits the group into separate entries
+        with distinct identifiers.
 
         Args:
             identifiers (dict): A dictionary with group identifiers as keys and group metadata as values.
@@ -219,12 +219,12 @@ class SegmentationDataset:
             proc_imgs = sorted(
                 os.path.join(img_out_dir, fn)
                 for fn in os.listdir(img_out_dir)
-                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+                if fn.lower().endswith(tuple(config.OUTPUT_EXTS))
             )
             mask_files = sorted(
                 os.path.join(mask_out_dir, fn)
                 for fn in os.listdir(mask_out_dir)
-                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+                if fn.lower().endswith(tuple(config.OUTPUT_EXTS))
             )
             # Pair each mask path with its corresponding class
             proc_masks = [

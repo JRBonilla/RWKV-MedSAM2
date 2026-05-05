@@ -40,10 +40,15 @@ if not logger.handlers:
     logger.addHandler(ch)
     
     # File handler: logs saved to INDEX_DIR/indexing_<timestamp>.log
-    os.makedirs(INDEX_DIR, exist_ok=True)
+    try:
+        os.makedirs(INDEX_DIR, exist_ok=True)
+        log_dir = INDEX_DIR
+    except OSError:
+        log_dir = os.path.join(os.getcwd(), ".dripp", "indexes")
+        os.makedirs(log_dir, exist_ok=True)
     # e.g. indexing_20250520_141305.log
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file_path = os.path.join(INDEX_DIR, f"indexing_{timestamp}.log")
+    log_file_path = os.path.join(log_dir, f"indexing_{timestamp}.log")
     fh = logging.FileHandler(log_file_path)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(fh)

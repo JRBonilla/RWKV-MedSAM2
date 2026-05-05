@@ -1,5 +1,7 @@
 """Preprocessing and group-viewer callbacks for the DRIPP debugger app."""
 
+import dripp.config as config
+
 from .common import *
 
 
@@ -191,13 +193,13 @@ class PreprocessingDebuggerMixin:
                 open=False
             )
 
-            # Pull out the NIfTI paths from preprocessing_metadata
+            # Pull out the processed image paths from preprocessing_metadata
             proc_imgs = entry.get("proc_images", [])
             first_ext = get_extension(proc_imgs[0]).lower() if proc_imgs else ""
 
             # If first_ext is a volumetric extension, treat as 3D; otherwise 2D
-            if first_ext in ['.nii.gz', '.nii', '.mhd', '.nrrd', '.mha', '.img', '.hdr', '.dicom', '.dcm', '.npy']:
-                # Use the single NIfTI under proc_images[0]
+            if first_ext in config.VOLUME_OUTPUT_EXTS:
+                # Use the single volume under proc_images[0]
                 img_nif = proc_imgs[0]
                 raw_masks = entry.get("proc_masks", [])
                 proc_msks = [
@@ -217,7 +219,7 @@ class PreprocessingDebuggerMixin:
                     tags=("images",)
                 )
 
-                # List each mask NIfTI
+                # List each volume mask
                 masks_parent = self.group_tree.insert(
                     vol_iid, "end",
                     text=f"Masks ({len(proc_msks)})",
@@ -378,8 +380,8 @@ class PreprocessingDebuggerMixin:
             proc_imgs = entry.get("proc_images", [])
             first_ext = get_extension(proc_imgs[0]).lower() if proc_imgs else ""
 
-            if first_ext in ['.nii.gz', '.nii', '.mhd', '.nrrd', '.mha', '.img', '.hdr', '.dicom', '.dcm', '.npy']:
-                # 3D-NIfTI mode
+            if first_ext in config.VOLUME_OUTPUT_EXTS:
+                # 3D-volume mode
                 img_iid = self.group_tree.insert(
                     grp_iid, "end",
                     text="Images (1)",
@@ -408,7 +410,7 @@ class PreprocessingDebuggerMixin:
                         tags=("masks",)
                     )
             else:
-                # 2D-PNG fallback (unchanged)
+                # 2D image fallback
                 imgs = entry.get("proc_images", entry.get("images", []))
                 img_iid = self.group_tree.insert(
                     grp_iid, "end",
@@ -484,15 +486,16 @@ class PreprocessingDebuggerMixin:
             if not entry:
                 return
 
-            # 4) If this group has a full-volume NIfTI, switch to 4-view mode
+            # 4) If this group has full-volume outputs, switch to 4-view mode
             img_nii    = entry.get("proc_images")
             raw_masks   = entry.get("proc_masks", [])
             msk_niftis  = [
                 m["path"] if isinstance(m, dict) else m
                 for m in raw_masks
             ]
-            if (get_extension(img_nii[0]).lower() in ['.nii.gz', '.nii', '.mhd', '.nrrd', '.mha', '.img', '.hdr', '.dicom', '.dcm', '.npy']
-                and get_extension(msk_niftis[0]).lower() in ['.nii.gz', '.nii', '.mhd', '.nrrd', '.mha', '.img', '.hdr', '.dicom', '.dcm', '.npy']):
+            if (img_nii and msk_niftis
+                and get_extension(img_nii[0]).lower() in config.VOLUME_OUTPUT_EXTS
+                and get_extension(msk_niftis[0]).lower() in config.VOLUME_OUTPUT_EXTS):
                 self.viewer_canvas.pack_forget()
                 self.nifti_frame.pack(fill="both", expand=True)
                 # Pass the entire list of mask files to _init_nifti_volumes(...)
@@ -503,7 +506,7 @@ class PreprocessingDebuggerMixin:
                 self.mask_file_label.pack_forget()
                 return
 
-            # 5) Otherwise, fall back to the 2D PNG viewer
+            # 5) Otherwise, fall back to the 2D image viewer
             self.nifti_frame.pack_forget()
             self.nifti_msk_list = []
             self.nifti_img = None
@@ -580,7 +583,7 @@ class PreprocessingDebuggerMixin:
                     state="normal" if self.current_mask_index < len(self.nifti_msk_list) - 1 else "disabled"
                 )
         else:
-            # 2D-PNG fallback
+            # 2D image fallback
             if self.current_mask_index > 0:
                 self.current_mask_index -= 1
                 self.render_current_pair()
@@ -611,7 +614,7 @@ class PreprocessingDebuggerMixin:
                     state="normal" if self.current_mask_index < len(self.nifti_msk_list) - 1 else "disabled"
                 )
         else:
-            # 2D-PNG fallback: advance through 2D masks
+            # 2D image fallback: advance through 2D masks
             if self.current_mask_index < len(self.current_masks) - 1:
                 self.current_mask_index += 1
                 self.render_current_pair()
@@ -803,12 +806,12 @@ class PreprocessingDebuggerMixin:
             proc_imgs = sorted(
                 os.path.join(img_out_dir, fn)
                 for fn in os.listdir(img_out_dir)
-                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+                if fn.lower().endswith(tuple(config.OUTPUT_EXTS))
             )
             mask_files = sorted(
                 os.path.join(mask_out_dir, fn)
                 for fn in os.listdir(mask_out_dir)
-                if fn.lower().endswith(".png") or fn.lower().endswith(".nii.gz")
+                if fn.lower().endswith(tuple(config.OUTPUT_EXTS))
             )
             proc_masks = [
                 {"path": p, "class": extract_mask_class(p)}
@@ -820,7 +823,7 @@ class PreprocessingDebuggerMixin:
                 logger.warning(f"Group {key} produced no processed masks. Skipping group.")
                 continue
 
-            # If preprocess_group returned multiple modality NIfTIs, split into separate entries
+            # If preprocess_group returned multiple modality volumes, split into separate entries
             if (isinstance(preprocessing_metadata, dict)
                     and "image_niftis" in preprocessing_metadata
                     and len(preprocessing_metadata["image_niftis"]) > 1):
@@ -833,7 +836,7 @@ class PreprocessingDebuggerMixin:
                         "short_id":         self.preprocessor._short_id(new_id),
                         "images":           entry["images"],
                         "masks":            entry["masks"],  # Original raw-mask paths
-                        "proc_images":      [img_nif],          # Put the NIfTI path here
+                        "proc_images":      [img_nif],          # Put the volume path here
                         "proc_masks":       proc_masks,
                         "preprocessing_metadata": {
                             "resize_shape": preprocessing_metadata.get("resize_shape"),
@@ -874,7 +877,7 @@ class PreprocessingDebuggerMixin:
                     entry_dict["preprocessing_metadata"]["fps"] = preprocessing_metadata["fps"]
                     entry_dict["preprocessing_metadata"]["num_frames"] = preprocessing_metadata["num_frames"]
 
-                # If 3D metadata is present, include volume_shape and NIfTI paths
+                # If 3D metadata is present, include volume_shape and volume paths
                 if isinstance(preprocessing_metadata, dict) and "volume_shape" in preprocessing_metadata:
                     entry_dict["preprocessing_metadata"]["volume_shape"] = preprocessing_metadata["volume_shape"]
 
