@@ -18,7 +18,13 @@ from pathlib import Path
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 
-from .helpers import get_extension, parse_mask_classes, parse_segmentation_tasks, match_mask_class
+from .helpers import (
+    DEFAULT_PREPROCESSING_OPTIONS,
+    get_extension,
+    parse_mask_classes,
+    parse_segmentation_tasks,
+    match_mask_class,
+)
 from .config import PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE, MIN_COMPONENT_SIZE
 
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
@@ -102,12 +108,13 @@ class Preprocessor:
 
         # Background value used for cropping and normalization decisions
         self.background_value = background_value
+        self._active_preprocessing_options = dict(DEFAULT_PREPROCESSING_OPTIONS)
 
         self.main_logger = main_logger
         self.dataset_logger = dataset_logger or main_logger
         self.dataset_logger.info("Preprocessor initialized successfully.")
 
-    def preprocess_group(self, sub_name, pipeline, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, mask_classes):
+    def preprocess_group(self, sub_name, pipeline, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, mask_classes, preprocessing_options=None):
         """
         Dispatch a group of images and masks through the specified preprocessing pipeline.
 
@@ -142,8 +149,12 @@ class Preprocessor:
         key = modality.lower()
         modality_key = key if key in self.modalities_3d.union(self.modalities_2d) else "default"
 
+        options = dict(DEFAULT_PREPROCESSING_OPTIONS)
+        options.update(preprocessing_options or {})
+        self._active_preprocessing_options = options
+
         # Compute unified bounding box over all images
-        group_bbox = self._compute_group_bbox(image_files, pipeline)
+        group_bbox = self._compute_group_bbox(image_files, pipeline, options)
         main_logger.info(f"Group bounding box: {group_bbox}")
 
         # Sort the images and masks for consistency
@@ -160,18 +171,18 @@ class Preprocessor:
             elif pipeline == "3D":
                 main_logger.info(f"Using 3D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
                 metadata = self.preprocess_3d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes
+                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
                 )
             elif pipeline == "2D":
                 main_logger.info(f"Using 2D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
                 metadata = self.preprocess_2d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes
+                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
                 )
             else:
                 main_logger.warning(f"Pipeline either unrecognized or not implemented: {pipeline} with type {type(pipeline)}")
                 main_logger.warning("Defaulting to 2D preprocessing.")
                 metadata = self.preprocess_2d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes
+                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
                 )
         except Exception as e:
             main_logger.error(f"Error in preprocess_group: {e}", exc_info=True)
@@ -188,7 +199,42 @@ class Preprocessor:
             main_logger.info(f"Removed {removed_masks} masks due to no significant components found")
         return metadata
     
-    def preprocess_2d(self, sub_name, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes):
+    def _mask_stem_for_strategy(self, path, strategy):
+        stem = Path(path).stem
+        if strategy == "stem":
+            return stem
+        if strategy == "stem_before_underscore":
+            return stem.split("_")[0]
+        return None
+
+    def _order_mask_series_like_dicom_images(self, image_series, mask_series, preprocessing_options):
+        if (
+            preprocessing_options.get("dicom_sort") != "position"
+            or len(image_series) != len(mask_series)
+        ):
+            return list(mask_series)
+
+        image_exts = [get_extension(p).lower() for p in image_series]
+        if not image_exts or not all(ext in ('.dcm', '.dicom') for ext in image_exts):
+            return list(mask_series)
+
+        def _slice_key(path):
+            ds = pydicom.dcmread(path, stop_before_pixels=True)
+            if hasattr(ds, 'ImagePositionPatient'):
+                return float(ds.ImagePositionPatient[2])
+            return int(getattr(ds, 'InstanceNumber', 0))
+
+        try:
+            order = sorted(range(len(image_series)), key=lambda i: _slice_key(image_series[i]))
+        except Exception as exc:
+            self.dataset_logger.warning(f"Could not align mask series to DICOM image order: {exc}")
+            return list(mask_series)
+
+        if order != list(range(len(image_series))):
+            self.dataset_logger.info("Reordered mask series to match DICOM image position order.")
+        return [mask_series[i] for i in order]
+
+    def preprocess_2d(self, sub_name, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, preprocessing_options=None):
         """
         Preprocess a batch of 2D masks and images using a shared bounding box.
 
@@ -198,12 +244,12 @@ class Preprocessor:
         - Resize to target_size
         - Split multiclass masks into binary masks
         - Split connected components and filter by min_mask_size
-        - Record valid stems for PAIP2019 or e_optha
+        - Record valid stems when configured for unmatched-image filtering
         - Save each component
 
         2. Images:
         - Load image with load_image
-        - Skip images without valid masks for PAIP2019 or e_optha
+        - Optionally skip images without valid masks
         - Crop to group_bbox
         - Normalize intensity (percentile-clip + z-score, use central region if significant crop)
         - Resize to target_size
@@ -230,7 +276,12 @@ class Preprocessor:
             f"Starting 2D batch preprocessing: {len(image_files)} images, {len(mask_files)} masks, modality={modality}"
         )
 
-        # For PAIP2019: collect mask stems that passed the size filter
+        preprocessing_options = preprocessing_options or DEFAULT_PREPROCESSING_OPTIONS
+        mask_stem_strategy = preprocessing_options.get("mask_stem_strategy", "none")
+        save_with_source_stem = bool(preprocessing_options.get("save_2d_masks_with_source_stem"))
+        skip_unmatched_images = bool(preprocessing_options.get("skip_unmatched_2d_images"))
+
+        # Collect mask stems that passed the size filter when configured.
         valid_mask_stems = set()
 
         # 1) Mask loop
@@ -285,32 +336,23 @@ class Preprocessor:
                     self.dataset_logger.warning(f"No significant components found in mask {msk_path}")
                     continue
 
-                # Record stems only for PAIP2019
-                if self.dataset_name == 'PAIP2019':
-                    valid_mask_stems.add(Path(msk_path).stem)
-                elif self.dataset_name == 'e_optha':
-                    if sub_name == 'EX':
-                        valid_mask_stems.add(Path(msk_path).stem.split('_')[0])
-                    elif sub_name == 'MA':
-                        valid_mask_stems.add(Path(msk_path).stem)
+                valid_stem = self._mask_stem_for_strategy(msk_path, mask_stem_strategy)
+                if valid_stem is not None:
+                    valid_mask_stems.add(valid_stem)
 
-                if self.dataset_name == 'QUBIQ2021' and sub_name=='brain-tumor':
-                    for j, comp in enumerate(filtered):
-                        cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
+                for j, comp in enumerate(filtered):
+                    cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
+                    if save_with_source_stem:
                         self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem)
-                        del comp
-                else:
-                    for j, comp in enumerate(filtered):
-                        cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
+                    else:
                         img_idx = self.get_matching_image_idx(composite_id, image_files)
                         self._save_mask(comp, '2d', img_idx, i, j, composite_id, mask_out_dir, cls)
-                        del comp
+                    del comp
                 del filtered, comps, resized_mask, cropped_mask, mask_arr
 
         # 2) Image loop
         for i, img_path in enumerate(tqdm(image_files, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D images...")):
-            # For PAIP2019, skip images without valid masks
-            if self.dataset_name == 'PAIP2019' or self.dataset_name == 'e_optha':
+            if skip_unmatched_images:
                 stem = Path(img_path).stem
                 if stem not in valid_mask_stems:
                     continue
@@ -354,12 +396,12 @@ class Preprocessor:
         )
         return metadata
 
-    def preprocess_3d(self, sub_name, image_series, mask_series, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes):
+    def preprocess_3d(self, sub_name, image_series, mask_series, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, preprocessing_options=None):
         """
         Preprocess a batch of 3D volumes and their masks using a shared bounding box.
 
         1. Load image volume(s) and mask volume(s):
-        - Supports single-file volumes, DICOM series, multi-modality inputs, CHAOS dataset labels, and DICOM-SEG.
+        - Supports single-file volumes, DICOM series, multi-modality inputs, split-label mask series, and DICOM-SEG.
         2. Resample mask volumes to the space of the first image modality.
         3. For each image modality:
         - Crop to group_bbox
@@ -396,6 +438,7 @@ class Preprocessor:
             f"Starting 3D batch preprocessing: {len(image_series)} image slices, "
             f"{len(mask_series) if mask_series else 0} mask files, modality={modality}"
         )
+        preprocessing_options = preprocessing_options or DEFAULT_PREPROCESSING_OPTIONS
 
         # Initialize lists for final outputs
         image_paths = []
@@ -427,10 +470,19 @@ class Preprocessor:
                 image_itk_list.append(mod_itk)
                 image_array_list.append(mod_numpy)
 
-        # CHAOS dataset: separate each label into its own binary volume
-        elif isinstance(mask_series, (list, tuple)) and len(mask_series) > 1 and getattr(self, 'dataset_name', None) == 'CHAOS':
+        # Configured mask series mode: separate each unique label into its own binary volume.
+        elif (
+            isinstance(mask_series, (list, tuple))
+            and len(mask_series) > 1
+            and preprocessing_options.get("mask_series_strategy") == "split_unique_labels"
+        ):
+            ordered_mask_series = self._order_mask_series_like_dicom_images(
+                image_series,
+                mask_series,
+                preprocessing_options,
+            )
             mask_slices = []
-            for mpath in mask_series:
+            for mpath in ordered_mask_series:
                 raw, header = self.load_image(mpath)     # raw grayscale (0–255)
                 mask_slices.append(self.xp.asarray(raw))
             chaos_vol = self.xp.stack(mask_slices, axis=0)
@@ -813,11 +865,8 @@ class Preprocessor:
                         return float(ds.ImagePositionPatient[2])
                     return int(getattr(ds, 'InstanceNumber', 0))
                 
-                # Only sort if LIDC-IDRI
-                if self.dataset_name == 'LIDC-IDRI':
+                if self._active_preprocessing_options.get("dicom_sort") == "position":
                     paths = sorted(paths, key=_slice_key)
-                else:
-                    paths = image_paths
 
                 # Read DICOM series
                 reader = sitk.ImageSeriesReader()
@@ -1052,7 +1101,7 @@ class Preprocessor:
             self.dataset_logger.info(f"Saved 3D image: {filename} to {out_dir}")
             return path
 
-        # 2D or video: save as configured image format
+        # 2D or video: save as configured format
         sid = self._short_id(composite_id)
         token, pad = {
             '2d':    ('img',   3),
@@ -1066,6 +1115,10 @@ class Preprocessor:
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(img)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
+        if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
+            sitk.WriteImage(sitk.GetImageFromArray(arr8), path)
+            self.dataset_logger.info(f"Saved 2D medical image: {filename} to {out_dir}")
+            return path
         if not cv2.imwrite(path, arr8):
             raise IOError(f"OpenCV failed to write image output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
@@ -1109,7 +1162,7 @@ class Preprocessor:
             self.dataset_logger.info(f"Saved 3D mask: {filename} to {out_dir}")
             return path
 
-        # 2D or video: save each mask component as configured image format
+        # 2D or video: save each mask component as configured format
         sid = self._short_id(composite_id)
         token, pad = {
             '2d':    ('img',   3),
@@ -1124,12 +1177,16 @@ class Preprocessor:
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(mask)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
+        if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
+            sitk.WriteImage(sitk.GetImageFromArray(arr8.astype(np.uint8)), path)
+            self.dataset_logger.info(f"Saved 2D medical mask: {filename} to {out_dir}")
+            return path
         if not cv2.imwrite(path, arr8):
             raise IOError(f"OpenCV failed to write mask output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
 
-    def _compute_group_bbox(self, image_paths, pipeline):
+    def _compute_group_bbox(self, image_paths, pipeline, preprocessing_options=None):
         """
         Compute a unified bounding box for a batch of 2D images or 3D volumes.
 
@@ -1141,7 +1198,7 @@ class Preprocessor:
 
         Otherwise (2D):
         - For each image or first frame of video, compute a 2D foreground mask
-        - Map tile coordinates to global coordinates for tiled datasets (e.g. PAIP2019)
+        - Optionally map tile coordinates to global coordinates for tiled datasets
         - Aggregate extents to compute (y0, y1, x0, x1)
         - Set self.is_significant_crop to True if >=25 percent of area is removed
 
@@ -1155,6 +1212,7 @@ class Preprocessor:
                 For 2D: (y0, y1, x0, x1)
         """
         self.dataset_logger.info(f"Computing group bounding box for {len(image_paths)} inputs")
+        preprocessing_options = preprocessing_options or DEFAULT_PREPROCESSING_OPTIONS
         ext0 = get_extension(image_paths[0]).lower()
 
         # 1) 3D volume case (including multi-modality split): NIfTI/NRRD/MHD or multi-file DICOM
@@ -1260,7 +1318,7 @@ class Preprocessor:
                 # Parse the tile's row/col indices from its filename, e.g. "0_10.jpeg"
                 basename = os.path.basename(path)
                 name_no_ext = os.path.splitext(basename)[0]
-                if getattr(self, "dataset_name", "").lower() == "paip2019":
+                if preprocessing_options.get("tile_coordinate_strategy") == "row_col_filename":
                     try:
                         row_str, col_str = name_no_ext.split("_")
                         row_idx, col_idx = int(row_str), int(col_str)

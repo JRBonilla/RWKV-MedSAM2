@@ -92,13 +92,14 @@ The same row is shown as a table first so it is easier to read:
 | `Mask Classes` | `tumor=1\|organ=2` |
 | `Segmentation Tasks` | `segmentation=tumor,organ` |
 | `Background Value` | `0` |
+| `Preprocessing Options` | `{dicom_sort: position}` |
 | `Preprocessed?` | `no` |
 
 Copy-paste CSV version:
 
 ```csv
-Dataset Name,Modality,Image File Type,Mask File Type,Root Folder,Train Folders,Test Folders,Mask Folders,Mask Key,Grouping Strategy,Grouping Regex,Mask Classes,Segmentation Tasks,Background Value,Preprocessed?
-ExampleCT,ct,.nii.gz,.nii.gz,,imagesTr,imagesTs,labelsTr,,regex-file,"images: (?P<id>.+)_0000\.nii\.gz; masks: (?P<id>.+)\.nii\.gz",tumor=1|organ=2,"segmentation=tumor,organ",0,no
+Dataset Name,Modality,Image File Type,Mask File Type,Root Folder,Train Folders,Test Folders,Mask Folders,Mask Key,Grouping Strategy,Grouping Regex,Mask Classes,Segmentation Tasks,Background Value,Preprocessing Options,Preprocessed?
+ExampleCT,ct,.nii.gz,.nii.gz,,imagesTr,imagesTs,labelsTr,,regex-file,"images: (?P<id>.+)_0000\.nii\.gz; masks: (?P<id>.+)\.nii\.gz",tumor=1|organ=2,"segmentation=tumor,organ",0,{dicom_sort: position},no
 ```
 
 ### Column Reference
@@ -121,6 +122,7 @@ Required or strongly recommended columns:
 | `Mask Classes` | Class mapping used to label output masks. Required for indexing to produce groups. |
 | `Segmentation Tasks` | Task mapping such as `task_name=class1,class2`. Required for indexing task metadata. |
 | `Background Value` | Optional integer background label. Defaults to `0`. |
+| `Preprocessing Options` | Optional behavior flags for preprocessing. Blank means defaults. |
 | `Preprocessed?` | Optional status flag. `yes` is treated as preprocessed; anything else is treated as not preprocessed. |
 
 Folder columns support direct relative paths and simple wildcard searches. A
@@ -229,6 +231,49 @@ liver_task=liver,tumor|brain_task=edema,core,enhancing
 
 For a dataset to index cleanly, class names referenced in `Segmentation Tasks`
 should also appear in `Mask Classes`.
+
+## Preprocessing Options
+
+`Preprocessing Options` uses DRIPP-style blocks. A block without a header applies
+to every group in the dataset; a `[subdataset-name]` block applies only to that
+subdataset and overrides dataset-wide values.
+
+```text
+{option: value; option: value}
+[subdataset-name] {option: value; option: value}
+```
+
+Supported options:
+
+| Option | Values |
+| --- | --- |
+| `skip_unmatched_2d_images` | `true`, `false` |
+| `mask_stem_strategy` | `none`, `stem`, `stem_before_underscore` |
+| `save_2d_masks_with_source_stem` | `true`, `false` |
+| `split_processed_images_by_modality` | `true`, `false` |
+| `mask_series_strategy` | `generic`, `split_unique_labels` |
+| `tile_coordinate_strategy` | `none`, `row_col_filename` |
+| `dicom_sort` | `position`, `none` |
+
+Examples:
+
+```text
+{skip_unmatched_2d_images: true; mask_stem_strategy: stem; tile_coordinate_strategy: row_col_filename}
+```
+
+```text
+{skip_unmatched_2d_images: true}
+[EX] {mask_stem_strategy: stem_before_underscore}
+[MA] {mask_stem_strategy: stem}
+```
+
+```text
+[brain-tumor] {save_2d_masks_with_source_stem: true; split_processed_images_by_modality: true}
+```
+
+```text
+{mask_series_strategy: split_unique_labels}
+```
 
 ## Index Datasets
 

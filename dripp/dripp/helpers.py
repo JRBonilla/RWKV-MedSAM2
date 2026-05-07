@@ -22,6 +22,30 @@ if not logger.handlers:
     global_handler.setFormatter(global_formatter)
     logger.addHandler(global_handler)
 
+
+DEFAULT_PREPROCESSING_OPTIONS = {
+    "skip_unmatched_2d_images": False,
+    "mask_stem_strategy": "none",
+    "save_2d_masks_with_source_stem": False,
+    "split_processed_images_by_modality": False,
+    "mask_series_strategy": "generic",
+    "tile_coordinate_strategy": "none",
+    "dicom_sort": "position",
+}
+
+PREPROCESSING_OPTION_CHOICES = {
+    "mask_stem_strategy": {"none", "stem", "stem_before_underscore"},
+    "mask_series_strategy": {"generic", "split_unique_labels"},
+    "tile_coordinate_strategy": {"none", "row_col_filename"},
+    "dicom_sort": {"position", "none"},
+}
+
+PREPROCESSING_BOOL_OPTIONS = {
+    "skip_unmatched_2d_images",
+    "save_2d_masks_with_source_stem",
+    "split_processed_images_by_modality",
+}
+
 def set_indexing_log(index_dir, dataset_name):
     """
     Reconfigure the SegmentationDataset logger so that all regex matching code
@@ -44,6 +68,134 @@ def set_indexing_log(index_dir, dataset_name):
     handler = logging.FileHandler(os.path.join(logs_dir, f"{dataset_name}_indexing.log"))
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(handler)
+
+
+def _find_matching_brace(text, start_index):
+    depth = 1
+    i = start_index + 1
+    while i < len(text) and depth > 0:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        raise ValueError("Unmatched '{' in Preprocessing Options.")
+    return i - 1
+
+
+def _parse_preprocessing_value(key, raw_value):
+    value = raw_value.strip()
+    if key in PREPROCESSING_BOOL_OPTIONS:
+        lowered = value.lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+        raise ValueError(f"Invalid boolean value '{value}' for preprocessing option '{key}'.")
+
+    if key in PREPROCESSING_OPTION_CHOICES:
+        lowered = value.lower()
+        if lowered not in PREPROCESSING_OPTION_CHOICES[key]:
+            allowed = ", ".join(sorted(PREPROCESSING_OPTION_CHOICES[key]))
+            raise ValueError(
+                f"Invalid value '{value}' for preprocessing option '{key}'. "
+                f"Expected one of: {allowed}."
+            )
+        return lowered
+
+    raise ValueError(f"Unknown preprocessing option '{key}'.")
+
+
+def _parse_preprocessing_options_body(body):
+    options = {}
+    if not body.strip():
+        return options
+
+    for item in body.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid preprocessing option '{item}'. Expected 'key: value'.")
+        key, raw_value = item.split(":", 1)
+        key = key.strip().lower()
+        if not key:
+            raise ValueError("Preprocessing option key cannot be blank.")
+        options[key] = _parse_preprocessing_value(key, raw_value)
+    return options
+
+
+def parse_preprocessing_options(raw_options):
+    """
+    Parse the optional CSV Preprocessing Options field.
+
+    Syntax:
+      {option: value; option: value}
+      [subdataset-name] {option: value; option: value}
+    """
+    if raw_options is None or (isinstance(raw_options, float) and pd.isna(raw_options)):
+        return {"global": {}, "subdatasets": {}}
+
+    text = str(raw_options).strip()
+    if not text:
+        return {"global": {}, "subdatasets": {}}
+
+    parsed = {"global": {}, "subdatasets": {}}
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(text):
+            break
+
+        subdataset_name = None
+        if text[pos] == "[":
+            end_header = text.find("]", pos + 1)
+            if end_header == -1:
+                raise ValueError("Unmatched '[' in Preprocessing Options.")
+            subdataset_name = text[pos + 1:end_header].strip()
+            if not subdataset_name:
+                raise ValueError("Subdataset name in Preprocessing Options cannot be blank.")
+            pos = end_header + 1
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+
+        if pos >= len(text) or text[pos] != "{":
+            raise ValueError("Expected '{...}' block in Preprocessing Options.")
+
+        end_body = _find_matching_brace(text, pos)
+        body = text[pos + 1:end_body]
+        block_options = _parse_preprocessing_options_body(body)
+
+        if subdataset_name is None:
+            parsed["global"].update(block_options)
+        else:
+            parsed["subdatasets"].setdefault(subdataset_name, {}).update(block_options)
+
+        pos = end_body + 1
+
+    return parsed
+
+
+def get_preprocessing_options(metadata, subdataset_name=None, include_defaults=False):
+    """
+    Resolve preprocessing options for a dataset/subdataset.
+
+    Global options are applied first; matching subdataset options override them.
+    Defaults are included only when requested, so index artifacts can store just
+    explicitly configured behavior while preprocessing receives full settings.
+    """
+    resolved = dict(DEFAULT_PREPROCESSING_OPTIONS) if include_defaults else {}
+    configured = metadata.get("preprocessing_options") or {}
+    resolved.update(configured.get("global") or {})
+
+    if subdataset_name:
+        sub_opts = (configured.get("subdatasets") or {}).get(str(subdataset_name).strip())
+        if sub_opts:
+            resolved.update(sub_opts)
+
+    return resolved
 
 class SubdatasetConfig:
     """
@@ -129,6 +281,11 @@ def load_dataset_metadata(csv_path):
                               if "Segmentation Tasks" in df.columns and pd.notna(row["Segmentation Tasks"])
                               else None)
         background_value = int(row["Background Value"]) if "Background Value" in df.columns and pd.notna(row["Background Value"]) else 0
+        preprocessing_options = parse_preprocessing_options(
+            row["Preprocessing Options"]
+            if "Preprocessing Options" in df.columns and pd.notna(row["Preprocessing Options"])
+            else None
+        )
 
         metadata[name] = {
             "modalities": [mod.strip() for mod in str(row["Modality"]).split(',')] if pd.notna(row["Modality"]) else [],
@@ -144,7 +301,8 @@ def load_dataset_metadata(csv_path):
             "background_value": background_value,
             "preprocessed": preprocessed_flag,
             "mask_classes": mask_classes,
-            "segmentation_tasks": segmentation_tasks
+            "segmentation_tasks": segmentation_tasks,
+            "preprocessing_options": preprocessing_options
         }
         for dataset, meta in metadata.items():
             for key, value in meta.items():

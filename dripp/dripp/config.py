@@ -23,6 +23,7 @@ SUPPORTED_IMAGE_OUTPUT_EXTS = {
 SUPPORTED_VOLUME_OUTPUT_EXTS = {
     ".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"
 }
+SUPPORTED_2D_OUTPUT_EXTS = SUPPORTED_IMAGE_OUTPUT_EXTS | SUPPORTED_VOLUME_OUTPUT_EXTS
 
 
 CONFIG_FILES_LOADED = []
@@ -129,8 +130,8 @@ VIDEO_EXTS = _ext_set(_CONFIG, "input_extensions", "video")
 VOLUME_EXTS = _ext_set(_CONFIG, "input_extensions", "volume")
 
 OUTPUT_FORMATS = {
-    "2d_image": _output_ext(_CONFIG, "2d_image_format", SUPPORTED_IMAGE_OUTPUT_EXTS),
-    "2d_mask": _output_ext(_CONFIG, "2d_mask_format", SUPPORTED_IMAGE_OUTPUT_EXTS),
+    "2d_image": _output_ext(_CONFIG, "2d_image_format", SUPPORTED_2D_OUTPUT_EXTS),
+    "2d_mask": _output_ext(_CONFIG, "2d_mask_format", SUPPORTED_2D_OUTPUT_EXTS),
     "3d_image": _output_ext(_CONFIG, "3d_image_format", SUPPORTED_VOLUME_OUTPUT_EXTS),
     "3d_mask": _output_ext(_CONFIG, "3d_mask_format", SUPPORTED_VOLUME_OUTPUT_EXTS),
     "video_frame": _output_ext(_CONFIG, "video_frame_format", SUPPORTED_IMAGE_OUTPUT_EXTS),
@@ -224,7 +225,8 @@ video = {_fmt_exts(VIDEO_EXTS)}
 volume = {_fmt_exts(VOLUME_EXTS)}
 
 [output_formats]
-# 2D/video formats: {_fmt_exts(SUPPORTED_IMAGE_OUTPUT_EXTS)}
+# 2D formats: {_fmt_exts(SUPPORTED_2D_OUTPUT_EXTS)}
+# Video formats: {_fmt_exts(SUPPORTED_IMAGE_OUTPUT_EXTS)}
 # 3D formats: {_fmt_exts(SUPPORTED_VOLUME_OUTPUT_EXTS)}
 2d_image_format = {OUTPUT_FORMATS["2d_image"]}
 2d_mask_format = {OUTPUT_FORMATS["2d_mask"]}

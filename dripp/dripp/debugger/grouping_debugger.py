@@ -1,5 +1,10 @@
 """Grouping and regex-debugger callbacks for the DRIPP debugger app."""
 
+import queue
+import threading
+
+from dripp.indexer import GLOBAL_TASKS
+
 from .common import *
 
 
@@ -288,6 +293,8 @@ class GroupingDebuggerMixin:
             None.
         """
         name = self.dataset_var.get()
+        if hasattr(self, "index_selected_btn"):
+            self.index_selected_btn.state(['!disabled'] if name else ['disabled'])
         meta = self.metadata.get(name, {})
         # Load regex
         self.regex_text.delete('1.0', tk.END)
@@ -426,55 +433,28 @@ class GroupingDebuggerMixin:
                     continue
                 self.config_tree.insert(parent, 'end', text=field_name, values=(repr(field_val),))
 
-    def test_regex(self):
-        """
-        Resolve files, build groups, and populate grouping trees.
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
-        # 1) Clear existing entries in all trees
+    def _clear_indexing_trees(self):
         for tree in (self.resolved_tree, self.train_tree, self.test_tree):
             tree.delete(*tree.get_children())
+        self.train_tree.master.config(text="Training Groups")
+        self.test_tree.master.config(text="Testing Groups")
 
-        # 2) Ensure a dataset is selected
-        dataset_name = self.dataset_var.get()
-        if not dataset_name:
-            messagebox.showwarning('Select Dataset', 'Please select a dataset.')
-            return
-
-        # 3) Redirect all helper-logger output into this dataset's own log
-        set_indexing_log(INDEX_DIR, dataset_name)
-
-        # 4) Confirm that indexing will run against an existing folder.
-        meta = self.metadata.get(dataset_name, {})
-        dataset_dir = self._ensure_dataset_dir(dataset_name)
-        if not dataset_dir:
-            return
-        meta = self.metadata.get(dataset_name, {})
-
-        # 5) Run the central indexing routine
-        result = index_dataset(dataset_name, meta)
-        if result is None:
-            messagebox.showerror(
-                'Indexing Error',
-                f'No indexing result for "{dataset_name}".'
-            )
-            return
-
-        # 5A) Resolve dataset folder structure
-        self.train_paths = []
+    def _resolve_indexing_paths(self, dataset_name, meta, dataset_dir):
+        train_paths = []
         for fld in meta.get('train_folders', []):
-            self.train_paths += resolve_folder(dataset_dir, fld)
-        self.test_paths = []
+            train_paths += resolve_folder(dataset_dir, fld)
+        test_paths = []
         for fld in meta.get('test_folders', []):
-            self.test_paths += resolve_folder(dataset_dir, fld)
-        self.mask_paths = resolve_mask_folders(dataset_dir, meta.get('mask_folders', []))
+            test_paths += resolve_folder(dataset_dir, fld)
+        mask_paths = resolve_mask_folders(dataset_dir, meta.get('mask_folders', []))
+        return train_paths, test_paths, mask_paths
 
-        # 5) Warn about any unannotated (no-mask) groups
+    def _display_index_result(self, dataset_name, result, train_paths, test_paths, mask_paths):
+        self._clear_indexing_trees()
+        self.train_paths = train_paths
+        self.test_paths = test_paths
+        self.mask_paths = mask_paths
+
         unannotated = result.get("unannotated_groups", [])
         if unannotated:
             messagebox.showwarning(
@@ -483,51 +463,43 @@ class GroupingDebuggerMixin:
                 + "\n".join(unannotated)
             )
 
-        # 6) Populate the "Resolved" tree with folders _and_ files
         root_id = self.resolved_tree.insert('', 'end', text='Resolved', open=True)
-
-        # 6A) Folders
         fld_id = self.resolved_tree.insert(root_id, 'end', text='Folders', tags=('folder',), open=True)
-        tf_id  = self.resolved_tree.insert(fld_id, 'end',
-                                        text=f'Train Folders ({len(self.train_paths)})',
-                                        tags=('folder',))
+        tf_id = self.resolved_tree.insert(
+            fld_id, 'end',
+            text=f'Train Folders ({len(self.train_paths)})',
+            tags=('folder',)
+        )
         for p in self.train_paths:
             self.resolved_tree.insert(tf_id, 'end', text=p, tags=('folder',))
 
-        tstf_id = self.resolved_tree.insert(fld_id, 'end',
-                                            text=f'Test Folders ({len(self.test_paths)})',
-                                            tags=('folder',))
+        tstf_id = self.resolved_tree.insert(
+            fld_id, 'end',
+            text=f'Test Folders ({len(self.test_paths)})',
+            tags=('folder',)
+        )
         for p in self.test_paths:
             self.resolved_tree.insert(tstf_id, 'end', text=p, tags=('folder',))
 
-        mskf_id = self.resolved_tree.insert(fld_id, 'end',
-                                            text=f'Mask Folders ({len(self.mask_paths)})',
-                                            tags=('folder',))
+        mskf_id = self.resolved_tree.insert(
+            fld_id, 'end',
+            text=f'Mask Folders ({len(self.mask_paths)})',
+            tags=('folder',)
+        )
         for p in self.mask_paths:
             self.resolved_tree.insert(mskf_id, 'end', text=p, tags=('folder',))
 
-        # 6B) Files
         files_id = self.resolved_tree.insert(root_id, 'end', text='Files', open=True)
-        # Images
         all_images = result['images_train'] + result['images_test']
-        imgs_id = self.resolved_tree.insert(
-            files_id, 'end',
-            text=f'Images ({len(all_images)})',
-            tags=('images',)
-        )
+        imgs_id = self.resolved_tree.insert(files_id, 'end', text=f'Images ({len(all_images)})', tags=('images',))
         for rec in all_images:
             self.resolved_tree.insert(imgs_id, 'end', text=rec['path'], tags=('images',))
-        # Masks
+
         masks = result['mask_files']
-        msks_id = self.resolved_tree.insert(
-            files_id, 'end',
-            text=f'Masks ({len(masks)})',
-            tags=('masks',)
-        )
+        msks_id = self.resolved_tree.insert(files_id, 'end', text=f'Masks ({len(masks)})', tags=('masks',))
         for rec in masks:
             self.resolved_tree.insert(msks_id, 'end', text=rec['path'], tags=('masks',))
 
-        # 7) Populate the training and testing group trees
         train_count = test_count = 0
         for group in result['groups']:
             for split, tree in (('train', self.train_tree), ('test', self.test_tree)):
@@ -542,27 +514,196 @@ class GroupingDebuggerMixin:
                         text=subgroup['identifier'],
                         tags=(split, 'error') if not subgroup['masks'] else (split,)
                     )
-                    # Images
-                    img_node = tree.insert(
-                        node, 'end',
-                        text=f"Images ({len(subgroup['images'])})",
-                        tags=('images',)
-                    )
+                    img_node = tree.insert(node, 'end', text=f"Images ({len(subgroup['images'])})", tags=('images',))
                     for r in subgroup['images']:
                         tree.insert(img_node, 'end', text=r['path'], tags=('images',))
-                    # Masks
-                    m_node = tree.insert(
-                        node, 'end',
-                        text=f"Masks ({len(subgroup['masks'])})",
-                        tags=('masks',)
-                    )
+                    m_node = tree.insert(node, 'end', text=f"Masks ({len(subgroup['masks'])})", tags=('masks',))
                     for r in subgroup['masks']:
                         tree.insert(m_node, 'end', text=r['path'], tags=('masks',))
 
-        # 8) Update headers and enable the "Save JSON" button
         self.train_tree.master.config(text=f"Training Groups ({train_count})")
         self.test_tree.master.config(text=f"Testing Groups ({test_count})")
         self.save_json_btn.state(['!disabled'])
+
+    def _open_index_progress_dialog(self, title, total):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.geometry("620x360")
+        win.resizable(True, True)
+
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+        status_var = tk.StringVar(value="Preparing indexing jobs...")
+        ttk.Label(body, textvariable=status_var).pack(anchor="w")
+        progress = ttk.Progressbar(body, mode="determinate", maximum=max(total, 1))
+        progress.pack(fill="x", pady=(8, 8))
+        log = scrolledtext.ScrolledText(body, wrap="word", height=12)
+        log.pack(fill="both", expand=True)
+
+        auto_close_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Close when done",
+            variable=auto_close_var
+        ).pack(anchor="w", pady=(8, 0))
+
+        close_btn = ttk.Button(body, text="Close", command=win.destroy, state="disabled")
+        close_btn.pack(anchor="e", pady=(8, 0))
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        return {
+            "window": win,
+            "status_var": status_var,
+            "progress": progress,
+            "log": log,
+            "auto_close_var": auto_close_var,
+            "close_btn": close_btn,
+        }
+
+    def _set_index_buttons_state(self, enabled):
+        if hasattr(self, "index_all_btn"):
+            self.index_all_btn.state(['!disabled'] if enabled else ['disabled'])
+        if hasattr(self, "index_selected_btn"):
+            selected_enabled = enabled and bool(self.dataset_var.get())
+            self.index_selected_btn.state(['!disabled'] if selected_enabled else ['disabled'])
+
+    def _append_index_progress(self, dialog, message):
+        dialog["log"].insert(tk.END, message + "\n")
+        dialog["log"].see(tk.END)
+
+    def _save_global_tasks_index(self):
+        out_tasks = {
+            task: {
+                "classes": sorted(list(info["classes"])),
+                "datasets": {ds: sorted(list(subs)) for ds, subs in info["datasets"].items()}
+            }
+            for task, info in GLOBAL_TASKS.items()
+        }
+        tasks_folder = os.path.join(INDEX_DIR, "Tasks")
+        os.makedirs(tasks_folder, exist_ok=True)
+        base = os.path.splitext(os.path.basename(self.csv_path))[0]
+        tasks_file = os.path.join(tasks_folder, f"{base}_tasks.json")
+        with open(tasks_file, "w") as tf:
+            json.dump(out_tasks, tf, indent=2)
+        return tasks_file
+
+    def _start_indexing_jobs(self, jobs, title, display_selected_result=False):
+        if not jobs:
+            messagebox.showwarning("No Datasets", "No datasets are available to index.")
+            return
+
+        progress_queue = queue.Queue()
+        dialog = self._open_index_progress_dialog(title, len(jobs))
+        self._set_index_buttons_state(False)
+
+        def worker():
+            completed = succeeded = failed = skipped = 0
+            for dataset_name, meta, dataset_dir in jobs:
+                progress_queue.put(("start", dataset_name))
+                if not dataset_dir:
+                    skipped += 1
+                    completed += 1
+                    progress_queue.put(("skip", dataset_name, "Dataset folder was not found."))
+                    progress_queue.put(("progress", completed))
+                    continue
+                try:
+                    set_indexing_log(INDEX_DIR, dataset_name)
+                    result = index_dataset(dataset_name, meta)
+                    if result is None:
+                        raise RuntimeError("Indexer returned no result.")
+                    paths = self._resolve_indexing_paths(dataset_name, meta, dataset_dir)
+                    succeeded += 1
+                    completed += 1
+                    progress_queue.put(("success", dataset_name, result, paths))
+                except Exception as e:
+                    failed += 1
+                    completed += 1
+                    progress_queue.put(("error", dataset_name, str(e)))
+                progress_queue.put(("progress", completed))
+
+            tasks_file = None
+            if len(jobs) > 1:
+                try:
+                    tasks_file = self._save_global_tasks_index()
+                except Exception as e:
+                    progress_queue.put(("task_error", str(e)))
+            progress_queue.put(("done", succeeded, failed, skipped, tasks_file))
+
+        def poll():
+            try:
+                while True:
+                    item = progress_queue.get_nowait()
+                    kind = item[0]
+                    if kind == "start":
+                        dialog["status_var"].set(f"Indexing {item[1]}...")
+                        self._append_index_progress(dialog, f"Starting {item[1]}")
+                    elif kind == "skip":
+                        self._append_index_progress(dialog, f"Skipped {item[1]}: {item[2]}")
+                    elif kind == "success":
+                        dataset_name, result, paths = item[1], item[2], item[3]
+                        image_count = len(result.get("images_train", [])) + len(result.get("images_test", []))
+                        mask_count = len(result.get("mask_files", []))
+                        group_count = len(result.get("groups", []))
+                        self._append_index_progress(
+                            dialog,
+                            f"Finished {dataset_name}: {image_count} images, {mask_count} masks, {group_count} subdatasets"
+                        )
+                        if display_selected_result:
+                            self._display_index_result(dataset_name, result, *paths)
+                    elif kind == "error":
+                        self._append_index_progress(dialog, f"Failed {item[1]}: {item[2]}")
+                    elif kind == "task_error":
+                        self._append_index_progress(dialog, f"Could not save task index: {item[1]}")
+                    elif kind == "progress":
+                        dialog["progress"]["value"] = item[1]
+                    elif kind == "done":
+                        succeeded, failed, skipped, tasks_file = item[1], item[2], item[3], item[4]
+                        dialog["status_var"].set(f"Done: {succeeded} indexed, {failed} failed, {skipped} skipped.")
+                        if tasks_file:
+                            self._append_index_progress(dialog, f"Saved task index: {tasks_file}")
+                        self._set_index_buttons_state(True)
+                        if dialog["auto_close_var"].get() and dialog["window"].winfo_exists():
+                            dialog["window"].destroy()
+                        else:
+                            dialog["close_btn"].state(['!disabled'])
+                            dialog["window"].protocol("WM_DELETE_WINDOW", dialog["window"].destroy)
+                        return
+            except queue.Empty:
+                pass
+
+            if dialog["window"].winfo_exists():
+                self.root.after(100, poll)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(100, poll)
+
+    def index_selected_dataset(self):
+        self._clear_indexing_trees()
+        dataset_name = self.dataset_var.get()
+        if not dataset_name:
+            messagebox.showwarning('Select Dataset', 'Please select a dataset.')
+            return
+        meta = self.metadata.get(dataset_name, {})
+        dataset_dir = self._ensure_dataset_dir(dataset_name)
+        if not dataset_dir:
+            return
+        meta = self.metadata.get(dataset_name, {})
+        self._start_indexing_jobs(
+            [(dataset_name, meta, dataset_dir)],
+            f"Indexing {dataset_name}",
+            display_selected_result=True,
+        )
+
+    def index_all_datasets(self):
+        jobs = []
+        for dataset_name, meta in self.metadata.items():
+            dataset_dir = self._ensure_dataset_dir(dataset_name, prompt_if_missing=False)
+            jobs.append((dataset_name, meta, dataset_dir))
+        GLOBAL_TASKS.clear()
+        self._start_indexing_jobs(jobs, "Indexing All Datasets")
+
+    def test_regex(self):
+        self.index_selected_dataset()
 
     def _copy_config_value(self):
         """

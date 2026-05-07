@@ -1,6 +1,7 @@
 """CSV viewer/editor callbacks for the DRIPP debugger app."""
 
 import configparser
+import hashlib
 
 from dripp.config import LOCAL_CONFIG_FILENAME
 
@@ -34,6 +35,7 @@ class CsvDebuggerMixin:
         "Mask Classes",
         "Segmentation Tasks",
         "Background Value",
+        "Preprocessing Options",
         "Preprocessed?",
     ]
     MODALITY_COLORS = {
@@ -64,6 +66,28 @@ class CsvDebuggerMixin:
         "single": "#d8f0dc",
         "multiple": "#dceeff",
     }
+    CSV_OPTION_COLORS = [
+        "#6ec6ff",
+        "#63d471",
+        "#ffb347",
+        "#b388ff",
+        "#ff6f91",
+        "#4dd0e1",
+        "#ffd54f",
+        "#82b1ff",
+        "#bcaaa4",
+        "#aed581",
+        "#ff8a80",
+        "#9fa8da",
+        "#80deea",
+        "#ce93d8",
+        "#dce775",
+        "#ffab91",
+        "#66bb6a",
+        "#d7a86e",
+        "#a5d6a7",
+        "#f48fb1",
+    ]
     VOLUME_FILE_TYPES = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd", ".dcm", ".dicom"}
     IMAGE_FILE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
     VIDEO_FILE_TYPES = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
@@ -460,8 +484,6 @@ class CsvDebuggerMixin:
 
         entry = ttk.Entry(self.csv_canvas)
         entry.insert(0, value)
-        entry.select_range(0, tk.END)
-        entry.focus_set()
         window_id = self.csv_canvas.create_window(
             x0,
             y0,
@@ -474,6 +496,25 @@ class CsvDebuggerMixin:
         entry.bind("<Return>", lambda _e: self._commit_csv_edit())
         entry.bind("<FocusOut>", lambda _e: self._commit_csv_edit())
         entry.bind("<Escape>", lambda _e: self._cancel_csv_edit())
+        entry.after_idle(lambda: self._focus_csv_edit_entry(entry))
+        return "break"
+
+    def _focus_csv_edit_entry(self, entry):
+        """
+        Focus the active CSV edit entry after Tk has mapped it into the canvas.
+
+        Args:
+            entry (ttk.Entry): The cell editor widget.
+
+        Returns:
+            None.
+        """
+        if not self.csv_edit_entry or self.csv_edit_entry[0] is not entry:
+            return
+        if not entry.winfo_exists():
+            return
+        entry.focus_set()
+        entry.select_range(0, tk.END)
 
     def _commit_csv_edit(self):
         """
@@ -488,12 +529,14 @@ class CsvDebuggerMixin:
         if not self.csv_edit_entry:
             return
         entry, window_id, row_index, col_index = self.csv_edit_entry
+        self.csv_edit_entry = None
         if row_index < len(self.csv_rows) and col_index < len(self.csv_columns):
             self.csv_rows[row_index] += [""] * (len(self.csv_columns) - len(self.csv_rows[row_index]))
             self.csv_rows[row_index][col_index] = entry.get()
             self.csv_dirty = True
         self.csv_canvas.delete(window_id)
-        self.csv_edit_entry = None
+        if entry.winfo_exists():
+            entry.destroy()
         self._measure_csv_rows()
         self._draw_csv_grid()
 
@@ -509,9 +552,11 @@ class CsvDebuggerMixin:
         """
         if not self.csv_edit_entry:
             return
-        _entry, window_id, _row_index, _col_index = self.csv_edit_entry
-        self.csv_canvas.delete(window_id)
+        entry, window_id, _row_index, _col_index = self.csv_edit_entry
         self.csv_edit_entry = None
+        self.csv_canvas.delete(window_id)
+        if entry.winfo_exists():
+            entry.destroy()
         self._draw_csv_grid()
 
     def _hex_to_rgb(self, color):
@@ -547,10 +592,37 @@ class CsvDebuggerMixin:
     def _split_csv_tokens(self, value):
         return [item.strip().lower() for item in str(value).split(",") if item.strip()]
 
+    def _option_color(self, namespace, value):
+        normalized = str(value).strip().lower()
+        if not normalized:
+            return "#eeeeee"
+        digest = hashlib.sha1(f"{namespace}:{normalized}".encode("utf-8")).digest()
+        index = int.from_bytes(digest[:2], "big") % len(self.CSV_OPTION_COLORS)
+        return self.CSV_OPTION_COLORS[index]
+
     def _modality_color(self, modality_value):
         modalities = self._split_csv_tokens(modality_value) or ["default"]
-        colors = [self.MODALITY_COLORS.get(mod, self.MODALITY_COLORS["default"]) for mod in modalities]
+        colors = [
+            self.MODALITY_COLORS.get(mod, self._option_color("modality", mod))
+            for mod in modalities
+        ]
         return self._mix_colors(colors)
+
+    def _file_type_token_color(self, extension):
+        ext = extension if extension.startswith(".") else f".{extension}"
+        if ext in self.VOLUME_FILE_TYPES:
+            return self.FILE_TYPE_COLORS["volume"]
+        if ext in self.IMAGE_FILE_TYPES:
+            return self.FILE_TYPE_COLORS["image"]
+        if ext in self.VIDEO_FILE_TYPES:
+            return self.FILE_TYPE_COLORS["video"]
+        return self._option_color("file-type", ext)
+
+    def _file_type_color(self, value):
+        extensions = self._split_csv_tokens(value)
+        if not extensions:
+            return self.FILE_TYPE_COLORS["unknown"]
+        return self._mix_colors([self._file_type_token_color(ext) for ext in extensions])
 
     def _file_type_category(self, value):
         extensions = set(self._split_csv_tokens(value))
@@ -593,7 +665,7 @@ class CsvDebuggerMixin:
         if distance is None:
             return "#eeeeee"
         ratio = min(distance / 10.0, 1.0)
-        return self._blend_colors("#d8f0dc", "#ffd6d6", ratio)
+        return self._blend_colors("#3fd35f", "#ff3b30", ratio)
 
     def _csv_cell_color(self, column, values):
         """
@@ -609,8 +681,7 @@ class CsvDebuggerMixin:
         if column == "Modality":
             return self._modality_color(self._value_for_column(self.csv_columns, values, column))
         if column in ("Image File Type", "Mask File Type"):
-            category = self._file_type_category(self._value_for_column(self.csv_columns, values, column))
-            return self.FILE_TYPE_COLORS.get(category, self.FILE_TYPE_COLORS["unknown"])
+            return self._file_type_color(self._value_for_column(self.csv_columns, values, column))
         if column == "Grouping Strategy":
             strategy = self._value_for_column(self.csv_columns, values, column).strip().lower() or "unknown"
             return self.GROUPING_STRATEGY_COLORS.get(strategy, self.GROUPING_STRATEGY_COLORS["unknown"])
@@ -663,8 +734,8 @@ class CsvDebuggerMixin:
         distance_label = "n/a" if distance is None else f"{distance:g}"
 
         self._chip("Modality", modality or "default", self._modality_color(modality))
-        self._chip("Image Types", image_category, self.FILE_TYPE_COLORS.get(image_category, self.FILE_TYPE_COLORS["unknown"]))
-        self._chip("Mask Types", mask_category, self.FILE_TYPE_COLORS.get(mask_category, self.FILE_TYPE_COLORS["unknown"]))
+        self._chip("Image Types", image_category, self._file_type_color(image_types))
+        self._chip("Mask Types", mask_category, self._file_type_color(mask_types))
         self._chip("Strategy", strategy, strategy_color)
         self._chip("Regex", regex_category, self.GROUPING_REGEX_COLORS[regex_category])
         self._chip("Distance", distance_label, self._grouping_distance_color(distance))

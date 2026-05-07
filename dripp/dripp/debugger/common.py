@@ -22,6 +22,7 @@ from dripp.helpers import (
     collect_files,
     extract_mask_class,
     get_composite_identifier,
+    get_preprocessing_options,
     get_extension,
     get_regex_configs,
     load_dataset_metadata,

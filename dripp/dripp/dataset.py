@@ -16,7 +16,8 @@ from .config import (
     BASE_PROC,
     DEFAULT_LOG_LEVEL,
     GROUPS_DIR as INDEX_DIR,
-    GPU_ENABLED
+    GPU_ENABLED,
+    CSV_FILENAME
 )
 from .preprocessor import Preprocessor
 from .helpers import *
@@ -200,6 +201,9 @@ class SegmentationDataset:
 
             # Call preprocess_group with pipeline as first argument
             try:
+                group_options = entry.get("preprocessing_options")
+                if group_options is None:
+                    group_options = get_preprocessing_options(self.metadata, sub_name, include_defaults=False)
                 preprocessing_metadata = self.preprocessor.preprocess_group(
                     sub_name,
                     sub_pipeline,
@@ -209,7 +213,8 @@ class SegmentationDataset:
                     img_out_dir,
                     mask_out_dir,
                     composite_id,
-                    self.mask_classes
+                    self.mask_classes,
+                    group_options
                 )
             except Exception as e:
                 logger.error(f"Error preprocessing group {key}: {e}", exc_info=True)
@@ -258,7 +263,7 @@ class SegmentationDataset:
                         }
                     }
                     grouping_metadata.append(split_entry)
-            elif self.dataset_name == "QUBIQ2021" and sub_name == "brain-tumor":
+            elif group_options.get("split_processed_images_by_modality"):
                 for idx, img in enumerate(proc_imgs):
                     new_id = f"{composite_id}_modality{idx}"
                     entry_dict = {
@@ -426,7 +431,7 @@ class DatasetManager:
             meta["Dataset Name"] = dataset.dataset_name
             updated_data.append(meta)
         df = pd.DataFrame(updated_data)
-        new_csv_path = normalize_path(os.path.join(BASE_PROC, "datasets.csv"))
+        new_csv_path = normalize_path(os.path.join(BASE_PROC, CSV_FILENAME))
         df.to_csv(new_csv_path, index=False)
 
     def export(self, export_path):
@@ -495,7 +500,7 @@ if __name__ == "__main__":
     if not args.preprocess:
         parser.error("Missing required argument: -preprocess")
 
-    csv_path = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
+    csv_path = normalize_path(os.path.join(BASE_UNPROC, CSV_FILENAME))
     manager = DatasetManager(csv_path)
 
     # Run processing

@@ -12,6 +12,8 @@ from .common import *
 from .csv_debugger import CsvDebuggerMixin
 from .grouping_debugger import GroupingDebuggerMixin
 from .preprocessing_debugger import PreprocessingDebuggerMixin
+from .readme_debugger import ReadmeDebuggerMixin
+from .settings_debugger import SettingsDebuggerMixin
 
 class Tooltip:
     """
@@ -70,7 +72,13 @@ class Tooltip:
             self.tipwindow.destroy()
             self.tipwindow = None
 
-class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, PreprocessingDebuggerMixin):
+class PreprocessingDebuggerApp(
+    GroupingDebuggerMixin,
+    CsvDebuggerMixin,
+    PreprocessingDebuggerMixin,
+    SettingsDebuggerMixin,
+    ReadmeDebuggerMixin,
+):
     """
     Run the Tk-based DRIPP grouping and preprocessing debugger.
 
@@ -80,7 +88,7 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, Preproce
     Returns:
         None.
     """
-    def __init__(self, root, csv_path=os.path.join(BASE_UNPROC, CSV_FILENAME)):
+    def __init__(self, root, csv_path=None):
         """
         Initialize the object.
 
@@ -94,6 +102,8 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, Preproce
         self.root = root
         root.title("Dataset Preprocessing Debugger")
         root.geometry("1920x1080")
+        if csv_path is None:
+            csv_path = os.path.join(BASE_UNPROC, CSV_FILENAME)
 
         # Tracks whether we're in batch mode
         self.is_batch = False
@@ -106,15 +116,16 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, Preproce
         self.original_regex = None
 
         # Notebook for tabs
-        self.notebook = ttk.Notebook(root)
+        self._configure_notebook_style()
+        self.notebook = ttk.Notebook(root, style="Dripp.TNotebook")
         self.notebook.pack(fill="both", expand=True)
 
         # Tab 1: CSV editor
         self._build_csv_tab()
 
-        # Tab 2: Regex Tester
+        # Tab 2: Indexing
         self.tab1 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab1, text="Regex Tester")
+        self.notebook.add(self.tab1, text="Indexing")
 
         style = ttk.Style(root)
         def fixed_map(option):
@@ -180,11 +191,15 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, Preproce
         btns = ttk.Frame(self.tab1)
         btns.pack(fill="x", padx=5, pady=5)
         ttk.Button(btns, text="Parse Regex", command=self.parse_configs).pack(side="left", padx=2)
-        ttk.Button(btns, text="Test", command=self.test_regex).pack(side="right", padx=2)
-        ttk.Label(btns, text="Sort:").pack(side="right", padx=(0,5))
+        self.index_all_btn = ttk.Button(btns, text="Index All", command=self.index_all_datasets)
+        self.index_all_btn.pack(side="right", padx=2)
+        self.index_selected_btn = ttk.Button(btns, text="Index Selected", command=self.index_selected_dataset)
+        self.index_selected_btn.pack(side="right", padx=2)
+        self.index_selected_btn.state(['disabled'])
         self.sort_var = tk.StringVar(value="None")
         ttk.Combobox(btns, textvariable=self.sort_var,
                      values=["None", "Subdataset Name", "Identifier"], state="readonly").pack(side="right", padx=2)
+        ttk.Label(btns, text="Sort:").pack(side="right", padx=(0,5))
         self.save_btn = ttk.Button(btns, text="Save Regex", command=self.save_regex)
         self.save_btn.pack(side="right", padx=2)
         self.save_btn.state(['disabled'])
@@ -495,6 +510,41 @@ class PreprocessingDebuggerApp(GroupingDebuggerMixin, CsvDebuggerMixin, Preproce
         self.current_index = 0
         self.current_masks = []
         self.current_mask_index = 0
+
+        # -- Tab 4: Settings -------------------------------------------
+        self._build_settings_tab()
+
+        # -- Tab 5: README ---------------------------------------------
+        self._build_readme_tab()
+
+    def _configure_notebook_style(self):
+        """
+        Make the selected debugger tab stand out from inactive tabs.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        style = ttk.Style(self.root)
+        style.configure("Dripp.TNotebook", tabmargins=(4, 6, 4, 0))
+        style.configure(
+            "Dripp.TNotebook.Tab",
+            padding=(12, 5, 12, 4),
+            font=("TkDefaultFont", 10),
+        )
+        style.map(
+            "Dripp.TNotebook.Tab",
+            padding=[
+                ("selected", (14, 9, 14, 5)),
+                ("!selected", (12, 5, 12, 4)),
+            ],
+            background=[
+                ("selected", "#ffffff"),
+                ("!selected", "#e6e6e6"),
+            ],
+        )
 
     def _add_tree_context_menu(self, tree):
         """

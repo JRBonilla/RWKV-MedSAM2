@@ -135,7 +135,7 @@ class PreprocessingDebuggerMixin:
                 global_stats = None
 
             self.preprocessor = Preprocessor(
-                target_size=(512,512),
+                target_size=config.DEFAULT_TARGET_SIZE,
                 dataset_logger=dataset_logger,
                 global_ct_stats=global_stats,
                 dataset_name=selected,
@@ -143,7 +143,7 @@ class PreprocessingDebuggerMixin:
             )
         else:
             self.preprocessor = Preprocessor(
-                target_size=(512,512),
+                target_size=config.DEFAULT_TARGET_SIZE,
                 dataset_logger=dataset_logger,
                 dataset_name=selected,
                 background_value=meta.get("background_value", 0)
@@ -498,6 +498,7 @@ class PreprocessingDebuggerMixin:
                 and get_extension(msk_niftis[0]).lower() in config.VOLUME_OUTPUT_EXTS):
                 self.viewer_canvas.pack_forget()
                 self.nifti_frame.pack(fill="both", expand=True)
+                self.nifti_frame.update_idletasks()
                 # Pass the entire list of mask files to _init_nifti_volumes(...)
                 self._init_nifti_volumes(img_nii[0], msk_niftis)
                 self.nav_frame.pack_forget()
@@ -787,6 +788,9 @@ class PreprocessingDebuggerMixin:
             os.makedirs(mask_out_dir, exist_ok=True)
 
             try:
+                group_options = entry.get("preprocessing_options")
+                if group_options is None:
+                    group_options = get_preprocessing_options(self.metadata, sub_name, include_defaults=False)
                 preprocessing_metadata = self.preprocessor.preprocess_group(
                     sub_name,
                     sub_pipeline,
@@ -796,7 +800,8 @@ class PreprocessingDebuggerMixin:
                     img_out_dir,
                     mask_out_dir,
                     composite_id,
-                    self.mask_classes
+                    self.mask_classes,
+                    group_options
                 )
             except Exception as e:
                 logger.error(f"Error preprocessing group {key}: {e}", exc_info=True)
@@ -844,7 +849,7 @@ class PreprocessingDebuggerMixin:
                         }
                     }
                     grouping_metadata.append(split_entry)
-            elif self.preproc_dataset_var.get() == "QUBIQ2021" and sub_name == "brain-tumor":
+            elif group_options.get("split_processed_images_by_modality"):
                 for idx, img in enumerate(proc_imgs):
                     new_id = f"{composite_id}_modality{idx}"
                     entry_dict = {
@@ -901,10 +906,6 @@ class PreprocessingDebuggerMixin:
         # Set the batch flag
         self.is_batch = True
         for name in all_names:
-            # Skip PAIP2019. Temporary: Takes too long.
-            if name == "PAIP2019":
-                continue
-
             # Select it in the UI
             self.preproc_dataset_var.set(name)
             # Clear UI and enable Load Preprocessed if needed
@@ -986,10 +987,10 @@ class PreprocessingDebuggerMixin:
         self.current_axis = 'Axial'
         self.current_mask_index = 0  # No single-mask navigation in combined mode
 
-        # Initialize display for each view
-        self.update_nifti_display('Axial',   Z // 2)
-        self.update_nifti_display('Coronal', Y // 2)
-        self.update_nifti_display('Sagittal',X // 2)
+        # Initialize display after Tk has measured the triplanar canvases.
+        self.nifti_frame.update_idletasks()
+        self._refresh_all_nifti_displays()
+        self.root.after_idle(self._refresh_all_nifti_displays)
 
         # Disable mask-prev/next buttons since all masks are shown simultaneously
         self.msk_prev_btn.config(state="disabled")
@@ -1006,14 +1007,27 @@ class PreprocessingDebuggerMixin:
                 self.nifti_frame,
                 text="Show Masks",
                 variable=self.show_masks,
-                command=lambda: self.update_nifti_display(
-                    self.current_axis,
-                    getattr(self, f"{self.current_axis.lower()}_slider").get()
-                )
+                command=self._refresh_all_nifti_displays
             )
             # Place it in the UI, e.g. above sliders
             cb.grid(row=2, column=0, columnspan=2, pady=(5,0))
             self._mask_toggle_cb = cb
+
+    def _refresh_all_nifti_displays(self):
+        """
+        Redraw every triplanar NIfTI view using each view's current slider value.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        for axis in ('Axial', 'Coronal', 'Sagittal'):
+            slider = getattr(self, f"{axis.lower()}_slider", None)
+            if slider is None:
+                continue
+            self.update_nifti_display(axis, slider.get())
 
     def update_nifti_display(self, axis, idx):
         """
@@ -1026,6 +1040,8 @@ class PreprocessingDebuggerMixin:
         Returns:
             None.
         """
+        idx = self._coerce_nifti_slice_index(axis, idx)
+
         # Determine the image slice for the given axis
         if axis == 'Axial':
             slice_img = self.nifti_img[idx, :, :]
@@ -1122,6 +1138,33 @@ class PreprocessingDebuggerMixin:
         cv.create_image(cw // 2, ch // 2, anchor='center', image=tkimg)
         cv.image = tkimg
 
+    def _coerce_nifti_slice_index(self, axis, idx):
+        """
+        Convert a Tk slider value into a valid integer NIfTI slice index.
+
+        Args:
+            axis (Any): View axis name.
+            idx (Any): Raw slice index value.
+
+        Returns:
+            int: Clamped slice index for the requested axis.
+        """
+        if self.nifti_img is None:
+            return 0
+
+        try:
+            idx = int(float(idx))
+        except (TypeError, ValueError):
+            idx = 0
+
+        axis_limits = {
+            'Axial': self.nifti_img.shape[0] - 1,
+            'Coronal': self.nifti_img.shape[1] - 1,
+            'Sagittal': self.nifti_img.shape[2] - 1,
+        }
+        max_idx = axis_limits.get(axis, 0)
+        return max(0, min(idx, max_idx))
+
     def _on_slider_move(self, axis, idx):
         """
         Handle triplanar slice slider movement.
@@ -1133,6 +1176,9 @@ class PreprocessingDebuggerMixin:
         Returns:
             None.
         """
+        idx = self._coerce_nifti_slice_index(axis, idx)
+        self.current_axis = axis
+
         # 1) Update the little value label
         lbl = getattr(self, f"{axis.lower()}_val_label")
         lbl.config(text=str(idx))

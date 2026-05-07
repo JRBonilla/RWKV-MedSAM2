@@ -18,9 +18,10 @@ from .helpers import (
     set_indexing_log,
     get_extension,
     parse_mask_classes,
-    parse_segmentation_tasks
+    parse_segmentation_tasks,
+    get_preprocessing_options
 )
-from .config import BASE_UNPROC, INDEX_DIR, VIDEO_EXTS, VOLUME_EXTS, DEFAULT_LOG_LEVEL
+from .config import BASE_UNPROC, INDEX_DIR, VIDEO_EXTS, VOLUME_EXTS, DEFAULT_LOG_LEVEL, CSV_FILENAME
 
 # Accumulate tasks across all datasets
 # Each entry has the following format:
@@ -154,6 +155,9 @@ def build_groupings(index_data, dataset_dir, metadata):
     # Use a dictionary to accumulate subdataset groups.
     subdatasets = {}  # Keys: subdataset name
 
+    def group_preprocessing_options(sname):
+        return get_preprocessing_options(metadata, sname, include_defaults=False)
+
     def ensure_subdataset(sname, modality):
         """
         Ensure that a subdataset with the given name exists in the subdatasets dictionary.
@@ -208,7 +212,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                         "masks": [],
                         "subdataset_name": sname,
                         "subdataset_modality": modality,
-                        "subdataset_pipeline": pipeline
+                        "subdataset_pipeline": pipeline,
+                        "preprocessing_options": group_preprocessing_options(sname)
                     }
                 group_dict[key]["images"].append({"path": rec["path"], "id": rec["id"]})
                 # do NOT break—allow other subdatasets to match
@@ -231,7 +236,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                     "masks": [],
                     "subdataset_name": sname,
                     "subdataset_modality": modality,
-                    "subdataset_pipeline": pipeline
+                    "subdataset_pipeline": pipeline,
+                    "preprocessing_options": group_preprocessing_options(sname)
                 }
             group_dict[key]["images"].append({"path": rec["path"], "id": rec["id"]})
 
@@ -276,7 +282,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                         "masks": [],
                         "subdataset_name": sname,
                         "subdataset_modality": modality,
-                        "subdataset_pipeline": pipeline
+                        "subdataset_pipeline": pipeline,
+                        "preprocessing_options": group_preprocessing_options(sname)
                     }
                 group_dict[key]["images"].append({"path": rec["path"], "id": rec["id"]})
                 # do NOT break—allow other subdatasets to match
@@ -299,7 +306,8 @@ def build_groupings(index_data, dataset_dir, metadata):
                     "masks": [],
                     "subdataset_name": sname,
                     "subdataset_modality": modality,
-                    "subdataset_pipeline": pipeline
+                    "subdataset_pipeline": pipeline,
+                    "preprocessing_options": group_preprocessing_options(sname)
                 }
             group_dict[key]["images"].append({"path": rec["path"], "id": rec["id"]})
 
@@ -564,6 +572,7 @@ def index_dataset(dataset_name, metadata):
     )
     mask_files = sorted(mask_files, key=lambda x: x["path"])
     index_data["mask_files"] = mask_files
+    index_data["preprocessing_options"] = metadata.get("preprocessing_options", {"global": {}, "subdatasets": {}})
 
     groups = build_groupings(index_data, dataset_dir, metadata)
     index_data["groups"] = groups
@@ -609,7 +618,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load metadata
-    CSV_PATH = normalize_path(os.path.join(BASE_UNPROC, "datasets.csv"))
+    CSV_PATH = normalize_path(os.path.join(BASE_UNPROC, CSV_FILENAME))
     datasets_metadata = load_dataset_metadata(CSV_PATH)
 
     # Run indexing
