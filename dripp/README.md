@@ -378,6 +378,66 @@ groups_dir = ...
 
 If an output format fails validation, use one of the supported extensions above.
 
+## Customize Output Folders
+
+Use the debugger Settings tab to build an output layout from fixed, color-coded
+folder tags. `Dataset` is always the first folder, and the remaining tags can be
+used once, moved, or removed. Image and mask folder names are editable text
+fields with validation. DRIPP stores the chosen tag order in `dripp.ini` as an
+`[output_structure]` template, so advanced users can still inspect or edit the
+saved values directly.
+
+```ini
+[output_structure]
+group_folder_template = {dataset}/{modality}/{subdataset}/{split}/{id_parts}
+images_folder = images
+masks_folder = masks
+```
+
+When editing `dripp.ini` directly, supported folder template tokens are:
+
+```text
+{dataset}, {modality}, {subdataset}, {split}, {id}, {id_parts}
+```
+
+In the debugger, the two ID layout tags are mutually exclusive:
+
+- `ID` (`{id}`): one folder from the matched group id, for example `Patient42_Study7_Slice003`.
+- `ID Parts` (`{id_parts}`): nested folders from the composite id, for example `Patient42/Study7/Slice003`.
+
+`ID Parts` keeps DRIPP's previous behavior by splitting the composite output
+identifier into nested folders and dropping the leading split name. For example,
+`train_Patient42_Study7_Slice003` becomes `Patient42/Study7/Slice003`.
+
+Example custom layout:
+
+```ini
+[output_structure]
+group_folder_template = {dataset}/{split}/{modality}/{id}
+images_folder = imgs
+masks_folder = labels
+```
+
+## Customize Output Filenames
+
+Use the debugger Settings tab to build image and mask filename stems from fixed,
+color-coded filename tags. DRIPP joins the selected tags with the configured
+separator and then appends the selected output extension.
+
+Default filename settings:
+
+```ini
+[output_filenames]
+image_segments = short_id, image_number, source_tag
+mask_segments = short_id, image_number, source_tag, mask_number, class_name, label_value, component_number
+separator = _
+```
+
+Available filename tags include `short_id`, `image_number`, `source_tag`,
+`mask_number`, `class_name`, `label_value`, and `component_number`. Tags that do
+not apply to an output are skipped; for example, `label_value` appears for 3D
+masks but not 2D masks.
+
 ## Backward Compatibility
 
 Existing module commands remain available:

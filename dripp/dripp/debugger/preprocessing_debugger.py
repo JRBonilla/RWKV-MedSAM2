@@ -1,6 +1,7 @@
 """Preprocessing and group-viewer callbacks for the DRIPP debugger app."""
 
 import dripp.config as config
+from dripp.output_structure import render_output_dirs
 
 from .common import *
 
@@ -757,33 +758,24 @@ class PreprocessingDebuggerMixin:
 
             composite_id = get_composite_identifier(entry)
 
-            # Build output dirs
             sub_name = entry.get("subdataset_name") or entry.get("name")
             sub_modality = (entry.get("subdataset_modality")
                             or (self.metadata.get("modalities") or ["default"])[0])
             sub_pipeline = entry.get("subdataset_pipeline")
 
-            # Only use subdataset name if it exists
-            if sub_name:
-                out_dir = os.path.join(self.output_dir,
-                                       sub_modality,
-                                       sub_name,
-                                       entry["split"])
-            else:
-                out_dir = os.path.join(self.output_dir,
-                                       sub_modality,
-                                       entry["split"])
-
-            # If composite_id starts with the split name, drop that prefix so
-            # We don't end up with "train/train/..."
-            id_subfolders = composite_id.split("_")
-            if id_subfolders and id_subfolders[0] == entry["split"]:
-                id_subfolders = id_subfolders[1:]
-
-            out_dir = normalize_path(os.path.join(out_dir, *id_subfolders))
-
-            img_out_dir = os.path.join(out_dir, "images")
-            mask_out_dir = os.path.join(out_dir, "masks")
+            output_dirs = render_output_dirs(
+                config.BASE_PROC,
+                self.preproc_dataset_var.get(),
+                entry,
+                sub_modality,
+                sub_name,
+                composite_id,
+                config.OUTPUT_STRUCTURE["group_folder_template"],
+                config.OUTPUT_STRUCTURE["images_folder"],
+                config.OUTPUT_STRUCTURE["masks_folder"],
+            )
+            img_out_dir = output_dirs["img_out_dir"]
+            mask_out_dir = output_dirs["mask_out_dir"]
             os.makedirs(img_out_dir, exist_ok=True)
             os.makedirs(mask_out_dir, exist_ok=True)
 

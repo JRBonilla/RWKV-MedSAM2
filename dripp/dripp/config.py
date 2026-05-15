@@ -11,6 +11,20 @@ import os
 import re
 from pathlib import Path
 
+from .output_structure import (
+    DEFAULT_GROUP_FOLDER_TEMPLATE,
+    DEFAULT_IMAGES_FOLDER,
+    DEFAULT_MASKS_FOLDER,
+    validate_group_folder_template,
+    validate_leaf_folder,
+)
+from .output_filenames import (
+    DEFAULT_FILENAME_SEPARATOR,
+    DEFAULT_IMAGE_FILENAME_SEGMENTS,
+    DEFAULT_MASK_FILENAME_SEGMENTS,
+    validate_output_filenames,
+)
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "defaults.ini"
@@ -142,6 +156,37 @@ IMAGE_OUTPUT_EXTS = {ext for ext in OUTPUT_EXTS if ext in SUPPORTED_IMAGE_OUTPUT
 VOLUME_OUTPUT_EXTS = {ext for ext in OUTPUT_EXTS if ext in SUPPORTED_VOLUME_OUTPUT_EXTS}
 
 # -------------------------------------------------------------------------------
+# Output folder structure
+# -------------------------------------------------------------------------------
+OUTPUT_STRUCTURE = {
+    "group_folder_template": validate_group_folder_template(
+        _CONFIG.get("output_structure", "group_folder_template", fallback=DEFAULT_GROUP_FOLDER_TEMPLATE)
+    ),
+    "images_folder": validate_leaf_folder(
+        _CONFIG.get("output_structure", "images_folder", fallback=DEFAULT_IMAGES_FOLDER),
+        "Images Folder",
+    ),
+    "masks_folder": validate_leaf_folder(
+        _CONFIG.get("output_structure", "masks_folder", fallback=DEFAULT_MASKS_FOLDER),
+        "Masks Folder",
+    ),
+}
+
+OUTPUT_FILENAMES = validate_output_filenames(
+    _CONFIG.get(
+        "output_filenames",
+        "image_segments",
+        fallback=", ".join(DEFAULT_IMAGE_FILENAME_SEGMENTS),
+    ),
+    _CONFIG.get(
+        "output_filenames",
+        "mask_segments",
+        fallback=", ".join(DEFAULT_MASK_FILENAME_SEGMENTS),
+    ),
+    _CONFIG.get("output_filenames", "separator", fallback=DEFAULT_FILENAME_SEPARATOR),
+)
+
+# -------------------------------------------------------------------------------
 # Regexes
 # -------------------------------------------------------------------------------
 _CLASS_RE = re.compile(r'%([^%]+)%')
@@ -151,7 +196,7 @@ _DIGIT_RE = re.compile(r"^\d+$")
 # -------------------------------------------------------------------------------
 # CLI Defaults
 # -------------------------------------------------------------------------------
-GPU_ENABLED = _CONFIG.getboolean("runtime", "gpu_enabled")
+GPU_ENABLED = _CONFIG.getboolean("runtime", "gpu_enabled", fallback=False)
 
 # -------------------------------------------------------------------------------
 # Logging
@@ -183,6 +228,8 @@ def get_config_summary():
             "volume": sorted(VOLUME_EXTS),
         },
         "output_formats": dict(OUTPUT_FORMATS),
+        "output_structure": dict(OUTPUT_STRUCTURE),
+        "output_filenames": dict(OUTPUT_FILENAMES),
         "runtime": {
             "gpu_enabled": GPU_ENABLED,
         },
@@ -235,8 +282,21 @@ volume = {_fmt_exts(VOLUME_EXTS)}
 video_frame_format = {OUTPUT_FORMATS["video_frame"]}
 video_mask_format = {OUTPUT_FORMATS["video_mask"]}
 
+[output_structure]
+# Supported tokens: {{dataset}}, {{modality}}, {{subdataset}}, {{split}}, {{id}}, {{id_parts}}
+group_folder_template = {OUTPUT_STRUCTURE["group_folder_template"]}
+images_folder = {OUTPUT_STRUCTURE["images_folder"]}
+masks_folder = {OUTPUT_STRUCTURE["masks_folder"]}
+
+[output_filenames]
+# Tags are joined with separator and the configured extension is appended.
+image_segments = {", ".join(OUTPUT_FILENAMES["image_segments"])}
+mask_segments = {", ".join(OUTPUT_FILENAMES["mask_segments"])}
+separator = {OUTPUT_FILENAMES["separator"]}
+
 [runtime]
-gpu_enabled = {str(GPU_ENABLED).lower()}
+# GPU acceleration is not implemented yet.
+# gpu_enabled = false
 
 [logging]
 # Use a standard Python logging level, such as DEBUG, INFO, WARNING, or ERROR.

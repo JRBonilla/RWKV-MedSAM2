@@ -26,6 +26,7 @@ from .helpers import (
     match_mask_class,
 )
 from .config import PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE, MIN_COMPONENT_SIZE
+from .output_filenames import render_image_filename, render_mask_filename
 
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
@@ -83,7 +84,7 @@ class Preprocessor:
         
         # GPU support
         if config.GPU_ENABLED:
-            import cupy as xp
+            import cupy as xp # type: ignore
         else:
             xp = np
         self.xp = xp
@@ -967,7 +968,7 @@ class Preprocessor:
             keys = [k for k in mat if not k.startswith('__')]
             key = 'predicted' if 'predicted' in keys else 'inst_map' if 'inst_map' in keys else keys[0]
             mask = self.xp.rint(mat[key]).astype(self.xp.int32)
-            self.dataset_logger.info(f"  -> .mat key='{key}', shape={data.shape}")
+            self.dataset_logger.info(f"  -> .mat key='{key}', shape={mask.shape}")
             return mask, {}, None
 
         # All other formats via load_image
@@ -1088,10 +1089,15 @@ class Preprocessor:
             # composite_id includes desired suffix (e.g., 'patient_image' or 'patient_modality0')
             sid = self._short_id(composite_id)
             ext = config.OUTPUT_FORMATS["3d_image"]
-            if image_tag is not None:
-                filename = f"{sid}_img{idx:0{3}d}_~{image_tag}~{ext}"
-            else:
-                filename = f"{sid}_img{idx:0{3}d}{ext}"
+            filename = render_image_filename(
+                mode,
+                idx,
+                sid,
+                ext,
+                image_tag,
+                config.OUTPUT_FILENAMES["image_segments"],
+                config.OUTPUT_FILENAMES["separator"],
+            )
             path = os.path.join(out_dir, filename)
             if isinstance(img, sitk.Image):
                 sitk.WriteImage(img, path)
@@ -1103,15 +1109,16 @@ class Preprocessor:
 
         # 2D or video: save as configured format
         sid = self._short_id(composite_id)
-        token, pad = {
-            '2d':    ('img',   3),
-            'video': ('frame', 4),
-        }[mode]
         ext = config.OUTPUT_FORMATS["2d_image" if mode == "2d" else "video_frame"]
-        if image_tag is not None:
-            filename = f"{sid}_{token}{idx:0{pad}d}_~{image_tag}~{ext}"
-        else:
-            filename = f"{sid}_{token}{idx:0{pad}d}{ext}"
+        filename = render_image_filename(
+            mode,
+            idx,
+            sid,
+            ext,
+            image_tag,
+            config.OUTPUT_FILENAMES["image_segments"],
+            config.OUTPUT_FILENAMES["separator"],
+        )
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(img)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
@@ -1149,10 +1156,19 @@ class Preprocessor:
             # Composite_id includes desired suffix (e.g., 'patient_mask')
             sid = self._short_id(composite_id)
             ext = config.OUTPUT_FORMATS["3d_mask"]
-            if mask_tag is not None:
-                filename = f"{sid}_img{img_idx:0{3}d}_~{mask_tag}~_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}{ext}"
-            else:
-                filename = f"{sid}_img{img_idx:0{3}d}_mask{mask_idx:0{3}d}_%{class_tag}%_label{label_value:0{3}d}_comp{comp_idx:0{3}d}{ext}"
+            filename = render_mask_filename(
+                mode,
+                img_idx,
+                mask_idx,
+                comp_idx,
+                sid,
+                ext,
+                class_tag,
+                mask_tag,
+                label_value,
+                config.OUTPUT_FILENAMES["mask_segments"],
+                config.OUTPUT_FILENAMES["separator"],
+            )
             path = os.path.join(out_dir, filename)
             if isinstance(mask, sitk.Image):
                 sitk.WriteImage(mask, path)
@@ -1164,16 +1180,20 @@ class Preprocessor:
 
         # 2D or video: save each mask component as configured format
         sid = self._short_id(composite_id)
-        token, pad = {
-            '2d':    ('img',   3),
-            'video': ('frame', 4),
-        }[mode]
         ext = config.OUTPUT_FORMATS["2d_mask" if mode == "2d" else "video_mask"]
-        # Inject mask tag if provided
-        if mask_tag is not None:
-            filename = f"{sid}_{token}{img_idx:0{pad}d}_~{mask_tag}~_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}{ext}"
-        else:
-            filename = f"{sid}_{token}{img_idx:0{pad}d}_mask{mask_idx:0{pad}d}_%{class_tag}%_comp{comp_idx:0{pad}d}{ext}"
+        filename = render_mask_filename(
+            mode,
+            img_idx,
+            mask_idx,
+            comp_idx,
+            sid,
+            ext,
+            class_tag,
+            mask_tag,
+            None,
+            config.OUTPUT_FILENAMES["mask_segments"],
+            config.OUTPUT_FILENAMES["separator"],
+        )
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(mask)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
