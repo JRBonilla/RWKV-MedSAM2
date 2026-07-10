@@ -320,25 +320,28 @@ class SettingsDebuggerMixin:
         self.output_structure_selected_tokens = []
         self.output_structure_active_token = None
         self.output_structure_token_buttons = {}
-        self.output_structure_selected_chips = {}
+        self.output_structure_tree_iids = {}
 
-        ttk.Label(structure_frame, text="Folder Tags:").grid(row=0, column=0, sticky="nw", padx=6, pady=3)
-        self.output_structure_selected_frame = ttk.Frame(structure_frame)
-        self.output_structure_selected_frame.grid(row=0, column=1, sticky="we", padx=4, pady=3)
-        label, color = "Dataset", "#dbeafe"
-        self.output_structure_dataset_chip = tk.Button(
-            self.output_structure_selected_frame,
-            text=label,
-            background=color,
-            activebackground=color,
-            relief="sunken",
-            borderwidth=2,
-            state="disabled",
+        ttk.Label(structure_frame, text="Folder Hierarchy:").grid(row=0, column=0, sticky="nw", padx=6, pady=3)
+        tree_frame = ttk.Frame(structure_frame)
+        tree_frame.grid(row=0, column=1, sticky="we", padx=4, pady=3)
+        tree_frame.columnconfigure(0, weight=1)
+        self.output_structure_tree = ttk.Treeview(
+            tree_frame,
+            columns=("token",),
+            show="tree",
+            height=7,
+            selectmode="browse",
         )
-        self.output_structure_dataset_chip.grid(row=0, column=0, sticky="w", padx=2, pady=2)
+        self.output_structure_tree.column("#0", width=260, minwidth=180, stretch=True, anchor="w")
+        self.output_structure_tree.grid(row=0, column=0, sticky="we")
+        self.output_structure_tree.bind("<<TreeviewSelect>>", self._on_output_structure_tree_select)
+        self.output_structure_tree.tag_configure("fixed", foreground="#555555")
+        self.output_structure_tree.tag_configure("folder", foreground="#222222")
+        self.output_structure_tree.tag_configure("hint", foreground="#777777")
         self._attach_settings_tooltip(
-            self.output_structure_dataset_chip,
-            self.SETTINGS_OUTPUT_STRUCTURE_TOOLTIPS["{dataset}"],
+            self.output_structure_tree,
+            "Folders are nested from top to bottom. Dataset is always the root folder.",
         )
 
         ttk.Label(structure_frame, text="Add Tag:").grid(row=1, column=0, sticky="nw", padx=6, pady=3)
@@ -996,7 +999,7 @@ class SettingsDebuggerMixin:
 
     def _render_output_structure_tag_builder(self):
         """
-        Refresh selected chips, disabled available tags, and controls.
+        Refresh the folder hierarchy, disabled available tags, and controls.
 
         Args:
             None.
@@ -1004,48 +1007,45 @@ class SettingsDebuggerMixin:
         Returns:
             None.
         """
-        if not hasattr(self, "output_structure_selected_frame"):
+        if not hasattr(self, "output_structure_tree"):
             return
 
-        for child in self.output_structure_selected_frame.winfo_children():
-            child.destroy()
-        self.output_structure_selected_chips = {}
+        tree = self.output_structure_tree
+        tree.delete(*tree.get_children())
+        self.output_structure_tree_iids = {}
 
-        label, color = "Dataset", "#dbeafe"
-        dataset_chip = tk.Button(
-            self.output_structure_selected_frame,
-            text=label,
-            background=color,
-            activebackground=color,
-            relief="sunken",
-            borderwidth=2,
-            state="disabled",
-        )
-        dataset_chip.grid(row=0, column=0, sticky="w", padx=2, pady=2)
-        self._attach_settings_tooltip(
-            dataset_chip,
-            self.SETTINGS_OUTPUT_STRUCTURE_TOOLTIPS["{dataset}"],
+        parent = tree.insert(
+            "",
+            "end",
+            iid="output-structure-dataset",
+            text="Dataset",
+            values=(self.SETTINGS_OUTPUT_STRUCTURE_REQUIRED_PREFIX,),
+            open=True,
+            tags=("fixed",),
         )
 
         for idx, token in enumerate(self.output_structure_selected_tokens):
-            label, color = self._output_structure_token_meta(token)
-            relief = "sunken" if token == self.output_structure_active_token else "raised"
-            chip = tk.Button(
-                self.output_structure_selected_frame,
+            label, _color = self._output_structure_token_meta(token)
+            iid = f"output-structure-folder-{idx}"
+            parent = tree.insert(
+                parent,
+                "end",
+                iid=iid,
                 text=label,
-                background=color,
-                activebackground=color,
-                relief=relief,
-                borderwidth=2,
-                command=lambda t=token: self._select_output_structure_token(t),
+                values=(token,),
+                open=True,
+                tags=("folder",),
             )
-            chip.grid(row=0, column=idx + 1, sticky="w", padx=2, pady=2)
-            self._attach_settings_tooltip(chip, self.SETTINGS_OUTPUT_STRUCTURE_TOOLTIPS[token])
-            self.output_structure_selected_chips[token] = chip
+            self.output_structure_tree_iids[token] = iid
 
         if not self.output_structure_selected_tokens:
-            ttk.Label(self.output_structure_selected_frame, text="Add folders after Dataset.").grid(
-                row=0, column=1, sticky="w", padx=2, pady=2
+            tree.insert(
+                parent,
+                "end",
+                iid="output-structure-empty",
+                text="Add folders after Dataset.",
+                values=("",),
+                tags=("hint",),
             )
 
         used = set(self.output_structure_selected_tokens)
@@ -1056,14 +1056,41 @@ class SettingsDebuggerMixin:
             )
             button.configure(state=("disabled" if disabled else "normal"))
 
+        active_iid = self.output_structure_tree_iids.get(self.output_structure_active_token)
+        if active_iid:
+            tree.selection_set(active_iid)
+            tree.focus(active_iid)
+            tree.see(active_iid)
+        else:
+            tree.selection_remove(tree.selection())
+
+        self._update_output_structure_controls()
+
+    def _on_output_structure_tree_select(self, _event=None):
+        """
+        Select the folder token represented by the active hierarchy row.
+
+        Args:
+            _event (Any): Tk event object.
+
+        Returns:
+            None.
+        """
+        if not hasattr(self, "output_structure_tree"):
+            return
+        selection = self.output_structure_tree.selection()
+        token = None
+        if selection:
+            values = self.output_structure_tree.item(selection[0], "values")
+            if values:
+                candidate = values[0]
+                if candidate in self.output_structure_selected_tokens:
+                    token = candidate
+        self.output_structure_active_token = token
         self._update_output_structure_controls()
 
     def _update_output_structure_controls(self):
         used = set(self.output_structure_selected_tokens)
-        for token, chip in getattr(self, "output_structure_selected_chips", {}).items():
-            relief = "sunken" if token == self.output_structure_active_token else "raised"
-            chip.configure(relief=relief)
-
         active = self.output_structure_active_token
         has_active = active in used
         active_index = self.output_structure_selected_tokens.index(active) if has_active else -1
@@ -1099,7 +1126,7 @@ class SettingsDebuggerMixin:
 
     def _add_output_structure_token(self, token):
         """
-        Add a token chip to the folder layout.
+        Add a token row to the folder hierarchy.
 
         Args:
             token (str): Template token.
@@ -1122,7 +1149,7 @@ class SettingsDebuggerMixin:
 
     def _select_output_structure_token(self, token):
         """
-        Select a tag chip for moving or removal.
+        Select a folder token for moving or removal.
 
         Args:
             token (str): Template token.
