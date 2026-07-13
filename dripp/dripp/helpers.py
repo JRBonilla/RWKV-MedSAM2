@@ -33,6 +33,32 @@ DEFAULT_PREPROCESSING_OPTIONS = {
     "dicom_sort": "position",
 }
 
+
+def normalize_modality_filter(modalities=None):
+    """Return a case-insensitive modality set, or ``None`` for no filtering."""
+
+    if modalities is None:
+        return None
+    if isinstance(modalities, str):
+        modalities = [modalities]
+    normalized = set()
+    for value in modalities:
+        normalized.update(
+            token.strip().casefold()
+            for token in str(value).split(",")
+            if token.strip()
+        )
+    if not normalized or normalized & {"all", "all modalities", "*"}:
+        return None
+    return frozenset(normalized)
+
+
+def modality_is_selected(modality, modalities=None):
+    """Return whether a modality passes an optional normalized filter."""
+
+    selected = normalize_modality_filter(modalities)
+    return selected is None or str(modality).strip().casefold() in selected
+
 PREPROCESSING_OPTION_CHOICES = {
     "mask_stem_strategy": {"none", "stem", "stem_before_underscore"},
     "mask_series_strategy": {"generic", "split_unique_labels"},

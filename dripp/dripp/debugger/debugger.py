@@ -360,6 +360,23 @@ class PreprocessingDebuggerApp(
         ).pack(side="left", padx=(0,10))
         # ---------------------------------------------------
 
+        ttk.Label(self.preproc_controls, text="Modality:").pack(side="left", padx=(5, 2))
+        self.preproc_modality_var = tk.StringVar(value="All modalities")
+        available_modalities = sorted({
+            str(modality).strip()
+            for metadata in self.metadata.values()
+            for modality in metadata.get("modalities", [])
+            if str(modality).strip()
+        }, key=str.casefold)
+        self.preproc_modality_combo = ttk.Combobox(
+            self.preproc_controls,
+            textvariable=self.preproc_modality_var,
+            values=["All modalities"] + available_modalities,
+            state="readonly",
+            width=18,
+        )
+        self.preproc_modality_combo.pack(side="left", padx=(0, 10))
+
         self.preprocess_btn = ttk.Button(
             self.preproc_controls,
             text="Preprocess",

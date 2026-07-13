@@ -5,7 +5,10 @@ import json
 import logging
 import random
 import pickle
+import threading
+import time
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
 from collections import defaultdict
@@ -57,7 +60,7 @@ class SegmentationDataset:
         self.processed_pairs = {"train": 0, "test": 0}
         self.mask_classes = parse_mask_classes(self.metadata.get("mask_classes"))
 
-    def process(self, preprocessor: Preprocessor, max_groups=0):
+    def process(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
         """
         Process the dataset by reorganizing files according to the pre-built groups JSON file.
 
@@ -70,6 +73,7 @@ class SegmentationDataset:
             max_groups (int): Maximum number of groups to process per split (train/test).
         """
         self.preprocessor = preprocessor
+        modality_filter = normalize_modality_filter(modalities)
 
         self.preprocessor.dataset_logger.info(f"Processing dataset '{self.dataset_name}'...")
         self.preprocessor.main_logger.info(f"\nProcessing dataset '{self.dataset_name}'...")
@@ -93,6 +97,8 @@ class SegmentationDataset:
             for sub in subdatasets:
                 sub_name = sub.get("name", "default")
                 sub_modality = sub.get("modality", (self.metadata.get("modalities") or ["default"])[0])
+                if not modality_is_selected(sub_modality, modality_filter):
+                    continue
                 for split in ["train", "test"]:
                     for group in sub.get(split, []):
                         group["subdataset_name"] = sub_name
@@ -120,7 +126,23 @@ class SegmentationDataset:
                 key = (g["identifier"], g["split"], g.get("subdataset_name"))
                 identifiers[key] = g
 
-            grouping_metadata = self._process_grouping_and_copy(identifiers, subdataset_configs, self.preprocessor.dataset_logger)
+            if modality_filter is not None:
+                self.preprocessor.dataset_logger.info(
+                    "Modality filter %s selected %d group(s)",
+                    ", ".join(sorted(modality_filter)), len(identifiers),
+                )
+
+            started = time.perf_counter()
+            grouping_metadata = self._process_grouping_and_copy(
+                identifiers,
+                subdataset_configs,
+                self.preprocessor.dataset_logger,
+                workers=workers,
+            )
+            self.preprocessor.dataset_logger.info(
+                "Processed %d groups with %d worker(s) in %.2f seconds",
+                len(identifiers), workers, time.perf_counter() - started,
+            )
         except Exception as e:
             self.preprocessor.dataset_logger.error(f"Error loading groups file {groups_file}: {e}.")
             return
@@ -135,7 +157,7 @@ class SegmentationDataset:
         with open(grouping_meta_path, "w") as f:
             json.dump(grouping_metadata, f, indent=2)
 
-    def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger):
+    def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger, workers=1):
         """
         Process each group in the identifiers dictionary by copying and preprocessing the corresponding image and mask files.
 
@@ -153,6 +175,38 @@ class SegmentationDataset:
             list: A list of dictionaries, each containing the group identifier, original and processed image and mask file lists,
                   and preprocessing metadata.
         """
+        if workers > 1 and len(identifiers) > 1:
+            thread_state = threading.local()
+
+            def process_one(item):
+                if not hasattr(thread_state, "dataset"):
+                    base = self.preprocessor
+                    worker_preprocessor = Preprocessor(
+                        target_size=base.target_size,
+                        ct_profiles=base.ct_profiles,
+                        min_mask_size=base.min_mask_size,
+                        dataset_logger=logger,
+                        dataset_name=base.dataset_name,
+                        background_value=base.background_value,
+                    )
+                    worker_dataset = SegmentationDataset(self.dataset_name, self.metadata)
+                    worker_dataset.preprocessor = worker_preprocessor
+                    thread_state.dataset = worker_dataset
+
+                key, entry = item
+                started = time.perf_counter()
+                result = thread_state.dataset._process_grouping_and_copy(
+                    {key: entry}, subdataset_configs, logger, workers=1
+                )
+                logger.info("Processed group %s in %.2f seconds", key, time.perf_counter() - started)
+                return result
+
+            grouping_metadata = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dripp-group") as executor:
+                for result in executor.map(process_one, identifiers.items()):
+                    grouping_metadata.extend(result)
+            return grouping_metadata
+
         grouping_metadata = []
         for key, entry in identifiers.items():
             if not entry["images"]:
@@ -322,7 +376,7 @@ class DatasetManager:
         for name, meta in self.metadata.items():
             self.datasets.append(SegmentationDataset(name, meta))
 
-    def process_all(self, start_at=None, max_groups=0):
+    def process_all(self, start_at=None, max_groups=0, workers=1, modalities=None):
         """
         Process all datasets by reorganizing files based on their groups JSON files.
         If start_at is given, skip everything up to (but not including) that dataset.
@@ -339,17 +393,30 @@ class DatasetManager:
             if idx is None:
                 raise ValueError(f"Dataset '{start_at}' not found; cannot resume from it.")
 
+        selected_modalities = normalize_modality_filter(modalities)
+        datasets = self.datasets[idx:]
+        if selected_modalities is not None:
+            datasets = [
+                dataset for dataset in datasets
+                if any(
+                    modality_is_selected(modality, selected_modalities)
+                    for modality in dataset.metadata.get("modalities", [])
+                )
+            ]
+
         for dataset in tqdm(
-            self.datasets[idx:],
+            datasets,
             desc=(f"Processing all datasets from '{start_at}'" if start_at else "Processing all datasets"),
-            total=len(self.datasets),
-            initial=idx
+            total=len(datasets),
         ):
-            self.process_dataset(dataset.dataset_name, max_groups=max_groups)
+            self.process_dataset(
+                dataset.dataset_name, max_groups=max_groups, workers=workers,
+                modalities=selected_modalities,
+            )
 
         self.update_csv()
 
-    def process_dataset(self, dataset_name, max_groups=0):
+    def process_dataset(self, dataset_name, max_groups=0, workers=1, modalities=None):
         """
         Process a single dataset by reorganizing files based on its groups JSON file.
 
@@ -364,6 +431,16 @@ class DatasetManager:
         dataset = next((ds for ds in self.datasets if ds.dataset_name == dataset_name), None)
         if not dataset:
             raise ValueError(f"Dataset '{dataset_name}' not found in metadata")
+        selected_modalities = normalize_modality_filter(modalities)
+        if selected_modalities is not None and not any(
+            modality_is_selected(modality, selected_modalities)
+            for modality in dataset.metadata.get("modalities", [])
+        ):
+            logging.getLogger(f"SegmentationDataset.{dataset_name}").info(
+                "Skipping dataset %s because it has no selected modalities: %s",
+                dataset_name, ", ".join(sorted(selected_modalities)),
+            )
+            return False
 
         # Create and configure a per-dataset logger
         dataset_logger = logging.getLogger(f"SegmentationDataset.{dataset_name}")
@@ -382,7 +459,10 @@ class DatasetManager:
 
         # Load validated subdataset-specific CT profiles if applicable
         meta = dataset.metadata
-        if any(m.lower() == "ct" for m in meta.get("modalities", [])):
+        processing_ct = any(m.lower() == "ct" for m in meta.get("modalities", [])) and (
+            selected_modalities is None or "ct" in selected_modalities
+        )
+        if processing_ct:
             stats_path = os.path.join(CT_STATS_DIR, f"{dataset_name}_ct_stats.json")
             ct_profiles = load_ct_profiles(stats_path, expected_dataset=dataset_name)
             dataset_logger.info("Loaded %d validated CT profile(s) from %s", len(ct_profiles), stats_path)
@@ -403,10 +483,17 @@ class DatasetManager:
             )
 
         # Run the preprocessing for this one dataset
-        dataset.process(preprocessor, max_groups=max_groups)
+        dataset.process(
+            preprocessor, max_groups=max_groups, workers=workers,
+            modalities=selected_modalities,
+        )
+        # Preprocessors contain imported array modules and logger state that cannot be pickled.
+        # The exported manager only needs the completed dataset metadata.
+        dataset.preprocessor = None
 
         # Update the CSV metadata to reflect any changes
         self.update_csv()
+        return True
 
     def update_csv(self):
         """
@@ -478,7 +565,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable GPU acceleration for preprocessing."
     )
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=2,
+        help="Number of concurrent CPU case workers (default: 2)."
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Override the configured preprocessing output directory."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used when --max-groups samples cases (default: 42)."
+    )
+    parser.add_argument(
+        "--modality",
+        action="append",
+        default=[],
+        help="Only preprocess this modality (case-insensitive; repeatable or comma-separated)."
+    )
     args = parser.parse_args()
+
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    random.seed(args.seed)
+    if args.output_dir:
+        BASE_PROC = normalize_path(args.output_dir)
+        config.BASE_PROC = BASE_PROC
+    modality_filter = normalize_modality_filter(args.modality)
 
     # Override the config flag at runtime:
     config.GPU_ENABLED = args.gpu
@@ -495,11 +612,17 @@ if __name__ == "__main__":
         if args.dataset not in manager.metadata:
             print(f"Dataset '{args.dataset}' not found in {csv_path}.")
             sys.exit(1)
-        manager.process_dataset(args.dataset, max_groups=args.max_groups)
+        manager.process_dataset(
+            args.dataset, max_groups=args.max_groups, workers=args.workers,
+            modalities=modality_filter,
+        )
     elif args.all is not None:
         # If args.all == '' then no start name provided, so resume from beginning
         start = args.all or None
-        manager.process_all(start_at=start, max_groups=args.max_groups)
+        manager.process_all(
+            start_at=start, max_groups=args.max_groups, workers=args.workers,
+            modalities=modality_filter,
+        )
     else:
         print("Please specify either --dataset/-d or --all/-a.")
 

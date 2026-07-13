@@ -1688,6 +1688,16 @@ class SettingsDebuggerMixin:
             self.ds_combo["values"] = list(self.metadata.keys())
         if hasattr(self, "preproc_ds_combo"):
             self.preproc_ds_combo["values"] = list(self.metadata.keys())
+        if hasattr(self, "preproc_modality_combo"):
+            available_modalities = sorted({
+                str(modality).strip()
+                for metadata in self.metadata.values()
+                for modality in metadata.get("modalities", [])
+                if str(modality).strip()
+            }, key=str.casefold)
+            self.preproc_modality_combo["values"] = ["All modalities"] + available_modalities
+        if hasattr(self, "preproc_modality_var"):
+            self.preproc_modality_var.set("All modalities")
         if hasattr(self, "dataset_var"):
             self.dataset_var.set("")
         if hasattr(self, "preproc_dataset_var"):

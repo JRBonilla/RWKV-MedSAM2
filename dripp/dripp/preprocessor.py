@@ -132,6 +132,7 @@ class Preprocessor:
         # Background value used for cropping and normalization decisions
         self.background_value = background_value
         self._active_preprocessing_options = dict(DEFAULT_PREPROCESSING_OPTIONS)
+        self._cached_3d_input = None
 
         self.main_logger = main_logger
         self.dataset_logger = dataset_logger or main_logger
@@ -192,6 +193,7 @@ class Preprocessor:
         options = dict(DEFAULT_PREPROCESSING_OPTIONS)
         options.update(preprocessing_options or {})
         self._active_preprocessing_options = options
+        self._cached_3d_input = None
 
         # Compute unified bounding box over all images
         group_bbox = self._compute_group_bbox(image_files, pipeline, options)
@@ -485,7 +487,13 @@ class Preprocessor:
         mask_paths = []
 
         # 1) Load image volume and metadata (SimpleITK image)
-        img_vol, img_itk = self.load_image(image_series)
+        cache_key = tuple(sorted(str(path) for path in image_series))
+        if self._cached_3d_input and self._cached_3d_input[0] == cache_key:
+            img_vol, img_itk = self._cached_3d_input[1], self._cached_3d_input[2]
+            self._cached_3d_input = None
+            self.dataset_logger.debug("Reusing image volume loaded for 3D bounding-box calculation")
+        else:
+            img_vol, img_itk = self.load_image(image_series)
 
         # Prepare lists to hold one or more image ITK volumes and arrays
         image_itk_list = []
@@ -609,8 +617,21 @@ class Preprocessor:
         resampled_mask_itk_list = []
         reference_itk = image_itk_list[0]
         for msk_itk in mask_itk_list:
-            resampled = sitk.Resample(msk_itk, reference_itk, sitk.Transform(), sitk.sitkNearestNeighbor, defaultPixelValue=self.background_value)
-            resampled_mask_itk_list.append(resampled)
+            same_geometry = (
+                msk_itk.GetSize() == reference_itk.GetSize()
+                and np.allclose(msk_itk.GetSpacing(), reference_itk.GetSpacing())
+                and np.allclose(msk_itk.GetOrigin(), reference_itk.GetOrigin())
+                and np.allclose(msk_itk.GetDirection(), reference_itk.GetDirection())
+            )
+            if same_geometry:
+                resampled_mask_itk_list.append(msk_itk)
+                self.dataset_logger.debug("Mask geometry already matches the image; skipping resampling")
+            else:
+                resampled = sitk.Resample(
+                    msk_itk, reference_itk, sitk.Transform(), sitk.sitkNearestNeighbor,
+                    defaultPixelValue=self.background_value,
+                )
+                resampled_mask_itk_list.append(resampled)
 
         # 3) For each modality, crop + resize + save image volume
         z0, z1, y0, y1, x0, x1 = group_bbox
@@ -621,17 +642,33 @@ class Preprocessor:
         for m_idx, (mod_itk, mod_array) in enumerate(zip(image_itk_list, image_array_list)):
             img_crop = mod_array[z0:z1, y0:y1, x0:x1]
 
-            processed_img_slices = []
-            for idx in range(img_crop.shape[0]):
-                slice_img = img_crop[idx]
-                norm_img = self._normalize_intensity(
-                    slice_img, modality,
-                    use_central_region=self.is_significant_crop
+            target_h, target_w = self.target_size
+            img_processed_vol = self.xp.empty(
+                (img_crop.shape[0], target_h, target_w), dtype=self.xp.float32
+            )
+            normalized_ct_volume = None
+            if modality == "ct":
+                profile = self._active_ct_profile
+                if profile is None:
+                    raise CTProfileError("CT volume normalization requires an active subdataset profile")
+                normalized_ct_volume = self.xp.asarray(img_crop, dtype=self.xp.float32)
+                normalized_ct_volume = self.xp.clip(
+                    normalized_ct_volume, profile.window_lower, profile.window_upper
                 )
-                resized_img = self._resize(norm_img, is_mask=False)
-                processed_img_slices.append(resized_img)
+                normalized_ct_volume = self._calculate_zscore(
+                    normalized_ct_volume, profile.mean, profile.std
+                ).astype(self.xp.float32)
 
-            img_processed_vol = self.xp.stack(processed_img_slices, axis=0)
+            for idx in range(img_crop.shape[0]):
+                if normalized_ct_volume is not None:
+                    norm_img = normalized_ct_volume[idx]
+                else:
+                    norm_img = self._normalize_intensity(
+                        img_crop[idx], modality,
+                        use_central_region=self.is_significant_crop
+                    )
+                resized_img = self._resize(norm_img, is_mask=False)
+                img_processed_vol[idx] = resized_img
 
             image_nifti = sitk.GetImageFromArray(self.xp.asnumpy(img_processed_vol) if config.GPU_ENABLED else img_processed_vol)
             new_spacing_img = (
@@ -658,14 +695,14 @@ class Preprocessor:
             mask_crop = mask_array[z0:z1, y0:y1, x0:x1]
 
             # (b) Resize each slice (nearest-neighbor for masks)
-            processed_mask_slices = []
+            target_h, target_w = self.target_size
+            mask_processed_vol = self.xp.empty(
+                (mask_crop.shape[0], target_h, target_w), dtype=self.xp.int32
+            )
             for sidx in range(mask_crop.shape[0]):
                 slice_mask = mask_crop[sidx]
                 resized_mask = self._resize(slice_mask, is_mask=True)
-                processed_mask_slices.append(resized_mask)
-
-            # Keep it as int32 so that labels >1 survive resizing
-            mask_processed_vol = self.xp.stack(processed_mask_slices, axis=0).astype(self.xp.int32)
+                mask_processed_vol[sidx] = resized_mask
 
             # (c) Build a SimpleITK image from the resized mask (either uint8 or int32 may be used;
             # casting to uint8 here is necessary for ConnectedComponent to work as it must be binary,
@@ -1278,22 +1315,25 @@ class Preprocessor:
         if pipeline == "3D":
             # Load_image may return (self.xp.ndarray, itk) or (List[self.xp.ndarray], List[itk])
             vol_data, vol_header = self.load_image(image_paths)
+            self._cached_3d_input = (
+                tuple(sorted(str(path) for path in image_paths)), vol_data, vol_header
+            )
 
             # If load_image returned a list of 3D volumes (i.e., original was multi-modality),
             # collapse foreground across all modalities.
             if isinstance(vol_data, list):
                 # Stack per-modality volumes and compute foreground mask
-                stacked = self.xp.stack([
-                    self.xp.asarray(vol != self.background_value)
-                    for vol in vol_data
-                ], axis=0)  # (M, Z, Y, X)
-                fg_all = self.xp.any(stacked, axis=0)  # (Z, Y, X)
+                fg_all = self.xp.zeros(vol_data[0].shape, dtype=self.xp.bool_)
+                for vol in vol_data:
+                    fg_all |= self.xp.asarray(vol != self.background_value)
                 vol_shape = fg_all.shape  # (Z, Y, X)
                 if not self.xp.any(fg_all):
                     Z, Y, X = vol_shape
                     self.dataset_logger.warning("No foreground found in multi-modality volume; using full extent")
                     return (0, Z, 0, Y, 0, X)
-                zs, ys, xs = self.xp.where(fg_all)
+                z_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(1, 2)))
+                y_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 2)))
+                x_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 1)))
 
             else:
                 # vol_data is a single 3D or 2D array
@@ -1310,7 +1350,9 @@ class Preprocessor:
                         Z, Y, X = vol_shape
                         self.dataset_logger.warning("No foreground found in 4D volume; using full extent")
                         return (0, Z, 0, Y, 0, X)
-                    zs, ys, xs = self.xp.where(fg_all)
+                    z_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(1, 2)))
+                    y_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 2)))
+                    x_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 1)))
 
                 else:
                     # vol.ndim == 3 here
@@ -1320,12 +1362,14 @@ class Preprocessor:
                         Z, Y, X = vol_shape
                         self.dataset_logger.warning("No foreground found in volume; using full extent")
                         return (0, Z, 0, Y, 0, X)
-                    zs, ys, xs = self.xp.where(fg)
+                    z_used = self.xp.flatnonzero(self.xp.any(fg, axis=(1, 2)))
+                    y_used = self.xp.flatnonzero(self.xp.any(fg, axis=(0, 2)))
+                    x_used = self.xp.flatnonzero(self.xp.any(fg, axis=(0, 1)))
 
             # Compute the bounding indices
-            z0, z1 = int(zs.min()), int(zs.max()) + 1
-            y0, y1 = int(ys.min()), int(ys.max()) + 1
-            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            z0, z1 = int(z_used[0]), int(z_used[-1]) + 1
+            y0, y1 = int(y_used[0]), int(y_used[-1]) + 1
+            x0, x1 = int(x_used[0]), int(x_used[-1]) + 1
 
             # Calculate crop significance
             orig_vol = math.prod(vol_shape)
@@ -1448,7 +1492,7 @@ class Preprocessor:
         Returns:
             self.xp.ndarray: Cropped array of the same dimensionality as input.
         """
-        self.dataset_logger.info(f"Cropping array with bbox={bbox}")
+        self.dataset_logger.debug(f"Cropping array with bbox={bbox}")
         r0, r1, c0, c1 = bbox
         return arr[r0:r1, c0:c1]
 
@@ -1477,7 +1521,7 @@ class Preprocessor:
         Returns:
             self.xp.ndarray: Normalized image (float32).
         """
-        self.dataset_logger.info(f"Normalizing intensity image with modality={modality}")
+        self.dataset_logger.debug(f"Normalizing intensity image with modality={modality}")
         img = self.xp.asarray(image).astype(self.xp.float32)
 
         if modality == 'ct':
@@ -1531,7 +1575,7 @@ class Preprocessor:
 
             result = self._calculate_zscore(img, mean, std)
 
-        self.dataset_logger.info(f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}")
+        self.dataset_logger.debug(f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}")
         return result.astype(self.xp.float32)
 
     def _calculate_zscore(self, img, mean, std):
@@ -1568,7 +1612,7 @@ class Preprocessor:
             self.xp.ndarray: Resized array of shape (target_height, target_width) or
                         (target_height, target_width, C) matching input channels.
         """
-        self.dataset_logger.info(f"Resizing to {self.target_size}")
+        self.dataset_logger.debug(f"Resizing to {self.target_size}")
         interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
         target_h, target_w = self.target_size
 

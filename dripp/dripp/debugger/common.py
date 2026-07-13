@@ -26,6 +26,8 @@ from dripp.helpers import (
     get_extension,
     get_regex_configs,
     load_dataset_metadata,
+    modality_is_selected,
+    normalize_modality_filter,
     normalize_path,
     parse_mask_classes,
     resolve_folder,

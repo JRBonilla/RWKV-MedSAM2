@@ -37,6 +37,7 @@ class PreprocessingDebuggerMixin:
         # 2) Load manager & metadata
         manager = DatasetManager(self.csv_path)
         meta = manager.metadata[selected]
+        modality_filter = normalize_modality_filter(self.preproc_modality_var.get())
 
         self.mask_classes = parse_mask_classes(meta.get("mask_classes") or "")
 
@@ -61,6 +62,8 @@ class PreprocessingDebuggerMixin:
             sub_name = sub.get("name", "default")
             sub_modality = sub.get("modality",
                                    (meta.get("modalities") or ["default"])[0])
+            if not modality_is_selected(sub_modality, modality_filter):
+                continue
             for split in ("train", "test"):
                 for grp in sub.get(split, []):
                     grp["subdataset_name"] = sub_name
@@ -92,6 +95,14 @@ class PreprocessingDebuggerMixin:
             (g["identifier"], g["split"], g.get("subdataset_name")): g
             for g in flat_groups
         }
+        if not identifiers:
+            if not self.is_batch:
+                requested = self.preproc_modality_var.get()
+                messagebox.showwarning(
+                    "No Matching Groups",
+                    f"Dataset '{selected}' has no groups matching modality '{requested}'.",
+                )
+            return
 
         # 8) Hook up both the Preprocessor's main_logger and this dataset_logger
         # First, clear the widget
@@ -115,8 +126,9 @@ class PreprocessingDebuggerMixin:
         if not any(isinstance(h, TextHandler) for h in pre_logger.handlers):
             pre_logger.addHandler(pre_handler)
 
-        dataset_logger.info(f"Processing dataset '{selected}'...")
-        pre_logger.info(f"\nProcessing dataset '{selected}'...")
+        modality_label = self.preproc_modality_var.get()
+        dataset_logger.info("Processing dataset '%s' with modality filter '%s'...", selected, modality_label)
+        pre_logger.info(f"\nProcessing dataset '{selected}' with modality filter '{modality_label}'...")
 
         # 8.5) Mirror SegmentationDataset: grab its output_dir & preprocessor
         # Find the actual dataset object to re-use its output_dir
@@ -125,7 +137,11 @@ class PreprocessingDebuggerMixin:
         self.output_dir = dataset_obj.output_dir
 
         # CT-aware preprocessor: load per-dataset CT stats if modality includes CT
-        if any(m.lower() == "ct" for m in meta.get("modalities", [])):
+        processing_ct = any(
+            str(group.get("subdataset_modality", "")).lower() == "ct"
+            for group in identifiers.values()
+        )
+        if processing_ct:
             stats_path = os.path.join(CT_STATS_DIR, f"{selected}_ct_stats.json")
             ct_profiles = load_ct_profiles(stats_path, expected_dataset=selected)
             dataset_logger.info("Loaded %d validated CT profile(s) from %s", len(ct_profiles), stats_path)
@@ -280,7 +296,8 @@ class PreprocessingDebuggerMixin:
             messagebox.showinfo(
                 "Preprocessing Complete",
                 f"Preprocessed {processed_groups} group{'s' if processed_groups != 1 else ''} "
-                f"for dataset '{selected}'.\nDropped {dropped_groups} group{'s' if dropped_groups != 1 else ''}."
+                f"for dataset '{selected}' using modality filter '{modality_label}'.\n"
+                f"Dropped {dropped_groups} group{'s' if dropped_groups != 1 else ''}."
             )
 
     def on_preproc_dataset_select(self, event):
@@ -909,7 +926,10 @@ class PreprocessingDebuggerMixin:
         # Final refresh of the Load Preprocessed button for whichever is selected now
         self.is_batch = False
         self.update_load_preproc_button()
-        messagebox.showinfo("Done", "All datasets have been preprocessed.")
+        messagebox.showinfo(
+            "Done",
+            f"All datasets matching modality '{self.preproc_modality_var.get()}' have been preprocessed.",
+        )
 
     def _init_nifti_volumes(self, img_path, msk_paths):
         """
