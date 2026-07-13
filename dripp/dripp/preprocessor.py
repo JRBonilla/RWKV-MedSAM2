@@ -27,6 +27,7 @@ from .helpers import (
 )
 from .config import PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE, MIN_COMPONENT_SIZE
 from .output_filenames import render_image_filename, render_mask_filename
+from .ct_profiles import CTProfile, CTProfileError, select_ct_profile
 
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
@@ -40,14 +41,16 @@ if not main_logger.handlers:
 
     # File handler: logs save to "preprocessor_<date>.log"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = PREPROCESSING_LOG_DIR
     try:
-        os.makedirs(PREPROCESSING_LOG_DIR, exist_ok=True)
-        log_dir = PREPROCESSING_LOG_DIR
+        os.makedirs(log_dir, exist_ok=True)
+        log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
+        fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
     except OSError:
         log_dir = os.path.join(os.getcwd(), ".dripp", "logs")
         os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
-    fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
+        log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
+        fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     main_logger.addHandler(fh)
 
@@ -67,14 +70,15 @@ class Preprocessor:
       - Ensure 3-channel output for grayscale inputs
       - Split multi-class masks into binary components and filter small regions
     """
-    def __init__(self, target_size=DEFAULT_TARGET_SIZE, ct_window=None, global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE, dataset_logger=None, dataset_name=None, background_value=0):
+    def __init__(self, target_size=DEFAULT_TARGET_SIZE, ct_profiles=None, ct_window=None, global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE, dataset_logger=None, dataset_name=None, background_value=0):
         """
         Initialize the Preprocessor.
 
         Args:
             target_size (tuple, optional): (width, height) for in-plane resizing. Defaults to (1024, 1024).
-            ct_window (tuple, optional): (window_width, window_level) for CT intensity windowing. Defaults to None.
-            global_ct_stats (tuple, optional): (mean, std) for CT z-score across the dataset. Defaults to None.
+            ct_profiles (mapping, optional): Validated schema-v2 profiles keyed by CT subdataset.
+            ct_window/global_ct_stats: Legacy fixed parameters retained for compatibility. Both
+                must be supplied together; schema-v2 profiles are preferred.
             min_mask_size (int, optional): Minimum pixel area for keeping a mask component. Defaults to 100.
             dataset_logger (logging.Logger, optional): Logger for dataset-specific logging. Defaults to main logger.
             dataset_name (str, optional): Name of the dataset. Defaults to None.
@@ -91,8 +95,26 @@ class Preprocessor:
 
         # Core configuration
         self.target_size = target_size
-        self.ct_window = ct_window
-        self.global_ct_mean, self.global_ct_std = global_ct_stats or (None, None)
+        self.ct_profiles = dict(ct_profiles or {})
+        self._active_ct_profile = None
+        if ct_window is not None or global_ct_stats is not None:
+            if ct_window is None or global_ct_stats is None:
+                raise CTProfileError(
+                    "Legacy CT configuration requires both ct_window and global_ct_stats; "
+                    "prefer validated schema-v2 ct_profiles"
+                )
+            else:
+                width, level = map(float, ct_window)
+                mean, std = map(float, global_ct_stats)
+                self._legacy_ct_profile = CTProfile(
+                    name="default", intensity_space="hu",
+                    window_lower=level - width / 2.0,
+                    window_upper=level + width / 2.0,
+                    mean=mean, std=std, count=1,
+                    source_image_count=1, failed_image_count=0,
+                )
+        else:
+            self._legacy_ct_profile = None
         self.min_mask_size = min_mask_size
         self.dataset_name = dataset_name
 
@@ -149,6 +171,23 @@ class Preprocessor:
         self.dataset_logger.info(f"DEBUG: modality is {modality!r} of type {type(modality)}")
         key = modality.lower()
         modality_key = key if key in self.modalities_3d.union(self.modalities_2d) else "default"
+
+        if modality_key == "ct":
+            if self.ct_profiles:
+                self._active_ct_profile = select_ct_profile(self.ct_profiles, sub_name)
+            elif self._legacy_ct_profile is not None:
+                self._active_ct_profile = self._legacy_ct_profile
+            else:
+                raise CTProfileError(
+                    f"CT preprocessing for {self.dataset_name!r}/{sub_name!r} requires a complete schema-v2 profile"
+                )
+            profile = self._active_ct_profile
+            self.dataset_logger.info(
+                "Selected CT profile %s: window=[%.4f, %.4f], mean=%.4f, std=%.4f",
+                profile.name, profile.window_lower, profile.window_upper, profile.mean, profile.std,
+            )
+        else:
+            self._active_ct_profile = None
 
         options = dict(DEFAULT_PREPROCESSING_OPTIONS)
         options.update(preprocessing_options or {})
@@ -1418,10 +1457,8 @@ class Preprocessor:
         Normalize image intensities according to modality-specific rules.
 
         CT:
-            - Apply windowing (if ct_window set)
-            - Identify foreground voxels (> background_value)
-            - Clip to 0.5-99.5 percentile of foreground
-            - Z-score using global CT mean/std (fallback to per-image if None)
+            - Apply the active subdataset's fixed window
+            - Z-score using that window's fixed global mean/std
 
         MRI/X-ray/Ultrasound/etc.:
             - Clip to 0.5-99.5 percentile of full image
@@ -1444,35 +1481,11 @@ class Preprocessor:
         img = self.xp.asarray(image).astype(self.xp.float32)
 
         if modality == 'ct':
-            # CT-specific path
-            # Windowing, if provided
-            if self.ct_window is not None:
-                window_width, window_level = self.ct_window
-                lower = window_level - window_width // 2.0
-                upper = window_level + window_width // 2.0
-                img = self.xp.clip(img, lower, upper)
-
-            # Foreground mask for clipping
-            fg_mask = img > self.background_value
-
-            # Percentile-based clipping on foreground
-            if self.xp.any(fg_mask):
-                lower = self.xp.percentile(img[fg_mask], 0.5)
-                upper = self.xp.percentile(img[fg_mask], 99.5)
-                img = self.xp.clip(img, lower, upper)
-
-            # Global z-score normalization (fallback to per-image if None)
-            if self.global_ct_mean is not None and self.global_ct_std is not None:
-                mean = self.global_ct_mean
-                std = self.global_ct_std
-            else:
-                if self.xp.any(fg_mask):
-                    mean = img[fg_mask].mean()
-                    std = img[fg_mask].std()
-                else:
-                    mean = img.mean()
-                    std = img.std()
-
+            profile = self._active_ct_profile
+            if profile is None:
+                raise CTProfileError("CT normalization was called without selecting a subdataset profile")
+            img = self.xp.clip(img, profile.window_lower, profile.window_upper)
+            mean, std = profile.mean, profile.std
             result = self._calculate_zscore(img, mean, std)
         elif modality in self.modalities_2d or modality == "mri":
             # MRI, X-ray, ultrasound, etc.

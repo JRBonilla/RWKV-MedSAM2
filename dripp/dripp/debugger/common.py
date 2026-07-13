@@ -16,7 +16,7 @@ import pandas as pd
 import SimpleITK as sitk
 from PIL import Image, ImageTk
 
-from dripp.config import BASE_UNPROC, CSV_FILENAME, INDEX_DIR
+from dripp.config import BASE_UNPROC, CSV_FILENAME, INDEX_DIR, CT_STATS_DIR
 from dripp.dataset import DatasetManager
 from dripp.helpers import (
     collect_files,

@@ -124,6 +124,7 @@ BASE_UNPROC = _CONFIG.get("paths", "base_unproc")
 BASE_PROC = _CONFIG.get("paths", "base_proc")
 GROUPS_DIR = _CONFIG.get("paths", "groups_dir")
 INDEX_DIR = _CONFIG.get("paths", "index_dir")
+CT_STATS_DIR = _CONFIG.get("paths", "ct_stats_dir", fallback=os.path.join(INDEX_DIR, "CTStats_v2"))
 CSV_FILENAME = _CONFIG.get("paths", "csv_filename")
 
 # -------------------------------------------------------------------------------
@@ -216,6 +217,7 @@ def get_config_summary():
             "base_proc": BASE_PROC,
             "groups_dir": GROUPS_DIR,
             "index_dir": INDEX_DIR,
+            "ct_stats_dir": CT_STATS_DIR,
             "csv_filename": CSV_FILENAME,
         },
         "preprocessing": {
@@ -256,6 +258,7 @@ base_proc = {BASE_PROC}
 # Indexes, grouping JSON, CT stats, logs, and task summaries live here.
 groups_dir = {GROUPS_DIR}
 index_dir = {INDEX_DIR}
+ct_stats_dir = {CT_STATS_DIR}
 csv_filename = {CSV_FILENAME}
 
 [preprocessing]

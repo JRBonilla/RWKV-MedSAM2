@@ -15,11 +15,13 @@ from .config import (
     BASE_UNPROC,
     BASE_PROC,
     DEFAULT_LOG_LEVEL,
-    GROUPS_DIR as INDEX_DIR,
+    GROUPS_DIR,
+    CT_STATS_DIR,
     GPU_ENABLED,
     CSV_FILENAME
 )
 from .preprocessor import Preprocessor
+from .ct_profiles import load_ct_profiles
 from .helpers import *
 from .output_structure import render_output_dirs
 
@@ -76,7 +78,7 @@ class SegmentationDataset:
         subdataset_configs = get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
 
         # Load the groups JSON file instead of the full index file.
-        groups_file = os.path.join(INDEX_DIR, f"{self.dataset_name}_groups.json")
+        groups_file = os.path.join(GROUPS_DIR, f"{self.dataset_name}_groups.json")
         try:
             with open(groups_file, "r") as f:
                 groups_data = json.load(f)
@@ -378,25 +380,17 @@ class DatasetManager:
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
             dataset_logger.addHandler(fh)
 
-        # Load global CT stats if applicable
+        # Load validated subdataset-specific CT profiles if applicable
         meta = dataset.metadata
-        global_ct_stats = None
         if any(m.lower() == "ct" for m in meta.get("modalities", [])):
-            stats_path = os.path.join(INDEX_DIR, "CTStats", f"{dataset_name}_ct_stats.json")
-            try:
-                with open(stats_path, "r") as sf:
-                    stats = json.load(sf)
-                global_ct_stats = (stats["mean"], stats["std"])
-                dataset_logger.info(
-                    f"Loaded CT stats: mean={global_ct_stats[0]:.4f}, std={global_ct_stats[1]:.4f}"
-                )
-            except Exception as e:
-                dataset_logger.warning(f"Could not load CT stats from {stats_path}: {e}")
+            stats_path = os.path.join(CT_STATS_DIR, f"{dataset_name}_ct_stats.json")
+            ct_profiles = load_ct_profiles(stats_path, expected_dataset=dataset_name)
+            dataset_logger.info("Loaded %d validated CT profile(s) from %s", len(ct_profiles), stats_path)
 
             preprocessor = Preprocessor(
                 target_size=(512, 512),
                 dataset_logger=dataset_logger,
-                global_ct_stats=global_ct_stats,
+                ct_profiles=ct_profiles,
                 dataset_name=dataset_name,
                 background_value=meta.get("background_value", 0)
             )

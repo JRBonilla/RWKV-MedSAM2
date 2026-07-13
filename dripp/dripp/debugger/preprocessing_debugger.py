@@ -2,6 +2,7 @@
 
 import dripp.config as config
 from dripp.output_structure import render_output_dirs
+from dripp.ct_profiles import load_ct_profiles
 
 from .common import *
 
@@ -125,20 +126,14 @@ class PreprocessingDebuggerMixin:
 
         # CT-aware preprocessor: load per-dataset CT stats if modality includes CT
         if any(m.lower() == "ct" for m in meta.get("modalities", [])):
-            stats_path = os.path.join(INDEX_DIR, "CTStats", f"{selected}_ct_stats.json")
-            try:
-                with open(stats_path, "r") as sf:
-                    ct_stats = json.load(sf)
-                global_stats = (ct_stats["mean"], ct_stats["std"])
-                dataset_logger.info(f"Loaded CT stats: mean={global_stats[0]:.4f}, std={global_stats[1]:.4f}")
-            except Exception as e:
-                dataset_logger.warning(f"Could not load CT stats from {stats_path}: {e}")
-                global_stats = None
+            stats_path = os.path.join(CT_STATS_DIR, f"{selected}_ct_stats.json")
+            ct_profiles = load_ct_profiles(stats_path, expected_dataset=selected)
+            dataset_logger.info("Loaded %d validated CT profile(s) from %s", len(ct_profiles), stats_path)
 
             self.preprocessor = Preprocessor(
                 target_size=config.DEFAULT_TARGET_SIZE,
                 dataset_logger=dataset_logger,
-                global_ct_stats=global_stats,
+                ct_profiles=ct_profiles,
                 dataset_name=selected,
                 background_value=meta.get("background_value", 0)
             )
