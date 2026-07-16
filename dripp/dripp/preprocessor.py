@@ -64,7 +64,8 @@ class Preprocessor:
 
     Common steps:
       - CT: windowing + global z-score normalization
-      - MRI / X-ray / Ultrasound / etc.: percentile clipping + per-image (or central region) z-score
+      - MRI: per-volume percentile clipping + foreground z-score for 3D inputs
+      - X-ray / Ultrasound / etc.: percentile clipping + per-image (or central region) z-score
       - Crop to non-zero region (flag if >= 25% removed)
       - Resize in-plane to target size
       - Ensure 3-channel output for grayscale inputs
@@ -406,17 +407,29 @@ class Preprocessor:
             if image_arr.ndim == 3 and isinstance(header, sitk.Image):
                 vol = image_arr
                 n_slices = vol.shape[0]
-                for z in range(n_slices):
-                    slice_img = vol[z]
-                    cropped_img = self._crop(slice_img, group_bbox)
-                    norm_img = self._normalize_intensity(
-                        cropped_img, modality, use_central_region=self.is_significant_crop
+                normalized_mri_volume = None
+                if modality == "mri":
+                    r0, r1, c0, c1 = group_bbox
+                    normalized_mri_volume = self._normalize_mri_volume(
+                        vol[:, r0:r1, c0:c1]
                     )
+                for z in range(n_slices):
+                    if normalized_mri_volume is not None:
+                        norm_img = normalized_mri_volume[z]
+                        cropped_img = None
+                    else:
+                        slice_img = vol[z]
+                        cropped_img = self._crop(slice_img, group_bbox)
+                        norm_img = self._normalize_intensity(
+                            cropped_img, modality, use_central_region=self.is_significant_crop
+                        )
                     resized_img = self._resize(norm_img, is_mask=False)
                     final_img = self._ensure_three_channels(resized_img)
 
                     self._save_image(final_img, '2d', 0, composite_id, img_out_dir, f"modality{z}")
                     del final_img, resized_img, norm_img, cropped_img
+                if normalized_mri_volume is not None:
+                    del normalized_mri_volume
                 del vol
 
             # Truly 2D image case
@@ -447,7 +460,7 @@ class Preprocessor:
         2. Resample mask volumes to the space of the first image modality.
         3. For each image modality:
         - Crop to group_bbox
-        - Normalize intensities per slice
+        - Normalize MRI intensities once per volume/channel; resize all modalities per slice
         - Resize to target_size
         - Save as NIfTI
         4. For each resampled mask volume:
@@ -646,22 +659,24 @@ class Preprocessor:
             img_processed_vol = self.xp.empty(
                 (img_crop.shape[0], target_h, target_w), dtype=self.xp.float32
             )
-            normalized_ct_volume = None
+            normalized_volume = None
             if modality == "ct":
                 profile = self._active_ct_profile
                 if profile is None:
                     raise CTProfileError("CT volume normalization requires an active subdataset profile")
-                normalized_ct_volume = self.xp.asarray(img_crop, dtype=self.xp.float32)
-                normalized_ct_volume = self.xp.clip(
-                    normalized_ct_volume, profile.window_lower, profile.window_upper
+                normalized_volume = self.xp.asarray(img_crop, dtype=self.xp.float32)
+                normalized_volume = self.xp.clip(
+                    normalized_volume, profile.window_lower, profile.window_upper
                 )
-                normalized_ct_volume = self._calculate_zscore(
-                    normalized_ct_volume, profile.mean, profile.std
+                normalized_volume = self._calculate_zscore(
+                    normalized_volume, profile.mean, profile.std
                 ).astype(self.xp.float32)
+            elif modality == "mri":
+                normalized_volume = self._normalize_mri_volume(img_crop)
 
             for idx in range(img_crop.shape[0]):
-                if normalized_ct_volume is not None:
-                    norm_img = normalized_ct_volume[idx]
+                if normalized_volume is not None:
+                    norm_img = normalized_volume[idx]
                 else:
                     norm_img = self._normalize_intensity(
                         img_crop[idx], modality,
@@ -687,6 +702,8 @@ class Preprocessor:
 
             img_path = self._save_image(image_nifti, '3d', m_idx, composite_id, img_out_dir, f"modality{m_idx}")
             image_paths.append(img_path)
+            if normalized_volume is not None:
+                del normalized_volume
 
         # 4) Process each resampled mask: crop, resize, split components or labels, save
         for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 3D masks")):
@@ -1202,7 +1219,12 @@ class Preprocessor:
             sitk.WriteImage(sitk.GetImageFromArray(arr8), path)
             self.dataset_logger.info(f"Saved 2D medical image: {filename} to {out_dir}")
             return path
-        if not cv2.imwrite(path, arr8):
+        # DRIPP keeps color images in RGB order (PIL convention). OpenCV expects
+        # BGR when writing raster images, so convert only at this boundary.
+        raster_arr = cv2.cvtColor(arr8, cv2.COLOR_RGB2BGR) if (
+            arr8.ndim == 3 and arr8.shape[2] == 3
+        ) else arr8
+        if not cv2.imwrite(path, raster_arr):
             raise IOError(f"OpenCV failed to write image output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return path
@@ -1504,7 +1526,7 @@ class Preprocessor:
             - Apply the active subdataset's fixed window
             - Z-score using that window's fixed global mean/std
 
-        MRI/X-ray/Ultrasound/etc.:
+        2D MRI/X-ray/Ultrasound/etc.:
             - Clip to 0.5-99.5 percentile of full image
             - Compute mean/std over central non-zero region if significant_crop, else full image
             - Z-score
@@ -1576,6 +1598,38 @@ class Preprocessor:
             result = self._calculate_zscore(img, mean, std)
 
         self.dataset_logger.debug(f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}")
+        return result.astype(self.xp.float32)
+
+    def _normalize_mri_volume(self, volume):
+        """Normalize one cropped 3D MRI channel using fixed volume-wide statistics.
+
+        Foreground percentiles and z-score statistics are calculated once for the
+        complete channel. Background and non-finite voxels remain zero so padding
+        does not become an artificial negative signal after normalization.
+        """
+        img = self.xp.asarray(volume, dtype=self.xp.float32)
+        finite = self.xp.isfinite(img)
+        foreground = finite & (img != self.background_value)
+        result = self.xp.zeros_like(img, dtype=self.xp.float32)
+
+        if not self.xp.any(foreground):
+            self.dataset_logger.warning(
+                "MRI volume contains no finite foreground voxels; returning zeros"
+            )
+            return result
+
+        values = img[foreground]
+        lower, upper = self.xp.percentile(values, (0.5, 99.5))
+        clipped_values = self.xp.clip(values, lower, upper)
+        mean = clipped_values.mean()
+        std = clipped_values.std()
+        result[foreground] = self._calculate_zscore(clipped_values, mean, std)
+        result = self.xp.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.dataset_logger.debug(
+            "Normalized MRI volume with window=[%.3f, %.3f], mean=%.3f, std=%.3f",
+            float(lower), float(upper), float(mean), float(std),
+        )
         return result.astype(self.xp.float32)
 
     def _calculate_zscore(self, img, mean, std):
