@@ -5,4 +5,8 @@ rwkv-medsam2.tar
 *.log
 *.zip
 dripp/dripp.egg-info
-__pycache__
+__pycache__/
+*.py[cod]
+diagnostic_outputs/
+diagnostic_external_video_outputs/
+.vscode/settings.json

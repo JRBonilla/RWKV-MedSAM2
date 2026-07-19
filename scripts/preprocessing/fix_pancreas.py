@@ -5,7 +5,7 @@ import SimpleITK as sitk
 
 # CONSTANTS
 # Base directory containing the original QUBIQ2021 subdatasets
-# BASE_DIR = r"F:\Datasets\QUBIQ2021\training_data_v3_QC"
+# BASE_DIR = r"/data/research/QUBIQ2021/training_data_v3_QC"
 BASE_DIR = r"/data/research/QUBIQ2021/training_data_v3_QC"
 # Subdatasets to process
 SUBDATASETS = [

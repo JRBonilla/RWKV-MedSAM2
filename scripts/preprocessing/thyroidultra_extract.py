@@ -8,8 +8,8 @@ import cv2
 import matplotlib.pyplot as plt
 
 # Path to the ThyroidUltra dataset
-# HDF5_PATH  = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
-# OUTPUT_DIR = "F:/Datasets/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
+# HDF5_PATH  = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
+# OUTPUT_DIR = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
 HDF5_PATH  = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/dataset.hdf5"
 OUTPUT_DIR = "/data/research/ThyroidUltra/thyroidultrasoundcineclip/extracted_ThyroidUltra/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)

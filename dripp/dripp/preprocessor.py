@@ -31,6 +31,29 @@ from .ct_profiles import CTProfile, CTProfileError, select_ct_profile
 
 sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
+
+def _dicom_slice_key_from_dataset(dataset):
+    """Return a slice-order key projected onto the DICOM acquisition normal."""
+    instance_number = int(getattr(dataset, "InstanceNumber", 0))
+    try:
+        orientation = np.asarray(dataset.ImageOrientationPatient, dtype=np.float64)
+        position = np.asarray(dataset.ImagePositionPatient, dtype=np.float64)
+        if orientation.size != 6 or position.size != 3:
+            raise ValueError("invalid DICOM orientation or position length")
+        slice_normal = np.cross(orientation[:3], orientation[3:])
+        normal_length = np.linalg.norm(slice_normal)
+        if normal_length <= np.finfo(np.float64).eps:
+            raise ValueError("degenerate DICOM slice normal")
+        projection = float(np.dot(position, slice_normal / normal_length))
+        return (0, projection, instance_number)
+    except (AttributeError, TypeError, ValueError):
+        return (1, instance_number, instance_number)
+
+
+def _dicom_slice_key(path):
+    dataset = pydicom.dcmread(path, stop_before_pixels=True)
+    return _dicom_slice_key_from_dataset(dataset)
+
 # Configure logger
 main_logger = logging.getLogger("Preprocessor")
 main_logger.setLevel(DEFAULT_LOG_LEVEL)
@@ -87,11 +110,36 @@ class Preprocessor:
         """
         main_logger.info(f"Initializing Preprocessor: target_size={target_size}, ct_window={ct_window}, global_ct_stats={global_ct_stats}, min_mask_size={min_mask_size}, gpu_enabled={config.GPU_ENABLED}")
         
-        # GPU support
+        # Select the backend only after runtime configuration/CLI parsing.
         if config.GPU_ENABLED:
-            import cupy as xp # type: ignore
+            try:
+                import cupy as xp  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPU preprocessing was requested, but CuPy is not installed. "
+                    "Install DRIPP with the 'gpu' extra or install a CUDA-compatible CuPy build."
+                ) from exc
+            try:
+                device_count = xp.cuda.runtime.getDeviceCount()
+                if device_count < 1:
+                    raise RuntimeError("CuPy did not detect any CUDA devices")
+                device = xp.cuda.Device(0)
+                device.use()
+                probe = xp.zeros(1, dtype=xp.float32)
+                del probe
+                xp.cuda.Stream.null.synchronize()
+                properties = xp.cuda.runtime.getDeviceProperties(0)
+                device_name = properties["name"]
+                if isinstance(device_name, bytes):
+                    device_name = device_name.decode("utf-8", errors="replace")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"GPU preprocessing was requested, but CUDA initialization failed: {exc}"
+                ) from exc
+            main_logger.info("Selected array backend CuPy on CUDA device 0: %s", device_name)
         else:
             xp = np
+            main_logger.info("Selected array backend NumPy")
         self.xp = xp
 
         # Core configuration
@@ -261,14 +309,8 @@ class Preprocessor:
         if not image_exts or not all(ext in ('.dcm', '.dicom') for ext in image_exts):
             return list(mask_series)
 
-        def _slice_key(path):
-            ds = pydicom.dcmread(path, stop_before_pixels=True)
-            if hasattr(ds, 'ImagePositionPatient'):
-                return float(ds.ImagePositionPatient[2])
-            return int(getattr(ds, 'InstanceNumber', 0))
-
         try:
-            order = sorted(range(len(image_series)), key=lambda i: _slice_key(image_series[i]))
+            order = sorted(range(len(image_series)), key=lambda i: _dicom_slice_key(image_series[i]))
         except Exception as exc:
             self.dataset_logger.warning(f"Could not align mask series to DICOM image order: {exc}")
             return list(mask_series)
@@ -521,12 +563,12 @@ class Preprocessor:
             msk_vol, msk_itk, _ = self.load_mask(mask_series)
             if msk_vol.ndim == 2:
                 msk_vol = msk_vol[self.xp.newaxis, ...]
-                msk_itk = sitk.GetImageFromArray(self.xp.asnumpy(msk_vol))
+                msk_itk = sitk.GetImageFromArray(self._as_numpy(msk_vol))
             mask_itk_list.append(msk_itk)
 
             # Build image_itk_list and image_array_list from each modality
             for m_idx, mod_numpy in enumerate(img_vol):
-                mod_itk = sitk.GetImageFromArray(self.xp.asnumpy(mod_numpy))
+                mod_itk = sitk.GetImageFromArray(self._as_numpy(mod_numpy))
                 mod_itk.CopyInformation(img_itk[m_idx])
                 image_itk_list.append(mod_itk)
                 image_array_list.append(mod_numpy)
@@ -571,17 +613,14 @@ class Preprocessor:
             if all(ext in {'.dcm', '.dicom'} for ext in exts):
                 sop = pydicom.dcmread(mask_series[0], stop_before_pixels=True).SOPClassUID
                 if sop == "1.2.840.10008.5.1.4.1.1.66.4":   # DICOM-SEG
-                    # 1) Build a mapping from CT SOPInstanceUID to slice index using Z-position
-                    ct_instances = []
-                    for img_path in image_series:
-                        ds_ct = pydicom.dcmread(img_path, stop_before_pixels=True)
-                        # Use ImagePositionPatient[2] for true physical slice order
-                        z_pos = float(ds_ct.ImagePositionPatient[2])
-                        ct_instances.append((z_pos, ds_ct.SOPInstanceUID))
-            
-                    # sort by ascending Z
-                    ct_instances.sort(key=lambda x: x[0])
-                    ct_uids = [uid for _, uid in ct_instances]
+                    # 1) Build a mapping from CT SOPInstanceUID to the loaded slice order
+                    ordered_ct_paths = list(image_series)
+                    if preprocessing_options.get("dicom_sort") == "position":
+                        ordered_ct_paths.sort(key=_dicom_slice_key)
+                    ct_uids = [
+                        pydicom.dcmread(path, stop_before_pixels=True).SOPInstanceUID
+                        for path in ordered_ct_paths
+                    ]
 
                     # 2) Create a full-zero volume matching CT depth/shape
                     depth = len(ct_uids)
@@ -734,6 +773,10 @@ class Preprocessor:
             label_items = []  # Tuples of (vol_array, label_value, mask_ref_for_class)
             unique_labels = self.xp.unique(mask_processed_vol)
 
+            if self.xp.array_equal(unique_labels, [self.background_value]):
+                self.dataset_logger.warning("No foreground — skipping.")
+                continue
+
             # Multi-class: one volume per original label
             if not (len(unique_labels) == 2 and set(unique_labels) == {0, 1}):
                 self.dataset_logger.info(f"Multi-class mask detected in mask index {idx}")
@@ -751,9 +794,6 @@ class Preprocessor:
 
             # Pure binary, single file
             else:
-                if self.xp.array_equal(unique_labels, [0]):
-                    self.dataset_logger.warning("No foreground — skipping.")
-                    continue
                 self.dataset_logger.info(f"Pure binary mask detected in mask index {idx}")
                 bin_vol = (mask_processed_vol != self.background_value).astype(self.xp.int32)
                 label_items.append((bin_vol, 1, mask_series[0]))
@@ -952,15 +992,10 @@ class Preprocessor:
         try:
             # 1) DICOM series (multi-slice)
             if len(paths) > 1 and ext in ('.dcm', '.dicom'):
-                # Sort by ImagePositionPatient Z (fall back to InstanceNumber)
-                def _slice_key(fname):
-                    ds = pydicom.dcmread(fname, stop_before_pixels=True)
-                    if hasattr(ds, 'ImagePositionPatient'):
-                        return float(ds.ImagePositionPatient[2])
-                    return int(getattr(ds, 'InstanceNumber', 0))
-                
+                # Sort by position projected onto the acquisition normal. Raw Z
+                # ordering reverses series whose slice direction points toward -Z.
                 if self._active_preprocessing_options.get("dicom_sort") == "position":
-                    paths = sorted(paths, key=_slice_key)
+                    paths = sorted(paths, key=_dicom_slice_key)
 
                 # Read DICOM series
                 reader = sitk.ImageSeriesReader()
@@ -1631,6 +1666,12 @@ class Preprocessor:
             float(lower), float(upper), float(mean), float(std),
         )
         return result.astype(self.xp.float32)
+
+    def _as_numpy(self, array):
+        """Explicitly transfer a backend array to host memory when required."""
+        if self.xp is np:
+            return np.asarray(array)
+        return self.xp.asnumpy(array)
 
     def _calculate_zscore(self, img, mean, std):
         """

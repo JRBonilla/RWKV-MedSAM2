@@ -108,14 +108,14 @@ def process_patients_from_batch(batch_input_dir, base_output_dir, target_size=10
 def main():
     # Training and testing input directories
     # train_directories = [
-    #     "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 2 (train 1)",
-    #     "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 3 (train 2)",
-    #     "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 4 (train 3)"
+    #     "/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 2 (train 1)",
+    #     "/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 3 (train 2)",
+    #     "/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 4 (train 3)"
     # ]
-    # test_directory = "F:/Datasets/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 1 (validate & csv)/valid"
+    # test_directory = "/data/research/CheXpert/chexpertchestxrays-u20210408/CheXpert-v1.0 batch 1 (validate & csv)/valid"
     
-    # base_output_train_dir = "F:/Datasets/CheXpert/preprocessed_chexpert/train/"
-    # base_output_test_dir  = "F:/Datasets/CheXpert/preprocessed_chexpert/test/"
+    # base_output_train_dir = "/data/research/CheXpert/preprocessed_chexpert/train/"
+    # base_output_test_dir  = "/data/research/CheXpert/preprocessed_chexpert/test/"
 
     # Training and testing input directories
     train_directories = [

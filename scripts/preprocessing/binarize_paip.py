@@ -3,7 +3,7 @@ Batch-binarize PAIP2019 Kaggle segmentation masks into per-case
 "seg_files_bin/0" folders, showing progress for all cases and per-case files.
 
 Assumes your root input directory contains case subfolders like:
-    F:/Datasets/PAIP2019/PAIP_2019/PAIP_2019/PAIP_2019/01_01_0083/
+    /data/research/PAIP2019/PAIP_2019/PAIP_2019/PAIP_2019/01_01_0083/
 which inside have:
     seg_files/0/*.jpg
 
@@ -16,7 +16,7 @@ import os
 import cv2
 from tqdm import tqdm
 
-# INPUT_ROOT = r"F:/Datasets/PAIP2019/PAIP_2019/PAIP_2019/PAIP_2019/"
+# INPUT_ROOT = r"/data/research/PAIP2019/PAIP_2019/PAIP_2019/PAIP_2019/"
 INPUT_ROOT = r"/data/research/PAIP2019/PAIP_2019/PAIP_2019/PAIP_2019/"
 THRESH     = 0  # Pixel > threshold becomes foreground
 

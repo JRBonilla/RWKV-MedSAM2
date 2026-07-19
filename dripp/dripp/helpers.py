@@ -4,14 +4,34 @@ import re
 import shutil
 import logging
 import numpy as np
-from .config import GPU_ENABLED
-if GPU_ENABLED:
-    import cupy as xp
-else:
-    xp = np
 from typing import Dict, List
 
 from .config import DEFAULT_LOG_LEVEL, _CLASS_RE, _RANGE_RE, _DIGIT_RE
+
+
+def get_array_module(array):
+    """Return NumPy or CuPy from the received array, independent of import order."""
+    if isinstance(array, np.ndarray):
+        return np
+
+    try:
+        import cupy as cp  # type: ignore
+    except ImportError as exc:
+        if type(array).__module__.split(".", 1)[0] == "cupy":
+            raise RuntimeError(
+                "Received a CuPy array, but CuPy is unavailable in this Python environment"
+            ) from exc
+        return np
+
+    return cp.get_array_module(array)
+
+
+def as_numpy(array):
+    """Explicitly convert a supported NumPy/CuPy array to a NumPy array."""
+    array_module = get_array_module(array)
+    if array_module is np:
+        return np.asarray(array)
+    return array_module.asnumpy(array)
 
 # Global logger: logs to "processing_errors.log"
 logger = logging.getLogger("SegmentationDatasetLogger")
@@ -918,9 +938,10 @@ def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette
         # Invert palette: label -> (R,G,B)
         inv_palette = {lbl: col for col, lbl in palette.items()}
         # Find unique non-zero labels via bincount
+        array_module = get_array_module(arr)
         flat = arr.ravel()
-        counts = xp.bincount(flat, minlength=background_value+1 if background_value > 0 else None)
-        unique_lbls = set(xp.nonzero(counts)[0])
+        counts = array_module.bincount(flat, minlength=background_value+1 if background_value > 0 else None)
+        unique_lbls = set(as_numpy(array_module.nonzero(counts)[0]).tolist())
         unique_lbls.discard(background_value)
 
         for lbl in unique_lbls:
@@ -935,11 +956,12 @@ def match_mask_class(mask_path, mask_arr, mask_classes, subdataset_name, palette
                     return cls_name
 
     # 3) Numeric matching: ranges and exact digits
-    if xp.issubdtype(arr.dtype, xp.integer):
+    array_module = get_array_module(arr)
+    if array_module.issubdtype(arr.dtype, array_module.integer):
         # Get uniques via bincount
         flat = arr.ravel()
-        counts = xp.bincount(flat)
-        uniques = xp.nonzero(counts)[0]
+        counts = array_module.bincount(flat)
+        uniques = as_numpy(array_module.nonzero(counts)[0]).tolist()
         logger.info(f"Numeric matching: {mask_path}. Uniques: {uniques}")
 
         for cls_name, rule in rules.items():

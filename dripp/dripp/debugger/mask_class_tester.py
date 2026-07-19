@@ -82,11 +82,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Test match_mask_class on processed mask components via Preprocessor"
     )
-    parser.add_argument("-b", "--base_dir", default="/path/to/raw/data",
+    parser.add_argument("-b", "--base_dir", default="/data/research",
                         help="Base directory for raw files (for relative paths)")
-    parser.add_argument("-c", "--csv", default="datasets.csv",
+    parser.add_argument("-c", "--csv", default="/data/research/datasets.csv",
                         help="Path to datasets CSV")
-    parser.add_argument("-i", "--index_dir", default="F:/DatasetIndexes/Groups",
+    parser.add_argument("-i", "--index_dir", default="/data/DatasetIndexes/Groups",
                         help="Directory with [DatasetName]_groups.json files")
     parser.add_argument("-d", "--dataset", required=True,
                         help="Dataset name as in CSV and Groups JSON")

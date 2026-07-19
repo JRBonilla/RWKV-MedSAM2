@@ -10,7 +10,7 @@ Results are saved to 'OUTPUT_DIR', preserving subfolder structure.
 import os
 from PIL import Image
 
-# PENDAL_ROOT = 'F:/Datasets/Pendal/Panoramic Dental X-rays With Segmented Mandibles/DentalPanoramicXrays'
+# PENDAL_ROOT = '/data/research/Pendal/Panoramic Dental X-rays With Segmented Mandibles/DentalPanoramicXrays'
 PENDAL_ROOT = '/data/research/Pendal/Panoramic Dental X-rays With Segmented Mandibles/DentalPanoramicXrays'
 OUTPUT_DIR = PENDAL_ROOT + "/Masks"
 

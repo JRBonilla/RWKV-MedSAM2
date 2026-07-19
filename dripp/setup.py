@@ -24,5 +24,8 @@ setup(
         "nibabel",
         "pydicom"
     ],
+    extras_require={
+        "gpu": ["cupy-cuda12x>=13"],
+    },
     python_requires= ">=3.7",
 )

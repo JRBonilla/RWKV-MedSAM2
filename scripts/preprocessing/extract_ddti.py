@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 # CONFIGURATION
-# INPUT_DIR   = Path(r"F:\Datasets\DDTI\DDTI")
+# INPUT_DIR   = Path("/data/research/DDTI/DDTI")
 INPUT_DIR   = Path(r"DDTI")
 OUTPUT_ROOT = Path("extracted_ddti")
 OUTPUT_ROOT.mkdir(exist_ok=True)

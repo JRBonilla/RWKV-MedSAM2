@@ -6,9 +6,9 @@ from tqdm import tqdm
 import copy
 
 # Base directories:
-# images_base       = r"F:\Datasets\LIDC-IDRI\manifest-1600709154662"
-# annotations_base  = r"F:\Datasets\LIDC-IDRI\DICOM-LIDC-IDRI-Nodules\manifest-1585232716547"
-# output_base       = r"F:\Datasets\LIDC-IDRI\Merged-LIDC-IDRI"
+# images_base       = r"/data/research/LIDC-IDRI/manifest-1600709154662"
+# annotations_base  = r"/data/research/LIDC-IDRI/DICOM-LIDC-IDRI-Nodules/manifest-1585232716547"
+# output_base       = r"/data/research/LIDC-IDRI/Merged-LIDC-IDRI"
 images_base       = r"manifest-1600709154662"
 annotations_base  = r"DICOM-LIDC-IDRI-Nodules/manifest-1585232716547"
 output_base       = r"Merged-LIDC-IDRI"

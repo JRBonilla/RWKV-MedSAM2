@@ -12,8 +12,8 @@ import nibabel as nib
 import SimpleITK as sitk
 
 # Input and output directories
-# input_dir     = "F:/Datasets/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_slices"
-# output_dir    = "F:/Datasets/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_niftis"
+# input_dir     = "/data/research/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_slices"
+# output_dir    = "/data/research/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_niftis"
 input_dir     = "/data/research/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_slices"
 output_dir    = "/data/research/LGE-CMR/MSCMRSeg/MSCMR_preprocessed/MSCMR_training_niftis"
 os.makedirs(output_dir, exist_ok=True)

@@ -125,8 +125,8 @@ def fix_orientation_and_export(study_dir: Path, out_dir: Path):
     print(f"Wrote mask -> {mask_out}")
 
 if __name__ == "__main__":
-    # ROOT   = Path(r"F:\Datasets\Cardiac MRI\Merged_Cardiac_MRI")
-    # OUTPUT = Path(r"F:\Datasets\Cardiac MRI\Fixed_Niftis")
+    # ROOT   = Path(r"/data/research/Cardiac MRI/Merged_Cardiac_MRI")
+    # OUTPUT = Path(r"/data/research/Cardiac MRI/Fixed_Niftis")
     ROOT   = Path(r"Merged_Cardiac_MRI")
     OUTPUT = Path(r"Fixed_Niftis")
 
