@@ -254,6 +254,12 @@ Supported options:
 | `mask_series_strategy` | `generic`, `split_unique_labels` |
 | `tile_coordinate_strategy` | `none`, `row_col_filename` |
 | `dicom_sort` | `position`, `none` |
+| `min_component_voxels_3d` | Integer at least `0`; `0` disables |
+| `mask_qc_downsample_3d` | Integer at least `1`; `2` matches the fast RWKV policy |
+| `min_slice_area_px_3d` | Integer at least `0`; `0` disables the absolute area threshold |
+| `min_slice_area_fraction_3d` | Number from `0.0` to `1.0`; `0` disables the fractional threshold |
+| `min_qualified_slices_3d` | Integer at least `0`; `0` disables slice-count filtering |
+| `require_contiguous_qualified_slices_3d` | `true`, `false`; requires a positive qualified-slice count |
 
 Examples:
 
@@ -273,6 +279,21 @@ Examples:
 
 ```text
 {mask_series_strategy: split_unique_labels}
+```
+
+The 3D options are evaluated on each connected component before it is written.
+Slice area is the larger of the absolute pixel threshold and the configured
+fraction of the full slice area. Slice-count and contiguity checks use the
+highest-resolution viewing axis. A downsample value of `2` preserves the fast
+sampling semantics used by RWKV-MedSAM2.
+
+The active server run enables the complete policy globally in `dripp.ini`:
+
+```text
+min_component_voxels_3d=64; mask_qc_downsample_3d=2;
+min_slice_area_px_3d=32; min_slice_area_fraction_3d=0.00153;
+min_qualified_slices_3d=8;
+require_contiguous_qualified_slices_3d=true
 ```
 
 ## Index Datasets

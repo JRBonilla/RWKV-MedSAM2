@@ -21,11 +21,15 @@ from logging.handlers import RotatingFileHandler
 from .helpers import (
     DEFAULT_PREPROCESSING_OPTIONS,
     get_extension,
+    normalize_3d_quality_policy,
     parse_mask_classes,
     parse_segmentation_tasks,
     match_mask_class,
 )
-from .config import PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE, MIN_COMPONENT_SIZE
+from .config import (
+    PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE,
+    MIN_COMPONENT_SIZE, MIN_COMPONENT_VOXELS_3D,
+)
 from .output_filenames import render_image_filename, render_mask_filename
 from .ct_profiles import CTProfile, CTProfileError, select_ct_profile
 
@@ -94,7 +98,12 @@ class Preprocessor:
       - Ensure 3-channel output for grayscale inputs
       - Split multi-class masks into binary components and filter small regions
     """
-    def __init__(self, target_size=DEFAULT_TARGET_SIZE, ct_profiles=None, ct_window=None, global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE, dataset_logger=None, dataset_name=None, background_value=0):
+    def __init__(
+        self, target_size=DEFAULT_TARGET_SIZE, ct_profiles=None, ct_window=None,
+        global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE,
+        min_component_voxels_3d=MIN_COMPONENT_VOXELS_3D,
+        dataset_logger=None, dataset_name=None, background_value=0,
+    ):
         """
         Initialize the Preprocessor.
 
@@ -104,11 +113,19 @@ class Preprocessor:
             ct_window/global_ct_stats: Legacy fixed parameters retained for compatibility. Both
                 must be supplied together; schema-v2 profiles are preferred.
             min_mask_size (int, optional): Minimum pixel area for keeping a mask component. Defaults to 100.
+            min_component_voxels_3d (int, optional): Minimum voxel count for keeping a
+                3D connected component. Zero disables 3D size filtering.
             dataset_logger (logging.Logger, optional): Logger for dataset-specific logging. Defaults to main logger.
             dataset_name (str, optional): Name of the dataset. Defaults to None.
             background_value (int, optional): Background value for normalization. Defaults to 0.
         """
-        main_logger.info(f"Initializing Preprocessor: target_size={target_size}, ct_window={ct_window}, global_ct_stats={global_ct_stats}, min_mask_size={min_mask_size}, gpu_enabled={config.GPU_ENABLED}")
+        if min_component_voxels_3d < 0:
+            raise ValueError("min_component_voxels_3d must be zero or greater")
+        main_logger.info(
+            "Initializing Preprocessor: target_size=%s, min_mask_size=%s, "
+            "min_component_voxels_3d=%s, gpu_enabled=%s",
+            target_size, min_mask_size, min_component_voxels_3d, config.GPU_ENABLED,
+        )
         
         # Select the backend only after runtime configuration/CLI parsing.
         if config.GPU_ENABLED:
@@ -166,6 +183,7 @@ class Preprocessor:
             self._legacy_ct_profile = None
         self.min_mask_size = min_mask_size
         self.dataset_name = dataset_name
+        self.min_component_voxels_3d = int(min_component_voxels_3d)
 
         # File-type constants
         self.volume_exts = config.VOLUME_EXTS
@@ -182,10 +200,147 @@ class Preprocessor:
         self.background_value = background_value
         self._active_preprocessing_options = dict(DEFAULT_PREPROCESSING_OPTIONS)
         self._cached_3d_input = None
+        self._reset_group_tracking()
 
         self.main_logger = main_logger
         self.dataset_logger = dataset_logger or main_logger
         self.dataset_logger.info("Preprocessor initialized successfully.")
+
+    def _reset_group_tracking(self):
+        """Reset lightweight output and QC state for one preprocessing group."""
+        self._current_images = []
+        self._current_masks = []
+        self._current_stage = "group"
+        self._current_reasons = []
+        self._current_qc = {
+            "empty_masks": 0,
+            "components_2d_found": 0,
+            "components_2d_rejected": 0,
+            "components_3d_found": 0,
+            "components_3d_rejected": 0,
+            "components_3d_rejected_by_reason": {},
+        }
+        policy_options = dict(DEFAULT_PREPROCESSING_OPTIONS)
+        policy_options["min_component_voxels_3d"] = self.min_component_voxels_3d
+        self._current_quality_policy_3d = normalize_3d_quality_policy(policy_options)
+
+    def _record_reason(self, reason):
+        if reason not in self._current_reasons:
+            self._current_reasons.append(reason)
+
+    def _group_tracking_metadata(self):
+        """Return a JSON-safe snapshot used by dataset-level result handling."""
+        images = [dict(record) for record in self._current_images]
+        image_positions = {}
+        for index, record in enumerate(images):
+            image_positions.setdefault(record["pairing_index"], index)
+
+        masks = []
+        for record in self._current_masks:
+            item = dict(record)
+            pairing_index = item.pop("pairing_index")
+            image_index = image_positions.get(pairing_index)
+            if image_index is None and len(images) == 1:
+                image_index = 0
+            item["image_index"] = image_index
+            masks.append(item)
+
+        return {
+            "proc_images": [record["path"] for record in images],
+            "proc_masks": masks,
+            "qc": dict(self._current_qc),
+            "quality_policy_3d": dict(self._current_quality_policy_3d),
+            "reasons": list(self._current_reasons),
+            "stage": self._current_stage,
+        }
+
+    def get_group_tracking_metadata(self):
+        """Expose the latest tracking snapshot after a handled group failure."""
+        return self._group_tracking_metadata()
+
+    def _record_3d_component_rejection(self, reason):
+        """Record one rejected 3D component without per-component logging."""
+        self._current_qc["components_3d_rejected"] += 1
+        counts = self._current_qc["components_3d_rejected_by_reason"]
+        counts[reason] = counts.get(reason, 0) + 1
+        self._record_reason(reason)
+
+    @staticmethod
+    def _evaluate_3d_component_quality(relabeled, component_sizes, policy):
+        """Return component-label to rejection-reason mappings before mask writes."""
+        rejections = {}
+        min_voxels = policy["min_component_voxels_3d"]
+        for component_label, component_size in enumerate(component_sizes, start=1):
+            if min_voxels and component_size < min_voxels:
+                rejections[component_label] = "component_below_minimum_voxels_3d"
+
+        min_area_px = policy["min_slice_area_px_3d"]
+        min_area_fraction = policy["min_slice_area_fraction_3d"]
+        min_slices = policy["min_qualified_slices_3d"]
+        area_enabled = min_area_px > 0 or min_area_fraction > 0.0
+        if not area_enabled and min_slices == 0:
+            return rejections
+
+        label_volume = sitk.GetArrayFromImage(relabeled)
+        if label_volume.ndim != 3:
+            return rejections
+
+        full_shape = tuple(int(value) for value in label_volume.shape)
+        inplane_areas = np.asarray([
+            full_shape[1] * full_shape[2],
+            full_shape[0] * full_shape[2],
+            full_shape[0] * full_shape[1],
+        ], dtype=np.int64)
+        hi_axis = int(inplane_areas.argmax())
+        full_slice_area = int(inplane_areas[hi_axis])
+
+        downsample = policy["mask_qc_downsample_3d"]
+        sampled = label_volume[::downsample, ::downsample, ::downsample]
+        sampled = np.moveaxis(sampled, hi_axis, 0)
+        component_count = len(component_sizes)
+        slice_counts = np.zeros(
+            (sampled.shape[0], component_count + 1), dtype=np.int64
+        )
+        for slice_index, label_slice in enumerate(sampled):
+            counts = np.bincount(
+                np.asarray(label_slice).reshape(-1), minlength=component_count + 1
+            )
+            slice_counts[slice_index] = counts[:component_count + 1]
+
+        threshold_full = max(
+            min_area_px, int(math.ceil(min_area_fraction * full_slice_area))
+        )
+        threshold_sampled = max(
+            1, int(math.ceil(threshold_full / (downsample ** 2)))
+        )
+
+        for component_label in range(1, component_count + 1):
+            if component_label in rejections:
+                continue
+            per_slice = slice_counts[:, component_label]
+            qualifying = per_slice >= threshold_sampled
+            if area_enabled and not bool(qualifying.any()):
+                rejections[component_label] = (
+                    "component_below_minimum_slice_area_3d"
+                )
+                continue
+            if min_slices == 0:
+                continue
+            if int(np.count_nonzero(qualifying)) < min_slices:
+                rejections[component_label] = (
+                    "component_below_minimum_slices_3d"
+                )
+                continue
+            if policy["require_contiguous_qualified_slices_3d"]:
+                flags = qualifying.astype(np.int32)
+                prefix = np.concatenate(([0], np.cumsum(flags)))
+                window_sums = prefix[min_slices:] - prefix[:-min_slices]
+                if not bool(np.any(window_sums == min_slices)):
+                    rejections[component_label] = (
+                        "component_below_minimum_contiguous_slices_3d"
+                    )
+
+        return rejections
 
     def preprocess_group(self, sub_name, pipeline, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, mask_classes, preprocessing_options=None):
         """
@@ -216,6 +371,8 @@ class Preprocessor:
                 plus pipeline-specific fields such as 'fps' for video or 'image_niftis' and 'mask_niftis' for 3D
         """
         main_logger.info(f"Preprocessing group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
+        self._reset_group_tracking()
+        self._current_stage = "configuration"
         
         # Normalize modality key for lookup
         self.dataset_logger.info(f"DEBUG: modality is {modality!r} of type {type(modality)}")
@@ -240,11 +397,16 @@ class Preprocessor:
             self._active_ct_profile = None
 
         options = dict(DEFAULT_PREPROCESSING_OPTIONS)
+        options["min_component_voxels_3d"] = self.min_component_voxels_3d
         options.update(preprocessing_options or {})
+        self._current_quality_policy_3d = normalize_3d_quality_policy(
+            options, applied=(pipeline == "3D"),
+        )
         self._active_preprocessing_options = options
         self._cached_3d_input = None
 
         # Compute unified bounding box over all images
+        self._current_stage = "load"
         group_bbox = self._compute_group_bbox(image_files, pipeline, options)
         main_logger.info(f"Group bounding box: {group_bbox}")
 
@@ -253,6 +415,7 @@ class Preprocessor:
         mask_files  = sorted(mask_files)
         
         # Preprocess
+        self._current_stage = "processing"
         try:
             if pipeline == "Video":
                 main_logger.info(f"Using video pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
@@ -277,17 +440,23 @@ class Preprocessor:
                 )
         except Exception as e:
             main_logger.error(f"Error in preprocess_group: {e}", exc_info=True)
-            return None
+            raise
 
         # Add is_significant_crop and slices to metadata
         metadata["is_significant_crop"] = bool(self.is_significant_crop)
+        tracking = self._group_tracking_metadata()
+        metadata.update(tracking)
 
         # Log and return
         main_logger.info(f"Completed preprocessing group for modality {modality}")
         
-        removed_masks = len(mask_files) - len(os.listdir(mask_out_dir))
-        if removed_masks > 0:
-            main_logger.info(f"Removed {removed_masks} masks due to no significant components found")
+        qc = tracking["qc"]
+        main_logger.info(
+            "QC summary: 2D kept=%d rejected=%d; 3D kept=%d rejected=%d; empty=%d",
+            qc["components_2d_found"] - qc["components_2d_rejected"], qc["components_2d_rejected"],
+            qc["components_3d_found"] - qc["components_3d_rejected"], qc["components_3d_rejected"],
+            qc["empty_masks"],
+        )
         return metadata
     
     def _mask_stem_for_strategy(self, path, strategy):
@@ -373,6 +542,8 @@ class Preprocessor:
         for i, msk_path in enumerate(tqdm(mask_files, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D masks...")):
             self.dataset_logger.info(f"Loading mask {msk_path}")
             mask_arr, header, palette = self.load_mask(msk_path)
+            components_found_before = self._current_qc["components_2d_found"]
+            components_rejected_before = self._current_qc["components_2d_rejected"]
 
             # Handle 3D mask volumes
             if mask_arr.ndim == 3 and isinstance(header, sitk.Image):
@@ -388,7 +559,7 @@ class Preprocessor:
                         for comp_bin in self._split_connected_components(binary):
                             # Re-label the component pixels with the original class label
                             comp = (comp_bin > 0).astype(self.xp.int32) * int(lbl)                        
-                            self.dataset_logger.info(f"Unique values in component: {self.xp.unique(comp)}")
+                            self.dataset_logger.debug(f"Unique values in component: {self.xp.unique(comp)}")
                             comps.append(comp)
                     filtered = self._filter_small_components(comps)
 
@@ -398,10 +569,13 @@ class Preprocessor:
 
                     for j, comp in enumerate(filtered):
                         cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
-                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem)
+                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem, pairing_index=z)
                         del comp
                     del filtered, comps, resized_mask, cropped_mask
                 del vol
+                self._log_2d_component_summary(
+                    msk_path, components_found_before, components_rejected_before,
+                )
 
             # Truly 2D mask case
             else:
@@ -413,27 +587,38 @@ class Preprocessor:
                     for comp_bin in self._split_connected_components(binary):
                         # Re-label the component pixels with the original class label
                         comp = (comp_bin > 0).astype(self.xp.int32) * int(lbl)
-                        self.dataset_logger.info(f"Unique values in component: {self.xp.unique(comp)}")
+                        self.dataset_logger.debug(f"Unique values in component: {self.xp.unique(comp)}")
                         comps.append(comp)
                 filtered = self._filter_small_components(comps)
 
                 if not filtered:
                     self.dataset_logger.warning(f"No significant components found in mask {msk_path}")
+                    self._log_2d_component_summary(
+                        msk_path, components_found_before, components_rejected_before,
+                    )
                     continue
 
                 valid_stem = self._mask_stem_for_strategy(msk_path, mask_stem_strategy)
                 if valid_stem is not None:
                     valid_mask_stems.add(valid_stem)
+                pairing_idx = next(
+                    (image_idx for image_idx, image_path in enumerate(image_files)
+                     if self._mask_stem_for_strategy(image_path, mask_stem_strategy) == valid_stem),
+                    0,
+                )
 
                 for j, comp in enumerate(filtered):
                     cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
                     if save_with_source_stem:
-                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem)
+                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem, pairing_index=pairing_idx)
                     else:
                         img_idx = self.get_matching_image_idx(composite_id, image_files)
                         self._save_mask(comp, '2d', img_idx, i, j, composite_id, mask_out_dir, cls)
                     del comp
                 del filtered, comps, resized_mask, cropped_mask, mask_arr
+                self._log_2d_component_summary(
+                    msk_path, components_found_before, components_rejected_before,
+                )
 
         # 2) Image loop
         for i, img_path in enumerate(tqdm(image_files, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D images...")):
@@ -468,7 +653,7 @@ class Preprocessor:
                     resized_img = self._resize(norm_img, is_mask=False)
                     final_img = self._ensure_three_channels(resized_img)
 
-                    self._save_image(final_img, '2d', 0, composite_id, img_out_dir, f"modality{z}")
+                    self._save_image(final_img, '2d', 0, composite_id, img_out_dir, f"modality{z}", pairing_index=z)
                     del final_img, resized_img, norm_img, cropped_img
                 if normalized_mri_volume is not None:
                     del normalized_mri_volume
@@ -666,6 +851,7 @@ class Preprocessor:
             image_array_list.append(sitk.GetArrayFromImage(img_itk))
 
         # 2) Resample each mask ITK to match the first image modality's space
+        self._current_stage = "resample"
         resampled_mask_itk_list = []
         reference_itk = image_itk_list[0]
         for msk_itk in mask_itk_list:
@@ -745,6 +931,7 @@ class Preprocessor:
                 del normalized_volume
 
         # 4) Process each resampled mask: crop, resize, split components or labels, save
+        self._current_stage = "processing"
         for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 3D masks")):
             # (a) Convert to numpy and crop
             mask_array = sitk.GetArrayFromImage(msk_itk_res).astype(self.xp.int32)
@@ -774,6 +961,8 @@ class Preprocessor:
             unique_labels = self.xp.unique(mask_processed_vol)
 
             if self.xp.array_equal(unique_labels, [self.background_value]):
+                self._current_qc["empty_masks"] += 1
+                self._record_reason("empty_mask")
                 self.dataset_logger.warning("No foreground — skipping.")
                 continue
 
@@ -799,6 +988,8 @@ class Preprocessor:
                 label_items.append((bin_vol, 1, mask_series[0]))
 
             # 2) Run one connected-component + save routine over all items
+            source_components_found = 0
+            source_components_rejected = 0
             for vol_array, label_val, mask_ref in label_items:
                 itk_lbl = sitk.GetImageFromArray(self.xp.asnumpy(vol_array.astype(self.xp.uint8)) if config.GPU_ENABLED else vol_array.astype(self.xp.uint8))
                 itk_lbl.CopyInformation(mask_nifti_raw)
@@ -812,9 +1003,23 @@ class Preprocessor:
                 relabel_filter.SortByObjectSizeOn()
                 relabeled = relabel_filter.Execute(cc)
 
+                component_sizes = tuple(
+                    int(size) for size in relabel_filter.GetSizeOfObjectsInPixels()
+                )
+                rejections = self._evaluate_3d_component_quality(
+                    relabeled, component_sizes, self._current_quality_policy_3d,
+                )
+                self._current_qc["components_3d_found"] += len(component_sizes)
+                source_components_found += len(component_sizes)
+                source_components_rejected += len(rejections)
+                for reason in rejections.values():
+                    self._record_3d_component_rejection(reason)
+
                 cls = match_mask_class(mask_ref, vol_array, mask_classes, sub_name, logger=self.dataset_logger, background_value=self.background_value)
-                for comp_idx in range(1, relabel_filter.GetNumberOfObjects()+1):
-                    self.dataset_logger.info(f"Saving component {comp_idx} of class {cls}…")
+                for comp_idx in range(1, len(component_sizes) + 1):
+                    if comp_idx in rejections:
+                        continue
+                    self.dataset_logger.debug(f"Saving component {comp_idx} of class {cls}…")
                     comp_bin = sitk.Equal(relabeled, comp_idx)
                     comp_lbl = sitk.Cast(comp_bin, sitk.sitkInt32)
                     comp_lbl = sitk.Multiply(comp_lbl, int(label_val))
@@ -832,6 +1037,15 @@ class Preprocessor:
                         label_value=label_val
                     )
                     mask_paths.append(path)
+
+
+            source_mask = mask_series[idx] if idx < len(mask_series) else mask_series[0]
+            self.dataset_logger.info(
+                "3D component summary for mask %s: found=%d accepted=%d rejected=%d",
+                source_mask, source_components_found,
+                source_components_found - source_components_rejected,
+                source_components_rejected,
+            )
 
         # Unified return with metadata
         return {
@@ -901,6 +1115,8 @@ class Preprocessor:
 
         # 4) Process each frame
         num_frames = len(frames)
+        components_found_before = self._current_qc["components_2d_found"]
+        components_rejected_before = self._current_qc["components_2d_rejected"]
         for idx, frame in enumerate(tqdm(frames, desc=f'[{self.dataset_name} - {sub_name}: {composite_id}] Processing frames')):
             keep_frame = True
 
@@ -947,6 +1163,10 @@ class Preprocessor:
             self._save_image(final, 'video', idx, composite_id, img_out_dir)
 
             del cropped, norm, resized, final
+        if mask_paths:
+            self._log_2d_component_summary(
+                mask_paths[0], components_found_before, components_rejected_before,
+            )
 
         metadata = {
             "fps": fps,
@@ -1196,8 +1416,30 @@ class Preprocessor:
             str: Short identifier.
         """
         return hashlib.md5(composite_id.encode()).hexdigest()[:8]
+
+    def _track_image_output(self, path, mode, pairing_index):
+        """Record an image output while it is being written."""
+        self._current_images.append({
+            "path": path,
+            "pairing_index": int(pairing_index),
+            "dimension": 3 if mode == "3d" else 2,
+        })
+        return path
+
+    def _track_mask_output(self, path, mode, pairing_index, class_tag):
+        """Record a mask output and its image relationship at write time."""
+        self._current_masks.append({
+            "path": path,
+            "class": class_tag,
+            "pairing_index": int(pairing_index),
+            "dimension": 3 if mode == "3d" else 2,
+        })
+        return path
     
-    def _save_image(self, img, mode, idx, composite_id, out_dir, image_tag=None):
+    def _save_image(
+        self, img, mode, idx, composite_id, out_dir, image_tag=None,
+        pairing_index=None,
+    ):
         """
         Save a processed image (2D slice, video frame, or 3D volume) to disk.
 
@@ -1213,6 +1455,8 @@ class Preprocessor:
         Returns:
             str: Full path to the saved file.
         """
+        self._current_stage = "write"
+        pairing_index = idx if pairing_index is None else pairing_index
         if mode == '3d':
             # composite_id includes desired suffix (e.g., 'patient_image' or 'patient_modality0')
             sid = self._short_id(composite_id)
@@ -1233,7 +1477,7 @@ class Preprocessor:
                 img_np = self.xp.asnumpy(img) if config.GPU_ENABLED else img
                 sitk.WriteImage(sitk.GetImageFromArray(img_np), path)
             self.dataset_logger.info(f"Saved 3D image: {filename} to {out_dir}")
-            return path
+            return self._track_image_output(path, mode, pairing_index)
 
         # 2D or video: save as configured format
         sid = self._short_id(composite_id)
@@ -1253,7 +1497,7 @@ class Preprocessor:
         if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
             sitk.WriteImage(sitk.GetImageFromArray(arr8), path)
             self.dataset_logger.info(f"Saved 2D medical image: {filename} to {out_dir}")
-            return path
+            return self._track_image_output(path, mode, pairing_index)
         # DRIPP keeps color images in RGB order (PIL convention). OpenCV expects
         # BGR when writing raster images, so convert only at this boundary.
         raster_arr = cv2.cvtColor(arr8, cv2.COLOR_RGB2BGR) if (
@@ -1262,9 +1506,13 @@ class Preprocessor:
         if not cv2.imwrite(path, raster_arr):
             raise IOError(f"OpenCV failed to write image output: {path}")
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
-        return path
+        return self._track_image_output(path, mode, pairing_index)
 
-    def _save_mask(self, mask, mode, img_idx, mask_idx, comp_idx, composite_id, out_dir, class_tag, mask_tag=None, label_value=1):
+    def _save_mask(
+        self, mask, mode, img_idx, mask_idx, comp_idx, composite_id,
+        out_dir, class_tag, mask_tag=None, label_value=1,
+        pairing_index=None,
+    ):
         """
         Save a processed mask (2D component, video frame, or 3D volume) to disk.
 
@@ -1285,6 +1533,8 @@ class Preprocessor:
         Returns:
             str: Full path to the saved file.
         """
+        self._current_stage = "write"
+        pairing_index = img_idx if pairing_index is None else pairing_index
         if mode == '3d':
             # Composite_id includes desired suffix (e.g., 'patient_mask')
             sid = self._short_id(composite_id)
@@ -1308,8 +1558,8 @@ class Preprocessor:
             else:
                 mask_np = self.xp.asnumpy(mask.astype(self.xp.int32)) if config.GPU_ENABLED else mask.astype(self.xp.int32)
                 sitk.WriteImage(sitk.GetImageFromArray(mask_np), path)
-            self.dataset_logger.info(f"Saved 3D mask: {filename} to {out_dir}")
-            return path
+            self.dataset_logger.debug(f"Saved 3D mask: {filename} to {out_dir}")
+            return self._track_mask_output(path, mode, pairing_index, class_tag)
 
         # 2D or video: save each mask component as configured format
         sid = self._short_id(composite_id)
@@ -1332,12 +1582,12 @@ class Preprocessor:
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
         if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
             sitk.WriteImage(sitk.GetImageFromArray(arr8.astype(np.uint8)), path)
-            self.dataset_logger.info(f"Saved 2D medical mask: {filename} to {out_dir}")
-            return path
+            self.dataset_logger.debug(f"Saved 2D medical mask: {filename} to {out_dir}")
+            return self._track_mask_output(path, mode, pairing_index, class_tag)
         if not cv2.imwrite(path, arr8):
             raise IOError(f"OpenCV failed to write mask output: {path}")
-        self.dataset_logger.info(f"Saved {filename} to {out_dir}")
-        return path
+        self.dataset_logger.debug(f"Saved {filename} to {out_dir}")
+        return self._track_mask_output(path, mode, pairing_index, class_tag)
 
     def _compute_group_bbox(self, image_paths, pipeline, preprocessing_options=None):
         """
@@ -1818,7 +2068,7 @@ class Preprocessor:
         Returns:
             List[self.xp.ndarray]: Filtered list where each mask has area >= min_mask_size.
         """
-        self.dataset_logger.info("Filtering small components")
+        found = len(mask_list)
 
         filtered = []
         for m in mask_list:
@@ -1827,12 +2077,31 @@ class Preprocessor:
             if area >= self.min_mask_size:
                 filtered.append(m)
 
-        self.dataset_logger.info(f"Filtered to {len(filtered)} components from {len(mask_list)} original components.")
+        rejected = found - len(filtered)
+        self._current_qc["components_2d_found"] += found
+        self._current_qc["components_2d_rejected"] += rejected
+        if found == 0:
+            self._current_qc["empty_masks"] += 1
+            self._record_reason("empty_mask")
+        elif rejected:
+            self._record_reason("component_below_minimum_size_2d")
         return filtered
+
+
+    def _log_2d_component_summary(self, source, found_before, rejected_before):
+        """Log one aggregate 2D component summary for a source mask or mask video."""
+        found = self._current_qc["components_2d_found"] - found_before
+        rejected = self._current_qc["components_2d_rejected"] - rejected_before
+        self.dataset_logger.info(
+            "2D component summary for mask %s: found=%d accepted=%d rejected=%d",
+            source, found, found - rejected, rejected,
+        )
 
     def _is_multiclass_mask(self, mask_array):
         """
         Determine if a mask array contains more than one foreground class:
+
+
         - For RGB(A) masks, returns True if more than one non-background color is present.
         - For single-channel masks, returns True if any label > 1 exists.
 

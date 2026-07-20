@@ -6,6 +6,7 @@ import os
 import math
 import base64
 import zlib
+import warnings
 import sys
 import random
 import torch
@@ -28,6 +29,9 @@ from tqdm import tqdm
 from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Any, Optional, List
 from rwkv_medsam2.dataset import SegmentationSequenceDataset, SequenceTransform  # noqa: E402
+
+DATASET_CACHE_VERSION = "v1.08"
+
 
 def _pack_u32_zlib_b64(arr_u32: np.ndarray) -> str:
     """
@@ -179,6 +183,42 @@ def _normalize_modality(mod):
         return None
     return str(mod).strip().lower()
 
+def _dripp_policy_satisfies_quality(policy, quality_params):
+    """Return whether DRIPP already enforced the active RWKV 3D QC contract."""
+    if not isinstance(policy, dict) or policy.get("applied") is not True:
+        return False
+
+    integer_keys = (
+        "min_component_voxels_3d",
+        "mask_qc_downsample_3d",
+        "min_slice_area_px_3d",
+        "min_qualified_slices_3d",
+    )
+    if any(
+        isinstance(policy.get(key), bool)
+        or not isinstance(policy.get(key), int)
+        for key in integer_keys
+    ):
+        return False
+    fraction = policy.get("min_slice_area_fraction_3d")
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        return False
+    if policy.get("require_contiguous_qualified_slices_3d") is not True:
+        return False
+
+    return (
+        policy["min_component_voxels_3d"]
+        >= int(quality_params.get("min_voxels", 64))
+        and policy["mask_qc_downsample_3d"]
+        == int(quality_params.get("downsample", 2))
+        and policy["min_slice_area_px_3d"]
+        >= int(quality_params.get("min_slice_area_px", 32))
+        and float(fraction)
+        >= float(quality_params.get("min_frac_2d_area") or 0.0)
+        and policy["min_qualified_slices_3d"]
+        >= int(quality_params.get("min_slices_any_axis", 2))
+    )
+
 _MASK_FG2D_CACHE = {}
 
 def _mask_has_fg_2d(mask_path: str) -> bool:
@@ -288,7 +328,8 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
             continue
 
         # Parse the groups file
-        data    = json.load(open(grp_file, 'r'))
+        with open(grp_file, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
         entries = []
         for sub in data.get("subdatasets", []):
             sub_name     = sub.get("name", "default")
@@ -297,6 +338,9 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
             sub_classes  = sub.get("classes", [])
 
             for entry in sub.get(split, []):
+                if entry.get("preprocessing", {}).get("status") in {"rejected", "failed"}:
+                    continue
+
                 entry["subdataset_name"] = sub_name
                 entry["tasks"]           = sub_tasks
                 entry["mask_classes"]    = sub_classes
@@ -353,6 +397,31 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 if cls_name is None:
                     continue
 
+                if "image_index" in mask:
+                    image_index = mask.get("image_index")
+                    dimension = mask.get("dimension")
+                    if (isinstance(image_index, bool)
+                            or not isinstance(image_index, int)
+                            or not 0 <= image_index < len(imgs)):
+                        warnings.warn(
+                            f"Skipping malformed explicit pairing for {msk_path}: "
+                            f"image_index={image_index!r} does not reference proc_images",
+                            RuntimeWarning,
+                        )
+                        continue
+                    if dimension is not None and dimension not in (2, 3):
+                        warnings.warn(
+                            f"Skipping malformed explicit pairing for {msk_path}: "
+                            f"dimension={dimension!r} is not 2 or 3",
+                            RuntimeWarning,
+                        )
+                        continue
+                    pairs.append({
+                        "image": imgs[image_index], "mask": msk_path,
+                        "class": cls_name, "_dimension": dimension,
+                    })
+                    continue
+
                 base = os.path.basename(msk_path)
 
                 # Prefer _mask#### first (PAIP2019 writes ..._img000_mask2272_...)
@@ -382,6 +451,12 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 if ip:
                     pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
 
+            entry_policy_3d = (
+                entry.get("preprocessing", {}).get("quality_policy_3d") or {}
+            )
+            for pair in pairs:
+                pair["_quality_policy_3d"] = entry_policy_3d
+
             # If no pairs found, skip
             if not pairs:
                 continue
@@ -404,8 +479,11 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
             pairs.sort(key=lambda x: _sort_idx(x['image']))
 
             # Build dims once
-            dims = [2 if os.path.splitext(p['image'])[1].lower() == '.png' else 3
-                    for p in pairs]
+            dims = [
+                p.pop("_dimension", None)
+                or (2 if os.path.splitext(p["image"])[1].lower() == ".png" else 3)
+                for p in pairs
+            ]
 
             # Drop 2D pairs whose masks have *no* foreground
             keep_idx = []
@@ -424,13 +502,21 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
             pairs = [pairs[i] for i in keep_idx]
             dims  = [dims[i]  for i in keep_idx]
 
-            # Build index lists for 3D and 2D (after filtering)
+            # Trust sufficient DRIPP policies; retain disk QC for legacy/weaker data.
             idx_3d = [i for i, d in enumerate(dims) if d == 3]
-
-            # Check quality of 3D masks using a compact stats cache
             qc_ok = {}
-            if idx_3d:
-                mask_paths_3d = [pairs[i]["mask"] for i in idx_3d]
+            fallback_idx_3d = []
+            for pair_index in idx_3d:
+                policy = pairs[pair_index].get("_quality_policy_3d")
+                if _dripp_policy_satisfies_quality(policy, quality_params):
+                    qc_ok[pair_index] = (
+                        True, {"reason": "quality_enforced_by_dripp"}
+                    )
+                else:
+                    fallback_idx_3d.append(pair_index)
+
+            if fallback_idx_3d:
+                mask_paths_3d = [pairs[i]["mask"] for i in fallback_idx_3d]
 
                 # Centralized cache dir: /data/DatasetIndexes/QC_Cache/<dataset> (or QC_CACHE_ROOT override)
                 ds_dir_default   = os.path.join(out_dir, ds)
@@ -440,7 +526,6 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 ds_factor = int(quality_params.get("downsample", 2))
                 wanted = set(mask_paths_3d)
 
-                # 1) Load existing per-mask stats (only what we need)
                 stats_map = load_maskstats_cache(
                     ds_dir=cache_dir_to_use,
                     split=split,
@@ -448,12 +533,13 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                     wanted_paths=wanted,
                 )
 
-                # 2) Compute stats for missing masks and append
                 missing = [p for p in mask_paths_3d if p not in stats_map]
                 if missing:
                     new_records = {}
                     for p in missing:
-                        ok_s, stats = compute_mask_stats_3d(p, downsample=ds_factor)
+                        ok_s, stats = compute_mask_stats_3d(
+                            p, downsample=ds_factor
+                        )
                         if ok_s:
                             new_records[p] = stats
                             stats_map[p] = stats
@@ -464,15 +550,18 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                         records=new_records,
                     )
 
-                # 3) Evaluate current quality_params from stats
-                for i_local, mpath in enumerate(mask_paths_3d):
-                    stats = stats_map.get(mpath, None)
+                for pair_index, mask_path in zip(
+                    fallback_idx_3d, mask_paths_3d
+                ):
+                    stats = stats_map.get(mask_path)
                     if stats is None:
-                        qc_ok[idx_3d[i_local]] = (False, {"reason": "stats_missing"})
+                        qc_ok[pair_index] = (
+                            False, {"reason": "stats_missing"}
+                        )
                         continue
-
-                    ok, info = evaluate_quality_from_stats(stats, quality_params)
-                    qc_ok[idx_3d[i_local]] = (ok, info)
+                    qc_ok[pair_index] = evaluate_quality_from_stats(
+                        stats, quality_params
+                    )
 
             # Now build outputs while consulting qc_ok for 3D pairs
             if len(pairs) > 1:
@@ -745,6 +834,8 @@ class DatasetSignature:
     aug_probs: Tuple[float, float, float]   # (base_prob, lr_prob, flip_prob)
     quality_params: Dict[str, Any]          # QC knobs used during pairing
     tasks_file_fingerprint: Optional[str]   # if you want to include DRIPP tasks.json fingerprint
+    fg_min_pixels_frac: float
+    dripp_manifests_fingerprint: Optional[str]
 
     def to_hash(self) -> str:
         """
@@ -776,6 +867,23 @@ def _fingerprint_file(path: Optional[str]) -> Optional[str]:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _fingerprint_dripp_manifests(out_dir: str) -> Optional[str]:
+    """Fingerprint manifest metadata without reading large JSON documents."""
+    if not os.path.isdir(out_dir):
+        return None
+    records = []
+    for dataset in sorted(os.listdir(out_dir)):
+        path = os.path.abspath(os.path.join(out_dir, dataset, f"{dataset}_groups.json"))
+        if not os.path.isfile(path):
+            continue
+        stat = os.stat(path)
+        records.append((path, stat.st_size, stat.st_mtime_ns))
+    if not records:
+        return None
+    payload = json.dumps(records, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 def _cache_paths(cache_root: str, sig: DatasetSignature) -> Dict[str, str]:
     """
@@ -929,9 +1037,11 @@ def build_and_cache_formatted_splits(
         "min_frac_2d_area": 0.00153,
     }
     tasks_fp = _fingerprint_file(getattr(getattr(config, "dripp", object()), "tasks_file", None))
+    fg_min_frac = float(getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002))
+    manifests_fp = _fingerprint_dripp_manifests(out_dir)
 
     sig = DatasetSignature(
-        version="v1.04",
+        version=DATASET_CACHE_VERSION,
         out_dir=out_dir,
         split="both",
         seq_len=seq_len,
@@ -941,6 +1051,8 @@ def build_and_cache_formatted_splits(
         seed=seed,
         aug_probs=(base_prob, lr_prob, flip_prob),
         quality_params=quality_params,
+        fg_min_pixels_frac=fg_min_frac,
+        dripp_manifests_fingerprint=manifests_fp,
         tasks_file_fingerprint=tasks_fp,
     )
 
@@ -969,8 +1081,6 @@ def build_and_cache_formatted_splits(
         tasks_map=tasks_map,
         quality_params=quality_params,
     )
-
-    fg_min_frac = float(getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002))
 
     train_ds = SegmentationSequenceDataset(
         train_seqs,
@@ -1046,11 +1156,13 @@ def load_datasets(*, config, cache_root):
         "min_frac_2d_area": 0.00153,
     }
     tasks_fp = _fingerprint_file(getattr(getattr(config, "dripp", object()), "tasks_file", None))
+    fg_min_frac = float(getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002))
+    manifests_fp = _fingerprint_dripp_manifests(out_dir)
 
     # Build signature
     # Bump the version when sequence formatting changes so cached datasets are not reused incorrectly.
     sig = DatasetSignature(
-        version="v1.06",
+        version=DATASET_CACHE_VERSION,
         out_dir=out_dir,
         split="both",
         seq_len=seq_len,
@@ -1061,6 +1173,8 @@ def load_datasets(*, config, cache_root):
         aug_probs=(base_prob, lr_prob, flip_prob),
         quality_params=quality_params,
         tasks_file_fingerprint=tasks_fp,
+        fg_min_pixels_frac=fg_min_frac,
+        dripp_manifests_fingerprint=manifests_fp,
     )
 
     # Try cached first
@@ -1079,6 +1193,7 @@ def load_datasets(*, config, cache_root):
             transform=ds.transform,
             max_frames_per_sequence=ds.max_frames_per_sequence,
             min_fg_frames_in_window=ds.min_fg_frames_in_window,
+            fg_min_pixels_frac=fg_min_frac,
             truncate=ds.truncate,
         )
 

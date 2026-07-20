@@ -6,12 +6,14 @@ import logging
 import random
 import pickle
 import threading
+import copy
+import tempfile
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from . import config
 from .config import (
@@ -27,6 +29,31 @@ from .preprocessor import Preprocessor
 from .ct_profiles import load_ct_profiles
 from .helpers import *
 from .output_structure import render_output_dirs
+
+
+REPORT_SCHEMA_VERSION = 2
+
+
+def atomic_write_json(path, value, *, indent=None):
+    """Atomically replace a JSON document, preserving an older valid file on error."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                value, handle, indent=indent,
+                separators=None if indent is not None else (",", ":"),
+            )
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 class SegmentationDataset:
     """
@@ -60,7 +87,7 @@ class SegmentationDataset:
         self.processed_pairs = {"train": 0, "test": 0}
         self.mask_classes = parse_mask_classes(self.metadata.get("mask_classes"))
 
-    def process(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
+    def _process_legacy(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
         """
         Process the dataset by reorganizing files according to the pre-built groups JSON file.
 
@@ -157,7 +184,7 @@ class SegmentationDataset:
         with open(grouping_meta_path, "w") as f:
             json.dump(grouping_metadata, f, indent=2)
 
-    def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger, workers=1):
+    def _process_grouping_and_copy_legacy(self, identifiers, subdataset_configs, logger, workers=1):
         """
         Process each group in the identifiers dictionary by copying and preprocessing the corresponding image and mask files.
 
@@ -354,6 +381,385 @@ class SegmentationDataset:
                 grouping_metadata.append(entry_dict)
 
         return grouping_metadata
+
+    @staticmethod
+    def _primary_reason(reasons, fallback="no_processed_masks"):
+        return reasons[-1] if reasons else fallback
+
+    def _preprocessing_result(
+        self, entry, tracking, status, reason=None, stage=None, error=None,
+    ):
+        result = {
+            "status": status,
+            "reason": reason,
+            "stage": stage,
+            "input_counts": {
+                "images": len(entry.get("images") or []),
+                "masks": len(entry.get("masks") or []),
+            },
+            "output_counts": {
+                "images": len(tracking.get("proc_images") or []),
+                "masks": len(tracking.get("proc_masks") or []),
+            },
+            "qc": dict(tracking.get("qc") or {
+                "empty_masks": 0,
+                "components_2d_found": 0,
+                "components_2d_rejected": 0,
+                "components_3d_found": 0,
+                "components_3d_rejected": 0,
+                "components_3d_rejected_by_reason": {},
+            }),
+            "quality_policy_3d": copy.deepcopy(
+                tracking.get("quality_policy_3d") or {}
+            ),
+        }
+        if error is not None:
+            result["error"] = {
+                "type": type(error).__name__,
+                "message": str(error).replace("\n", " ")[:500],
+            }
+        return result
+
+    @staticmethod
+    def _failure_reason(stage):
+        if stage == "load":
+            return "load_error"
+        if stage == "resample":
+            return "resample_error"
+        if stage == "write":
+            return "write_error"
+        return "processing_error"
+
+    def _base_output_entry(self, entry, composite_id):
+        result = copy.deepcopy(entry)
+        result.setdefault("short_id", self.preprocessor._short_id(composite_id))
+        return result
+
+    @staticmethod
+    def _clean_pipeline_metadata(metadata):
+        ignored = {
+            "proc_images", "proc_masks", "qc", "reasons", "stage",
+            "image_niftis", "mask_niftis", "quality_policy_3d",
+        }
+        return {
+            key: value for key, value in (metadata or {}).items()
+            if key not in ignored
+        }
+
+    def _successful_entries(self, entry, composite_id, metadata, status_block, options):
+        proc_images = list(metadata.get("proc_images") or [])
+        proc_masks = [dict(mask) for mask in metadata.get("proc_masks") or []]
+        pipeline_metadata = self._clean_pipeline_metadata(metadata)
+        source_identifier = entry.get("identifier", composite_id)
+
+        split_outputs = (
+            len(metadata.get("image_niftis") or []) > 1
+            or options.get("split_processed_images_by_modality")
+        )
+        if split_outputs and len(proc_images) > 1:
+            outputs = []
+            shared_3d_masks = bool(metadata.get("image_niftis"))
+            for image_index, image_path in enumerate(proc_images):
+                if shared_3d_masks:
+                    selected_masks = [dict(mask, image_index=0) for mask in proc_masks]
+                else:
+                    selected_masks = [
+                        dict(mask, image_index=0) for mask in proc_masks
+                        if mask.get("image_index") == image_index
+                    ]
+                result = self._base_output_entry(entry, composite_id)
+                result.update({
+                    "identifier": f"{composite_id}_modality{image_index}",
+                    "source_identifier": source_identifier,
+                    "proc_images": [image_path],
+                    "proc_masks": selected_masks,
+                    "preprocessing_metadata": pipeline_metadata,
+                    "preprocessing": copy.deepcopy(status_block),
+                })
+                result["preprocessing"]["output_counts"] = {
+                    "images": 1, "masks": len(selected_masks),
+                }
+                outputs.append(result)
+            return outputs
+
+        result = self._base_output_entry(entry, composite_id)
+        result.update({
+            "proc_images": proc_images,
+            "proc_masks": proc_masks,
+            "preprocessing_metadata": pipeline_metadata,
+            "preprocessing": status_block,
+        })
+        return [result]
+
+    def _process_one_group(self, key, entry, subdataset_configs, logger):
+        composite_id = get_composite_identifier(entry)
+        base = self._base_output_entry(entry, composite_id)
+        base["proc_images"] = []
+        base["proc_masks"] = []
+
+        if not entry.get("images"):
+            error = ValueError("group has no input images")
+            base["preprocessing"] = self._preprocessing_result(
+                entry, {}, "failed", "load_error", "load", error,
+            )
+            logger.error("Group %s has no input images", key)
+            return [base]
+
+        image_paths = sorted(
+            item["path"] if isinstance(item, dict) else item
+            for item in entry.get("images") or []
+        )
+        mask_paths = sorted(
+            item["path"] if isinstance(item, dict) else item
+            for item in entry.get("masks") or []
+        )
+        sub_name = entry.get("subdataset_name") or entry.get("name")
+        sub_modality = entry.get("subdataset_modality") or (
+            (self.metadata.get("modalities") or ["default"])[0]
+        )
+        output_dirs = render_output_dirs(
+            config.BASE_PROC, self.dataset_name, entry, sub_modality, sub_name,
+            composite_id, config.OUTPUT_STRUCTURE["group_folder_template"],
+            config.OUTPUT_STRUCTURE["images_folder"],
+            config.OUTPUT_STRUCTURE["masks_folder"],
+        )
+        options = entry.get("preprocessing_options")
+        if options is None:
+            options = get_preprocessing_options(
+                self.metadata, sub_name, include_defaults=False,
+            )
+        options = options or {}
+
+        reset_tracking = getattr(self.preprocessor, "_reset_group_tracking", None)
+        if reset_tracking is not None:
+            reset_tracking()
+        try:
+            os.makedirs(output_dirs["img_out_dir"], exist_ok=True)
+            os.makedirs(output_dirs["mask_out_dir"], exist_ok=True)
+            metadata = self.preprocessor.preprocess_group(
+                sub_name, entry.get("subdataset_pipeline"), image_paths, mask_paths,
+                sub_modality, output_dirs["img_out_dir"], output_dirs["mask_out_dir"],
+                composite_id, self.mask_classes, options,
+            )
+        except Exception as error:
+            logger.error("Error preprocessing group %s: %s", key, error, exc_info=True)
+            tracking = self.preprocessor.get_group_tracking_metadata()
+            usable = bool(tracking.get("proc_images") and tracking.get("proc_masks"))
+            status = "partial" if usable else "failed"
+            reason = "partial_output" if usable else self._failure_reason(tracking.get("stage"))
+            result = self._base_output_entry(entry, composite_id)
+            result["proc_images"] = list(tracking.get("proc_images") or []) if usable else []
+            result["proc_masks"] = list(tracking.get("proc_masks") or []) if usable else []
+            result["preprocessing_metadata"] = {}
+            result["preprocessing"] = self._preprocessing_result(
+                entry, tracking, status, reason, tracking.get("stage"), error,
+            )
+            return [result]
+
+        proc_images = metadata.get("proc_images") or []
+        proc_masks = metadata.get("proc_masks") or []
+        if not proc_images or not proc_masks:
+            reason = self._primary_reason(metadata.get("reasons") or [])
+            base["preprocessing_metadata"] = self._clean_pipeline_metadata(metadata)
+            base["preprocessing"] = self._preprocessing_result(
+                entry, metadata, "rejected", reason,
+            )
+            logger.warning("Group %s rejected: %s", key, reason)
+            return [base]
+
+        status = self._preprocessing_result(entry, metadata, "accepted")
+        return self._successful_entries(entry, composite_id, metadata, status, options)
+
+    def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger, workers=1):
+        items = list(identifiers.items())
+        if workers <= 1 or len(items) <= 1:
+            results = []
+            for key, entry in items:
+                results.extend(self._process_one_group(key, entry, subdataset_configs, logger))
+            return results
+
+        thread_state = threading.local()
+
+        def process_one(item):
+            if not hasattr(thread_state, "dataset"):
+                current = self.preprocessor
+                worker_preprocessor = Preprocessor(
+                    target_size=current.target_size,
+                    ct_profiles=current.ct_profiles,
+                    min_mask_size=current.min_mask_size,
+                    min_component_voxels_3d=current.min_component_voxels_3d,
+                    dataset_logger=logger,
+                    dataset_name=current.dataset_name,
+                    background_value=current.background_value,
+                )
+                worker_dataset = SegmentationDataset(self.dataset_name, self.metadata)
+                worker_dataset.preprocessor = worker_preprocessor
+                thread_state.dataset = worker_dataset
+            key, entry = item
+            return thread_state.dataset._process_one_group(
+                key, entry, subdataset_configs, logger,
+            )
+
+        results = []
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="dripp-group",
+        ) as executor:
+            for group_results in executor.map(process_one, items):
+                results.extend(group_results)
+        return results
+
+    def _build_nested_manifest(self, source, results):
+        by_locator = defaultdict(list)
+        for result in results:
+            locator = tuple(result.get("_source_locator", ()))
+            manifest_result = copy.deepcopy(result)
+            manifest_result.pop("_source_locator", None)
+            by_locator[locator].append(manifest_result)
+
+        nested = copy.deepcopy(source)
+        nested["preprocessing_schema_version"] = REPORT_SCHEMA_VERSION
+        for sub_index, subdataset in enumerate(nested.get("subdatasets", [])):
+            for split in ("train", "test"):
+                rebuilt = []
+                for group_index, original in enumerate(subdataset.get(split, [])):
+                    replacement = by_locator.get((sub_index, split, group_index))
+                    rebuilt.extend(replacement if replacement is not None else [original])
+                subdataset[split] = rebuilt
+        return nested
+
+    def _build_report(self, results, preprocessing_seconds, manifest_seconds):
+        unique_results = {}
+        for result in results:
+            key = tuple(result.get("_source_locator") or (
+                result.get("identifier"), result.get("split"),
+                result.get("subdataset_name"),
+            ))
+            unique_results.setdefault(key, result)
+        attempted_results = list(unique_results.values())
+        status_counts = Counter(result["preprocessing"]["status"] for result in attempted_results)
+        reason_counts = Counter(
+            result["preprocessing"]["reason"] for result in attempted_results
+            if result["preprocessing"].get("reason")
+        )
+        issues = []
+        for result in attempted_results:
+            state = result["preprocessing"]
+            if state["status"] == "accepted":
+                continue
+            issues.append({
+                "identifier": result.get("source_identifier", result.get("identifier")),
+                "split": result.get("split"),
+                "subdataset": result.get("subdataset_name"),
+                "stage": state.get("stage"),
+                "reason": state.get("reason"),
+            })
+
+        quality_policies_3d = []
+        seen_policies = set()
+        for result in attempted_results:
+            policy = result["preprocessing"].get("quality_policy_3d") or {}
+            if not policy:
+                continue
+            policy_key = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+            if policy_key not in seen_policies:
+                seen_policies.add(policy_key)
+                quality_policies_3d.append(policy)
+
+        return {
+            "dataset": self.dataset_name,
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "thresholds": {
+                "min_component_size_2d": self.preprocessor.min_mask_size,
+                "min_component_voxels_3d": self.preprocessor.min_component_voxels_3d,
+            },
+            "quality_policies_3d": quality_policies_3d,
+            "group_counts": {
+                "attempted": sum(status_counts.values()),
+                "accepted": status_counts["accepted"],
+                "rejected": status_counts["rejected"],
+                "failed": status_counts["failed"],
+                "partial": status_counts["partial"],
+            },
+            "reason_counts": dict(sorted(reason_counts.items())),
+            "durations_seconds": {
+                "preprocessing": round(preprocessing_seconds, 6),
+                "manifest_writing": round(manifest_seconds, 6),
+            },
+            "issues": issues,
+        }
+
+    def process(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
+        self.preprocessor = preprocessor
+        selected_modalities = normalize_modality_filter(modalities)
+        groups_file = os.path.join(GROUPS_DIR, f"{self.dataset_name}_groups.json")
+        with open(groups_file, "r", encoding="utf-8") as handle:
+            groups_data = json.load(handle)
+
+        grouping_regex = self.metadata.get("grouping_regex")
+        subdataset_configs = (
+            get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
+        )
+        candidates = []
+        for sub_index, subdataset in enumerate(groups_data.get("subdatasets", [])):
+            sub_name = subdataset.get("name", "default")
+            modality = subdataset.get(
+                "modality", (self.metadata.get("modalities") or ["default"])[0],
+            )
+            if not modality_is_selected(modality, selected_modalities):
+                continue
+            for split in ("train", "test"):
+                split_groups = []
+                for group_index, original in enumerate(subdataset.get(split, [])):
+                    entry = copy.deepcopy(original)
+                    entry["split"] = entry.get("split", split)
+                    entry["subdataset_name"] = sub_name
+                    entry["subdataset_modality"] = modality
+                    entry.setdefault("subdataset_pipeline", subdataset.get("pipeline"))
+                    entry["_source_locator"] = (sub_index, split, group_index)
+                    split_groups.append(entry)
+                if max_groups > 0 and len(split_groups) > max_groups:
+                    split_groups = random.sample(split_groups, max_groups)
+                candidates.extend(split_groups)
+
+        identifiers = {
+            (entry.get("identifier"), entry["split"], entry["subdataset_name"], ordinal): entry
+            for ordinal, entry in enumerate(candidates)
+        }
+        preprocessing_started = time.perf_counter()
+        results = self._process_grouping_and_copy(
+            identifiers, subdataset_configs, self.preprocessor.dataset_logger,
+            workers=workers,
+        )
+        preprocessing_seconds = time.perf_counter() - preprocessing_started
+
+        nested = self._build_nested_manifest(groups_data, results)
+        legacy = []
+        for result in results:
+            if (result["preprocessing"]["status"] in {"accepted", "partial"}
+                    and result.get("proc_images") and result.get("proc_masks")):
+                legacy_result = copy.deepcopy(result)
+                legacy_result.pop("_source_locator", None)
+                legacy.append(legacy_result)
+        manifest_started = time.perf_counter()
+        atomic_write_json(
+            os.path.join(self.output_dir, f"{self.dataset_name}_groups.json"), nested,
+        )
+        atomic_write_json(os.path.join(self.output_dir, "groupings.json"), legacy)
+        manifest_seconds = time.perf_counter() - manifest_started
+        report = self._build_report(results, preprocessing_seconds, manifest_seconds)
+        atomic_write_json(
+            os.path.join(self.output_dir, "preprocessing_report.json"), report, indent=2,
+        )
+
+        self.metadata["Preprocessed?"] = "yes"
+        self.preprocessor.dataset_logger.info(
+            "Dataset %s: attempted=%d accepted=%d rejected=%d failed=%d partial=%d; "
+            "preprocessing=%.3fs manifest_writing=%.3fs",
+            self.dataset_name, report["group_counts"]["attempted"],
+            report["group_counts"]["accepted"], report["group_counts"]["rejected"],
+            report["group_counts"]["failed"], report["group_counts"]["partial"],
+            preprocessing_seconds, manifest_seconds,
+        )
 
 class DatasetManager:
     """

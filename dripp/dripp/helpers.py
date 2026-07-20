@@ -6,7 +6,13 @@ import logging
 import numpy as np
 from typing import Dict, List
 
-from .config import DEFAULT_LOG_LEVEL, _CLASS_RE, _RANGE_RE, _DIGIT_RE
+from .config import (
+    DEFAULT_LOG_LEVEL, _CLASS_RE, _RANGE_RE, _DIGIT_RE,
+    MIN_COMPONENT_VOXELS_3D, MASK_QC_DOWNSAMPLE_3D,
+    MIN_SLICE_AREA_PX_3D, MIN_SLICE_AREA_FRACTION_3D,
+    MIN_QUALIFIED_SLICES_3D,
+    REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D,
+)
 
 
 def get_array_module(array):
@@ -51,6 +57,12 @@ DEFAULT_PREPROCESSING_OPTIONS = {
     "mask_series_strategy": "generic",
     "tile_coordinate_strategy": "none",
     "dicom_sort": "position",
+    "min_component_voxels_3d": MIN_COMPONENT_VOXELS_3D,
+    "mask_qc_downsample_3d": MASK_QC_DOWNSAMPLE_3D,
+    "min_slice_area_px_3d": MIN_SLICE_AREA_PX_3D,
+    "min_slice_area_fraction_3d": MIN_SLICE_AREA_FRACTION_3D,
+    "min_qualified_slices_3d": MIN_QUALIFIED_SLICES_3D,
+    "require_contiguous_qualified_slices_3d": REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D,
 }
 
 
@@ -90,6 +102,18 @@ PREPROCESSING_BOOL_OPTIONS = {
     "skip_unmatched_2d_images",
     "save_2d_masks_with_source_stem",
     "split_processed_images_by_modality",
+    "require_contiguous_qualified_slices_3d",
+}
+
+PREPROCESSING_INT_OPTIONS = {
+    "min_component_voxels_3d",
+    "mask_qc_downsample_3d",
+    "min_slice_area_px_3d",
+    "min_qualified_slices_3d",
+}
+
+PREPROCESSING_FLOAT_OPTIONS = {
+    "min_slice_area_fraction_3d",
 }
 
 def set_indexing_log(index_dir, dataset_name):
@@ -150,7 +174,65 @@ def _parse_preprocessing_value(key, raw_value):
             )
         return lowered
 
+    if key in PREPROCESSING_INT_OPTIONS:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid integer value '{value}' for preprocessing option '{key}'."
+            ) from exc
+        if key == "mask_qc_downsample_3d" and parsed < 1:
+            raise ValueError("mask_qc_downsample_3d must be at least 1")
+        if key != "mask_qc_downsample_3d" and parsed < 0:
+            raise ValueError(f"{key} must be zero or greater")
+        return parsed
+
+    if key in PREPROCESSING_FLOAT_OPTIONS:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid numeric value '{value}' for preprocessing option '{key}'."
+            ) from exc
+        if not 0.0 <= parsed <= 1.0:
+            raise ValueError(f"{key} must be between 0 and 1")
+        return parsed
+
     raise ValueError(f"Unknown preprocessing option '{key}'.")
+
+
+def normalize_3d_quality_policy(options, *, applied=False):
+    """Return and validate the effective JSON-safe 3D quality policy."""
+    policy = {
+        "min_component_voxels_3d": int(options.get("min_component_voxels_3d", 0)),
+        "mask_qc_downsample_3d": int(options.get("mask_qc_downsample_3d", 2)),
+        "min_slice_area_px_3d": int(options.get("min_slice_area_px_3d", 0)),
+        "min_slice_area_fraction_3d": float(
+            options.get("min_slice_area_fraction_3d", 0.0)
+        ),
+        "min_qualified_slices_3d": int(options.get("min_qualified_slices_3d", 0)),
+        "require_contiguous_qualified_slices_3d": bool(
+            options.get("require_contiguous_qualified_slices_3d", False)
+        ),
+        "applied": bool(applied),
+    }
+    if policy["min_component_voxels_3d"] < 0:
+        raise ValueError("min_component_voxels_3d must be zero or greater")
+    if policy["mask_qc_downsample_3d"] < 1:
+        raise ValueError("mask_qc_downsample_3d must be at least 1")
+    if policy["min_slice_area_px_3d"] < 0:
+        raise ValueError("min_slice_area_px_3d must be zero or greater")
+    if not 0.0 <= policy["min_slice_area_fraction_3d"] <= 1.0:
+        raise ValueError("min_slice_area_fraction_3d must be between 0 and 1")
+    if policy["min_qualified_slices_3d"] < 0:
+        raise ValueError("min_qualified_slices_3d must be zero or greater")
+    if (policy["require_contiguous_qualified_slices_3d"]
+            and policy["min_qualified_slices_3d"] == 0):
+        raise ValueError(
+            "require_contiguous_qualified_slices_3d requires "
+            "min_qualified_slices_3d greater than zero"
+        )
+    return policy
 
 
 def _parse_preprocessing_options_body(body):

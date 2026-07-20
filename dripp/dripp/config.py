@@ -137,6 +137,39 @@ DEFAULT_NORMALIZATION = {
     "do_zscore": _CONFIG.getboolean("preprocessing", "normalization_do_zscore"),
 }
 MIN_COMPONENT_SIZE = _CONFIG.getint("preprocessing", "min_component_size")
+MIN_COMPONENT_VOXELS_3D = _CONFIG.getint(
+    "preprocessing", "min_component_voxels_3d", fallback=64
+)
+MASK_QC_DOWNSAMPLE_3D = _CONFIG.getint(
+    "preprocessing", "mask_qc_downsample_3d", fallback=2
+)
+MIN_SLICE_AREA_PX_3D = _CONFIG.getint(
+    "preprocessing", "min_slice_area_px_3d", fallback=0
+)
+MIN_SLICE_AREA_FRACTION_3D = _CONFIG.getfloat(
+    "preprocessing", "min_slice_area_fraction_3d", fallback=0.0
+)
+MIN_QUALIFIED_SLICES_3D = _CONFIG.getint(
+    "preprocessing", "min_qualified_slices_3d", fallback=0
+)
+REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D = _CONFIG.getboolean(
+    "preprocessing", "require_contiguous_qualified_slices_3d", fallback=False
+)
+if MIN_COMPONENT_VOXELS_3D < 0:
+    raise ValueError("preprocessing.min_component_voxels_3d must be zero or greater")
+if MASK_QC_DOWNSAMPLE_3D < 1:
+    raise ValueError("preprocessing.mask_qc_downsample_3d must be at least 1")
+if MIN_SLICE_AREA_PX_3D < 0:
+    raise ValueError("preprocessing.min_slice_area_px_3d must be zero or greater")
+if not 0.0 <= MIN_SLICE_AREA_FRACTION_3D <= 1.0:
+    raise ValueError("preprocessing.min_slice_area_fraction_3d must be between 0 and 1")
+if MIN_QUALIFIED_SLICES_3D < 0:
+    raise ValueError("preprocessing.min_qualified_slices_3d must be zero or greater")
+if REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D and MIN_QUALIFIED_SLICES_3D == 0:
+    raise ValueError(
+        "preprocessing.require_contiguous_qualified_slices_3d requires "
+        "min_qualified_slices_3d greater than zero"
+    )
 
 # -------------------------------------------------------------------------------
 # File extensions
@@ -224,6 +257,12 @@ def get_config_summary():
             "target_size": DEFAULT_TARGET_SIZE,
             "normalization": DEFAULT_NORMALIZATION,
             "min_component_size": MIN_COMPONENT_SIZE,
+            "min_component_voxels_3d": MIN_COMPONENT_VOXELS_3D,
+            "mask_qc_downsample_3d": MASK_QC_DOWNSAMPLE_3D,
+            "min_slice_area_px_3d": MIN_SLICE_AREA_PX_3D,
+            "min_slice_area_fraction_3d": MIN_SLICE_AREA_FRACTION_3D,
+            "min_qualified_slices_3d": MIN_QUALIFIED_SLICES_3D,
+            "require_contiguous_qualified_slices_3d": REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D,
         },
         "input_extensions": {
             "video": sorted(VIDEO_EXTS),
@@ -268,6 +307,12 @@ normalization_percentile_min = {DEFAULT_NORMALIZATION["percentile_min"]}
 normalization_percentile_max = {DEFAULT_NORMALIZATION["percentile_max"]}
 normalization_do_zscore = {str(DEFAULT_NORMALIZATION["do_zscore"]).lower()}
 min_component_size = {MIN_COMPONENT_SIZE}
+min_component_voxels_3d = {MIN_COMPONENT_VOXELS_3D}
+mask_qc_downsample_3d = {MASK_QC_DOWNSAMPLE_3D}
+min_slice_area_px_3d = {MIN_SLICE_AREA_PX_3D}
+min_slice_area_fraction_3d = {MIN_SLICE_AREA_FRACTION_3D}
+min_qualified_slices_3d = {MIN_QUALIFIED_SLICES_3D}
+require_contiguous_qualified_slices_3d = {str(REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D).lower()}
 
 [input_extensions]
 # Comma-separated extensions used when indexing raw datasets.
