@@ -92,6 +92,57 @@ class ComponentVoxelFilterTests(unittest.TestCase):
         self.assertIn("component_below_minimum_size_2d", tracking["reasons"])
 
 
+class PairingRegressionTests(unittest.TestCase):
+    def _run_2d_group(self, mask_path):
+        preprocessor = Preprocessor(
+            target_size=(4, 4), min_mask_size=1, dataset_name="fixture",
+        )
+        mask = np.ones((4, 4), dtype=np.uint8)
+        preprocessor.is_significant_crop = False
+        image = np.ones((4, 4), dtype=np.float32)
+        with mock.patch.object(
+            preprocessor, "load_mask", return_value=(mask, None, None),
+        ), mock.patch.object(
+            preprocessor, "load_image", return_value=(image, None),
+        ), mock.patch.object(
+            preprocessor, "_crop", side_effect=lambda value, _bbox: value,
+        ), mock.patch.object(
+            preprocessor, "_resize", side_effect=lambda value, is_mask: value,
+        ), mock.patch.object(
+            preprocessor, "_normalize_intensity",
+            side_effect=lambda value, *_args, **_kwargs: value,
+        ), mock.patch.object(
+            preprocessor, "_save_mask",
+        ) as save_mask, mock.patch.object(
+            preprocessor, "_save_image",
+        ), mock.patch(
+            "dripp.preprocessor.match_mask_class", return_value="organ",
+        ):
+            preprocessor.preprocess_2d(
+                "site", ["/tmp/case_a.png", "/tmp/case_b.png"],
+                [mask_path], "default", "/tmp", "/tmp", "group",
+                (0, 4, 0, 4), {}, {
+                    "mask_stem_strategy": "stem",
+                    "save_2d_masks_with_source_stem": False,
+                    "skip_unmatched_2d_images": False,
+                },
+            )
+        return preprocessor, save_mask
+
+    def test_stem_pairing_is_recorded_when_source_stem_filename_is_disabled(self):
+        _preprocessor, save_mask = self._run_2d_group("/tmp/case_b.png")
+        self.assertEqual(save_mask.call_count, 1)
+        self.assertEqual(save_mask.call_args.kwargs["pairing_index"], 1)
+
+    def test_unmatched_multi_image_mask_is_not_assigned_to_image_zero(self):
+        preprocessor, save_mask = self._run_2d_group("/tmp/no_match.png")
+        self.assertEqual(save_mask.call_count, 0)
+        tracking = preprocessor.get_group_tracking_metadata()
+        self.assertEqual(tracking["qc"]["unmatched_2d_masks"], 1)
+        self.assertIn("unmatched_2d_mask", tracking["reasons"])
+
+
+
 class FakePreprocessor:
     target_size = (8, 8)
     ct_profiles = None
@@ -130,6 +181,7 @@ class FakePreprocessor:
             "min_slice_area_fraction_3d": 0.00153,
             "min_qualified_slices_3d": 8,
             "require_contiguous_qualified_slices_3d": True,
+            "slice_axis_sampling_3d": "full_resolution",
             "applied": True,
         }
 
@@ -229,7 +281,7 @@ class ManifestResultTests(unittest.TestCase):
                 report = json.load(handle)
 
             self.assertEqual(nested["dataset_metadata"], groups["dataset_metadata"])
-            self.assertEqual(nested["preprocessing_schema_version"], 2)
+            self.assertEqual(nested["preprocessing_schema_version"], 3)
             subdataset = nested["subdatasets"][0]
             self.assertEqual(subdataset["tasks"], ["segment"])
             self.assertEqual(subdataset["classes"], ["organ"])
@@ -258,8 +310,52 @@ class ManifestResultTests(unittest.TestCase):
                 "failed": 1, "partial": 1,
             })
             self.assertEqual(len(report["issues"]), 4)
-            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(report["schema_version"], 3)
             self.assertIn(FakePreprocessor._policy(), report["quality_policies_3d"])
+
+    def test_shared_2d_masks_are_copied_to_every_split_modality(self):
+        dataset = object.__new__(SegmentationDataset)
+        dataset.preprocessor = FakePreprocessor()
+        entry = {
+            "identifier": "qubiq",
+            "images": [{"path": "/raw/modalities.nii.gz"}],
+            "masks": [{"path": "/raw/consensus.png"}],
+        }
+        metadata = {
+            "proc_images": [f"/processed/modality{index}.png" for index in range(4)],
+            "proc_masks": [
+                {
+                    "path": "/processed/consensus.png", "class": "tumor",
+                    "image_index": 0, "dimension": 2,
+                }
+            ],
+        }
+        status = {
+            "status": "accepted", "reason": None, "stage": None,
+            "output_counts": {"images": 4, "masks": 1},
+        }
+        shared = dataset._successful_entries(
+            entry, "qubiq", metadata, status, {
+                "split_processed_images_by_modality": True,
+                "share_masks_across_processed_images": True,
+            },
+        )
+        self.assertEqual(len(shared), 4)
+        self.assertTrue(all(len(item["proc_masks"]) == 1 for item in shared))
+        self.assertTrue(all(
+            item["proc_masks"][0]["image_index"] == 0 for item in shared
+        ))
+
+        separate = dataset._successful_entries(
+            entry, "qubiq", metadata, status, {
+                "split_processed_images_by_modality": True,
+                "share_masks_across_processed_images": False,
+            },
+        )
+        self.assertEqual(
+            [len(item["proc_masks"]) for item in separate], [1, 0, 0, 0]
+        )
+
 
     def test_atomic_write_preserves_previous_manifest_on_serialization_failure(self):
         with tempfile.TemporaryDirectory() as root:

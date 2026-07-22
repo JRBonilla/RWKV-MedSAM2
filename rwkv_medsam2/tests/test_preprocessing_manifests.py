@@ -3,6 +3,8 @@ import os
 import tempfile
 import unittest
 import warnings
+import numpy as np
+import SimpleITK as sitk
 from types import SimpleNamespace
 from unittest import mock
 
@@ -94,6 +96,7 @@ class DrippPolicyTrustTests(unittest.TestCase):
             "min_slice_area_fraction_3d": 0.00153,
             "min_qualified_slices_3d": 8,
             "require_contiguous_qualified_slices_3d": True,
+            "slice_axis_sampling_3d": "full_resolution",
             "applied": True,
         }
         policy.update(updates)
@@ -104,7 +107,7 @@ class DrippPolicyTrustTests(unittest.TestCase):
         dataset_dir = os.path.join(root, "fixture")
         os.makedirs(dataset_dir)
         manifest = {
-            "preprocessing_schema_version": 2,
+            "preprocessing_schema_version": 3,
             "subdatasets": [{
                 "name": "site", "modality": "mri", "tasks": ["segment"],
                 "classes": ["organ"], "train": entries, "test": [],
@@ -151,6 +154,8 @@ class DrippPolicyTrustTests(unittest.TestCase):
 
     def test_legacy_malformed_and_weaker_policies_use_fallback(self):
         policies = [
+            {key: value for key, value in self._policy().items()
+             if key != "slice_axis_sampling_3d"},
             {},
             self._policy(applied=False),
             self._policy(min_component_voxels_3d=63),
@@ -184,6 +189,32 @@ class DrippPolicyTrustTests(unittest.TestCase):
         self.assertEqual(len(pairs), len(policies))
         self.assertEqual(load_stats.call_count, len(policies))
         self.assertEqual(evaluate.call_count, len(policies))
+
+
+class MaskStatsSamplingTests(unittest.TestCase):
+    def test_sequence_axis_is_full_resolution_and_voxel_count_is_exact(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "mask.nii.gz")
+            mask = np.zeros((8, 16, 16), dtype=np.uint8)
+            mask[:, :8, :8] = 1
+            sitk.WriteImage(sitk.GetImageFromArray(mask), path)
+
+            ok, stats = preprocessing.compute_mask_stats_3d(path, downsample=2)
+            self.assertTrue(ok)
+            self.assertEqual(stats["sampling_semantics"], "in_plane_only_v1")
+            self.assertEqual(stats["per_slice_len"], 8)
+            self.assertEqual(stats["voxels_exact"], int(mask.sum()))
+
+            accepted, info = preprocessing.evaluate_quality_from_stats(
+                stats, {
+                    "min_voxels": 64,
+                    "min_slices_any_axis": 8,
+                    "min_slice_area_px": 16,
+                    "min_frac_2d_area": 0.0,
+                },
+            )
+            self.assertTrue(accepted, info)
+
 
 
 class CacheSignatureTests(unittest.TestCase):

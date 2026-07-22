@@ -251,6 +251,7 @@ Supported options:
 | `mask_stem_strategy` | `none`, `stem`, `stem_before_underscore` |
 | `save_2d_masks_with_source_stem` | `true`, `false` |
 | `split_processed_images_by_modality` | `true`, `false` |
+| `share_masks_across_processed_images` | `true`, `false`; give every split image the same source masks |
 | `mask_series_strategy` | `generic`, `split_unique_labels` |
 | `tile_coordinate_strategy` | `none`, `row_col_filename` |
 | `dicom_sort` | `position`, `none` |
@@ -274,7 +275,7 @@ Examples:
 ```
 
 ```text
-[brain-tumor] {save_2d_masks_with_source_stem: true; split_processed_images_by_modality: true}
+[brain-tumor] {save_2d_masks_with_source_stem: true; split_processed_images_by_modality: true; share_masks_across_processed_images: true}
 ```
 
 ```text
@@ -284,8 +285,9 @@ Examples:
 The 3D options are evaluated on each connected component before it is written.
 Slice area is the larger of the absolute pixel threshold and the configured
 fraction of the full slice area. Slice-count and contiguity checks use the
-highest-resolution viewing axis. A downsample value of `2` preserves the fast
-sampling semantics used by RWKV-MedSAM2.
+highest-resolution viewing axis. The viewing axis remains at full resolution so
+slice-count and contiguity thresholds refer to real source slices; downsampling
+is applied only within each slice for the fast area calculation.
 
 The active server run enables the complete policy globally in `dripp.ini`:
 

@@ -54,6 +54,7 @@ DEFAULT_PREPROCESSING_OPTIONS = {
     "mask_stem_strategy": "none",
     "save_2d_masks_with_source_stem": False,
     "split_processed_images_by_modality": False,
+    "share_masks_across_processed_images": False,
     "mask_series_strategy": "generic",
     "tile_coordinate_strategy": "none",
     "dicom_sort": "position",
@@ -102,6 +103,7 @@ PREPROCESSING_BOOL_OPTIONS = {
     "skip_unmatched_2d_images",
     "save_2d_masks_with_source_stem",
     "split_processed_images_by_modality",
+    "share_masks_across_processed_images",
     "require_contiguous_qualified_slices_3d",
 }
 
@@ -214,6 +216,11 @@ def normalize_3d_quality_policy(options, *, applied=False):
         "require_contiguous_qualified_slices_3d": bool(
             options.get("require_contiguous_qualified_slices_3d", False)
         ),
+        # This is an implementation semantic, not a user-configurable threshold.
+        # Keeping the sequence axis at full resolution makes slice counts refer
+        # to real source slices while only the in-plane area calculation is
+        # sampled.
+        "slice_axis_sampling_3d": "full_resolution",
         "applied": bool(applied),
     }
     if policy["min_component_voxels_3d"] < 0:

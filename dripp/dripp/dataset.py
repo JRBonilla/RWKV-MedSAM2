@@ -31,7 +31,7 @@ from .helpers import *
 from .output_structure import render_output_dirs
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 
 
 def atomic_write_json(path, value, *, indent=None):
@@ -458,9 +458,12 @@ class SegmentationDataset:
         )
         if split_outputs and len(proc_images) > 1:
             outputs = []
-            shared_3d_masks = bool(metadata.get("image_niftis"))
+            shared_masks = (
+                bool(metadata.get("image_niftis"))
+                or bool(options.get("share_masks_across_processed_images"))
+            )
             for image_index, image_path in enumerate(proc_images):
-                if shared_3d_masks:
+                if shared_masks:
                     selected_masks = [dict(mask, image_index=0) for mask in proc_masks]
                 else:
                     selected_masks = [

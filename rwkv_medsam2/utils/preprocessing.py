@@ -30,7 +30,8 @@ from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Any, Optional, List
 from rwkv_medsam2.dataset import SegmentationSequenceDataset, SequenceTransform  # noqa: E402
 
-DATASET_CACHE_VERSION = "v1.08"
+DATASET_CACHE_VERSION = "v1.09"
+MASKSTATS_CACHE_VERSION = "v2"
 
 
 def _pack_u32_zlib_b64(arr_u32: np.ndarray) -> str:
@@ -76,7 +77,9 @@ def _stats_cache_filename(ds_dir: str, split: str, downsample: int) -> str:
         str: Cache file path.
     """
     ds = int(max(1, downsample))
-    return os.path.join(ds_dir, f"maskstats_{split}_ds{ds}.jsonl")
+    return os.path.join(
+        ds_dir, f"maskstats_{MASKSTATS_CACHE_VERSION}_{split}_ds{ds}.jsonl"
+    )
 
 def load_maskstats_cache(
     ds_dir: str,
@@ -204,6 +207,8 @@ def _dripp_policy_satisfies_quality(policy, quality_params):
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
         return False
     if policy.get("require_contiguous_qualified_slices_3d") is not True:
+        return False
+    if policy.get("slice_axis_sampling_3d") != "full_resolution":
         return False
 
     return (
@@ -1834,8 +1839,9 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
 
     Stored stats include:
       - full_shape: [Z,Y,X]
-      - ds: downsample factor used for per-slice arrays
-      - voxels_est: estimated full-res FG voxel count from ds grid
+      - ds: in-plane downsample factor used for per-slice arrays
+      - sampling_semantics: versioned sequence/in-plane sampling behavior
+      - voxels_exact: exact full-resolution foreground voxel count
       - slices_by_axis_ds: [sZ,sY,sX] counts of slices with any FG on ds grid
       - max_area_est: estimated max per-slice FG area (scaled to full-res)
       - hi_axis: axis chosen by in-plane resolution proxy
@@ -1844,7 +1850,7 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
 
     Args:
         mask_path (str): Path to a 3D mask image.
-        downsample (int): Stride used for compact per-slice stats.
+        downsample (int): In-plane stride used for compact per-slice stats.
 
     Returns:
         tuple[bool, dict[str, Any]]: Success flag and stats or error info.
@@ -1861,13 +1867,23 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
 
     Z_full, Y_full, X_full = m_bin.shape
 
+    # Choose the viewing/sequence axis before sampling. Keep that axis at
+    # full resolution and sample only the two in-plane axes.
+    inplane_area = np.array([
+        Y_full * X_full,  # axis 0: Z slices are YxX
+        Z_full * X_full,  # axis 1: Y slices are ZxX
+        Z_full * Y_full,  # axis 2: X slices are ZxY
+    ], dtype=np.int64)
+    hi_axis = int(inplane_area.argmax())
+
     ds = int(max(1, downsample))
-    m_ds = m_bin[::ds, ::ds, ::ds] if ds > 1 else m_bin
+    sampling = [slice(None, None, ds)] * 3
+    sampling[hi_axis] = slice(None)
+    m_ds = m_bin[tuple(sampling)] if ds > 1 else m_bin
     Z_ds, Y_ds, X_ds = m_ds.shape
 
-    # Estimated full-res FG voxel count
-    vox_ds = int(m_ds.sum())
-    voxels_est = int(vox_ds * (ds ** 3))
+    # Voxel filtering is exact; only per-slice area statistics are sampled.
+    voxels_exact = int(m_bin.sum())
 
     # Slices with any FG (ds grid) for reference/diagnostics
     sZ = int(np.count_nonzero(m_ds.any(axis=(1, 2))))
@@ -1882,13 +1898,6 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
     ))
     max_area_est = int(max_area_ds * (ds ** 2))
 
-    # Choose highest in-plane resolution axis based on full-res proxy
-    inplane_area = np.array([
-        Y_full * X_full,  # axis 0: Z slices are YxX
-        Z_full * X_full,  # axis 1: Y slices are ZxX
-        Z_full * Y_full,  # axis 2: X slices are ZxY
-    ], dtype=np.int64)
-    hi_axis = int(inplane_area.argmax())
 
     # Per-slice FG area on the chosen axis (ds grid)
     if hi_axis == 0:
@@ -1901,7 +1910,10 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
     stats = {
         "full_shape": [int(Z_full), int(Y_full), int(X_full)],
         "ds": int(ds),
-        "voxels_est": int(voxels_est),
+        "sampling_semantics": "in_plane_only_v1",
+        "voxels_exact": int(voxels_exact),
+        # Retained for older diagnostic consumers; the value is now exact.
+        "voxels_est": int(voxels_exact),
         "slices_by_axis_ds": [int(sZ), int(sY), int(sX)],
         "max_area_est": int(max_area_est),
         "hi_axis": int(hi_axis),
@@ -1915,7 +1927,7 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
     Decide pass/fail using cached stats and the current quality_params.
 
     Enforces:
-      - min_voxels (estimated from ds grid)
+      - min_voxels (exact full-resolution count)
       - existence of a contiguous window of length N=min_slices_any_axis along hi_axis
         where each slice has FG area >= max(min_slice_area_px, min_frac_2d_area * full_slice_area)
 
@@ -1935,9 +1947,9 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
     min_slice_area_px = int(quality_params.get("min_slice_area_px", 32))
     min_frac_2d_area = quality_params.get("min_frac_2d_area", None)
 
-    vox_est = int(stats.get("voxels_est", 0))
-    if vox_est < min_voxels:
-        return False, {"reason": "too_few_voxels", "voxels": vox_est}
+    voxels = int(stats.get("voxels_exact", stats.get("voxels_est", 0)))
+    if voxels < min_voxels:
+        return False, {"reason": "too_few_voxels", "voxels": voxels}
 
     # Full-res slice area for the chosen hi_axis
     if hi_axis == 0:
@@ -1989,7 +2001,7 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
         "hi_axis": hi_axis,
         "contig_window_len": win_len,
         "thr_area_ds": thr_area_ds,
-        "voxels": vox_est,
+        "voxels": voxels,
         "max_area": int(stats.get("max_area_est", 0)),
         "slices_by_axis": stats.get("slices_by_axis_ds", [0, 0, 0]),
     }

@@ -46,7 +46,8 @@ class QualityOptionTests(unittest.TestCase):
                 "{min_component_voxels_3d: 80; mask_qc_downsample_3d: 2; "
                 "min_slice_area_px_3d: 24; min_slice_area_fraction_3d: 0.01; "
                 "min_qualified_slices_3d: 6; "
-                "require_contiguous_qualified_slices_3d: true}"
+                "require_contiguous_qualified_slices_3d: true; "
+                "share_masks_across_processed_images: true}"
                 "[site-b] {min_qualified_slices_3d: 9}"
             )
         }
@@ -56,8 +57,10 @@ class QualityOptionTests(unittest.TestCase):
         policy = normalize_3d_quality_policy(options, applied=True)
         self.assertEqual(policy["min_component_voxels_3d"], 80)
         self.assertEqual(policy["min_qualified_slices_3d"], 9)
+        self.assertTrue(options["share_masks_across_processed_images"])
         self.assertEqual(policy["min_slice_area_fraction_3d"], 0.01)
         self.assertTrue(policy["applied"])
+        self.assertEqual(policy["slice_axis_sampling_3d"], "full_resolution")
 
     def test_invalid_options_are_rejected(self):
         invalid_values = (
@@ -141,7 +144,7 @@ class ComponentExtentFilterTests(unittest.TestCase):
         )
 
         count_labels = np.zeros((10, 16, 16), dtype=np.uint8)
-        count_labels[0:3, :4, :4] = 1
+        count_labels[0:2, :4, :4] = 1
         self.assertEqual(
             self._evaluate(
                 count_labels, self._policy(min_qualified_slices_3d=3)
@@ -169,6 +172,18 @@ class ComponentExtentFilterTests(unittest.TestCase):
         contiguous = np.zeros((10, 16, 16), dtype=np.uint8)
         contiguous[0:5, :4, :4] = 1
         self.assertEqual(self._evaluate(contiguous, policy), {})
+
+    def test_downsampling_preserves_the_sequence_axis(self):
+        labels = np.zeros((8, 16, 16), dtype=np.uint8)
+        labels[:, :8, :8] = 1
+        policy = self._policy(
+            mask_qc_downsample_3d=2,
+            min_slice_area_px_3d=16,
+            min_qualified_slices_3d=8,
+            require_contiguous_qualified_slices_3d=True,
+        )
+        self.assertEqual(self._evaluate(labels, policy), {})
+
 
     def test_highest_resolution_axis_matches_rwkv_heuristic(self):
         labels = np.zeros((8, 4, 10), dtype=np.uint8)
@@ -216,7 +231,7 @@ class ComponentExtentFilterTests(unittest.TestCase):
             self.assertEqual(metadata["qc"]["components_3d_rejected"], 1)
             self.assertEqual(
                 metadata["qc"]["components_3d_rejected_by_reason"],
-                {"component_below_minimum_slice_area_3d": 1},
+                {"component_below_minimum_slices_3d": 1},
             )
             self.assertEqual(len(os.listdir(mask_dir)), 1)
 

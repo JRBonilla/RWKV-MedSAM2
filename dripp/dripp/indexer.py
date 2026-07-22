@@ -425,8 +425,15 @@ def build_groupings(index_data, dataset_dir, metadata):
             logger.info(f"No test images for subdataset {sname}. Randomly splitting training groups.")
             new_train = {}
             new_test = {}
+            identifier_splits = {}
             for key, group in sub["train"].items():
-                if random.random() < train_ratio:
+                # Keep related groups (for example cardiac phases or imaging
+                # planes captured as additional regex fields) on the same side
+                # of the split to prevent patient-level train/test leakage.
+                identifier = group["identifier"]
+                if identifier not in identifier_splits:
+                    identifier_splits[identifier] = random.random() < train_ratio
+                if identifier_splits[identifier]:
                     group["split"] = "train"
                     new_train[key] = group
                 else:

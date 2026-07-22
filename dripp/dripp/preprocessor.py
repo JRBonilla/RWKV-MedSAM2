@@ -216,6 +216,7 @@ class Preprocessor:
             "empty_masks": 0,
             "components_2d_found": 0,
             "components_2d_rejected": 0,
+            "unmatched_2d_masks": 0,
             "components_3d_found": 0,
             "components_3d_rejected": 0,
             "components_3d_rejected_by_reason": {},
@@ -281,7 +282,9 @@ class Preprocessor:
         if not area_enabled and min_slices == 0:
             return rejections
 
-        label_volume = sitk.GetArrayFromImage(relabeled)
+        # Sample through a read-only view; copying every full relabeled volume
+        # made the lightweight QC pass dominate preprocessing time.
+        label_volume = sitk.GetArrayViewFromImage(relabeled)
         if label_volume.ndim != 3:
             return rejections
 
@@ -295,7 +298,9 @@ class Preprocessor:
         full_slice_area = int(inplane_areas[hi_axis])
 
         downsample = policy["mask_qc_downsample_3d"]
-        sampled = label_volume[::downsample, ::downsample, ::downsample]
+        sampling = [slice(None, None, downsample)] * 3
+        sampling[hi_axis] = slice(None)
+        sampled = label_volume[tuple(sampling)]
         sampled = np.moveaxis(sampled, hi_axis, 0)
         component_count = len(component_sizes)
         slice_counts = np.zeros(
@@ -604,8 +609,23 @@ class Preprocessor:
                 pairing_idx = next(
                     (image_idx for image_idx, image_path in enumerate(image_files)
                      if self._mask_stem_for_strategy(image_path, mask_stem_strategy) == valid_stem),
-                    0,
+                    None,
                 )
+                if pairing_idx is None and len(image_files) == 1:
+                    pairing_idx = 0
+                if pairing_idx is None:
+                    self._current_qc["unmatched_2d_masks"] += 1
+                    self._current_qc["components_2d_rejected"] += len(filtered)
+                    self._record_reason("unmatched_2d_mask")
+                    self.dataset_logger.warning(
+                        "No image stem matched 2D mask %s; skipping the mask "
+                        "instead of assigning it to image 0.", msk_path,
+                    )
+                    del filtered, comps, resized_mask, cropped_mask, mask_arr
+                    self._log_2d_component_summary(
+                        msk_path, components_found_before, components_rejected_before,
+                    )
+                    continue
 
                 for j, comp in enumerate(filtered):
                     cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
@@ -613,7 +633,13 @@ class Preprocessor:
                         self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem, pairing_index=pairing_idx)
                     else:
                         img_idx = self.get_matching_image_idx(composite_id, image_files)
-                        self._save_mask(comp, '2d', img_idx, i, j, composite_id, mask_out_dir, cls)
+                        # Filename formatting is independent from the explicit
+                        # image-mask relationship. Keep the legacy filename
+                        # index while recording the stem-matched image index.
+                        self._save_mask(
+                            comp, '2d', img_idx, i, j, composite_id,
+                            mask_out_dir, cls, pairing_index=pairing_idx,
+                        )
                     del comp
                 del filtered, comps, resized_mask, cropped_mask, mask_arr
                 self._log_2d_component_summary(
