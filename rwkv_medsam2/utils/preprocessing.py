@@ -30,7 +30,7 @@ from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Any, Optional, List
 from rwkv_medsam2.dataset import SegmentationSequenceDataset, SequenceTransform  # noqa: E402
 
-DATASET_CACHE_VERSION = "v1.09"
+DATASET_CACHE_VERSION = "v1.10"
 MASKSTATS_CACHE_VERSION = "v2"
 
 
@@ -589,6 +589,10 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                         'pair':       (pair['image'], pair['mask']),
                         'dim':        dim,
                         'modality':   entry_modality,
+                        'identifier': entry.get('identifier'),
+                        'source_identifier': entry.get(
+                            'source_identifier', entry.get('identifier')
+                        ),
                     })
                     ds_kept += 1
                     total_kept_global += 1
@@ -611,6 +615,10 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                             'pair':         (pairs[0]['image'], pairs[0]['mask']),
                             'dim':          dim,
                             'modality':     entry_modality,
+                            'identifier':   entry.get('identifier'),
+                            'source_identifier': entry.get(
+                                'source_identifier', entry.get('identifier')
+                            ),
                         })
                         ds_kept += 1
                         total_kept_global += 1
@@ -627,6 +635,10 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                         'pair':         (pairs[0]['image'], pairs[0]['mask']),
                         'dim':          dim,
                         'modality':     entry_modality,
+                        'identifier':   entry.get('identifier'),
+                        'source_identifier': entry.get(
+                            'source_identifier', entry.get('identifier')
+                        ),
                     })
                     ds_kept += 1
                     total_kept_global += 1
@@ -661,11 +673,11 @@ def get_sequences(
          dataset, subdataset, tasks, class, pair, dim.
       2. If 'tasks_map' is provided, 'get_pairings()' uses it to refine the per-pair
          task list based on the mask class.
-      3. Group all entries by (dataset, subdataset, tasks, modality).
+      3. Group all entries by source identifier (or processed image path fallback).
       4. For 2D, each pair becomes its own single-frame sequence.
       5. Treat each 3D entry as a single-element sequence.
-      6. If 'split=="train"', shuffle and split within each group into train/validation
-         subsets using 'val_frac'.
+      6. If 'split=="train"', assign whole source groups to train or validation
+         within each dataset/subdataset using 'val_frac'.
       7. Return:
          - For 'split=="train"': a tuple '(train_seqs, val_seqs)'.
          - For 'split=="test"': a list 'test_seqs'.
@@ -706,124 +718,59 @@ def get_sequences(
     pairs = get_pairings(
         out_dir, datasets, split, tasks_map=tasks_map, quality_params=quality_params
     )
-    pairs2D = [p for p in pairs if p["dim"] == 2]
-    pairs3D = [p for p in pairs if p["dim"] == 3]
+    def _source_key(pair_record):
+        """Return a stable source-level key shared by all masks of one case."""
+        source = pair_record.get("source_identifier") or pair_record.get("identifier")
+        if source is None:
+            source = os.path.normcase(os.path.abspath(pair_record["pair"][0]))
+        return str(source)
 
-    # 2) Group by (dataset, subdataset, tasks, modality)
-    grouped2D = defaultdict(list)
-    for p in pairs2D:
-        key = (p["dataset"], p["subdataset"], tuple(p["tasks"]), p.get("modality", "unknown"))
-        grouped2D[key].append(p["pair"])  # (img_path, mask_path)
+    def _as_sequence(pair_record):
+        """Convert one paired mask into the sequence metadata consumed by the dataset."""
+        return {
+            "dataset": pair_record["dataset"],
+            "subdataset": pair_record["subdataset"],
+            "tasks": list(pair_record["tasks"]),
+            "class": pair_record.get("class"),
+            "sequence": [pair_record["pair"]],
+            "dim": int(pair_record["dim"]),
+            "modality": pair_record.get("modality", "unknown"),
+            "identifier": pair_record.get("identifier"),
+            "source_identifier": pair_record.get("source_identifier")
+            or pair_record.get("identifier")
+            or _source_key(pair_record),
+        }
 
-    grouped3D = defaultdict(list)
-    for p in pairs3D:
-        key = (p["dataset"], p["subdataset"], tuple(p["tasks"]), p.get("modality", "unknown"))
-        grouped3D[key].append(p["pair"])  # (vol_img_path, vol_mask_path)
+    if split != "train":
+        return [_as_sequence(pair_record) for pair_record in pairs]
+
+    # Split whole source groups, not individual image-mask pairs. A source may
+    # yield many component masks, tasks, or multichannel outputs; assigning its
+    # pairs independently leaks the same image/case into train and validation.
+    grouped_sources = defaultdict(lambda: defaultdict(list))
+    for pair_record in pairs:
+        stratum = (pair_record["dataset"], pair_record["subdataset"])
+        grouped_sources[stratum][_source_key(pair_record)].append(pair_record)
 
     rng = random.Random(seed)
+    train_seqs, val_seqs = [], []
+    for stratum in sorted(grouped_sources):
+        source_groups = list(grouped_sources[stratum].items())
+        source_groups.sort(key=lambda item: item[0])
+        rng.shuffle(source_groups)
 
-    # 3) Build train/val or test lists
-    if split == "train":
-        train_seqs, val_seqs = [], []
+        n_val = int(len(source_groups) * val_frac)
+        if val_frac > 0.0 and len(source_groups) > 1:
+            # Source-level grouping can make small datasets much smaller than
+            # their component-mask counts suggest. Keep one validation source
+            # without ever consuming the only available training source.
+            n_val = min(len(source_groups) - 1, max(1, n_val))
+        val_source_keys = {key for key, _ in source_groups[:n_val]}
+        for source_key, source_pairs in source_groups:
+            destination = val_seqs if source_key in val_source_keys else train_seqs
+            destination.extend(_as_sequence(pair_record) for pair_record in source_pairs)
 
-        # 3a) 2D: split at pair-level; each pair becomes a single-frame sequence
-        for (ds, sub, tasks, modality), frames in grouped2D.items():
-            frames = frames[:]  # copy
-            rng.shuffle(frames)
-
-            n_val = int(len(frames) * val_frac)
-            val_f = frames[:n_val]
-            train_f = frames[n_val:]
-
-            for pair in train_f:
-                train_seqs.append(
-                    {
-                        "dataset": ds,
-                        "subdataset": sub,
-                        "tasks": list(tasks),
-                        "sequence": [pair],  # one frame
-                        "dim": 2,
-                        "modality": modality,
-                    }
-                )
-            for pair in val_f:
-                val_seqs.append(
-                    {
-                        "dataset": ds,
-                        "subdataset": sub,
-                        "tasks": list(tasks),
-                        "sequence": [pair],  # one frame
-                        "dim": 2,
-                        "modality": modality,
-                    }
-                )
-
-        # 3b) 3D: split volumes per sequence; each volume stays as a single-element sequence
-        for (ds, sub, tasks, modality), vols in grouped3D.items():
-            vols = vols[:]  # copy
-            rng.shuffle(vols)
-
-            n_val = int(len(vols) * val_frac)
-            val_v = vols[:n_val]
-            train_v = vols[n_val:]
-
-            for v in train_v:
-                train_seqs.append(
-                    {
-                        "dataset": ds,
-                        "subdataset": sub,
-                        "tasks": list(tasks),
-                        "sequence": [v],
-                        "dim": 3,
-                        "modality": modality,
-                    }
-                )
-            for v in val_v:
-                val_seqs.append(
-                    {
-                        "dataset": ds,
-                        "subdataset": sub,
-                        "tasks": list(tasks),
-                        "sequence": [v],
-                        "dim": 3,
-                        "modality": modality,
-                    }
-                )
-
-        return train_seqs, val_seqs
-
-    # Test split
-    test_seqs = []
-
-    # 2D: each pair becomes a single-frame sequence
-    for (ds, sub, tasks, modality), frames in grouped2D.items():
-        for pair in frames:
-            test_seqs.append(
-                {
-                    "dataset": ds,
-                    "subdataset": sub,
-                    "tasks": list(tasks),
-                    "sequence": [pair],  # one frame
-                    "dim": 2,
-                    "modality": modality,
-                }
-            )
-
-    # 3D: each volume stays as a single-element sequence
-    for (ds, sub, tasks, modality), vols in grouped3D.items():
-        for v in vols:
-            test_seqs.append(
-                {
-                    "dataset": ds,
-                    "subdataset": sub,
-                    "tasks": list(tasks),
-                    "sequence": [v],
-                    "dim": 3,
-                    "modality": modality,
-                }
-            )
-
-    return test_seqs
+    return train_seqs, val_seqs
 
 @dataclass
 class DatasetSignature:

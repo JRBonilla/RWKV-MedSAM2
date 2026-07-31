@@ -1,13 +1,39 @@
 # scripts/rebuild_loaders.py
-import os
 import argparse
+import os
+import sys
 
-import torch  # not strictly required, but fine
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from rwkv_medsam2.train_sam2 import (
-    load_config,
     get_data_loaders,
+    load_config,
     save_data_loaders,
 )
+from rwkv_medsam2.utils.teacher_refinement import (
+    assert_disjoint_sources,
+    source_paths,
+)
+
+
+def _validate_loader_sources(config, train_loader, val_loader, test_loader):
+    expected_root = os.path.normcase(os.path.abspath(str(config.dripp.output_dir))) + os.sep
+    splits = {
+        "train": train_loader.dataset.sequences,
+        "validation": val_loader.dataset.sequences,
+        "test": test_loader.dataset.sequences,
+    }
+    for split_name, sequences in splits.items():
+        wrong = sorted(path for path in source_paths(sequences) if not path.startswith(expected_root))
+        if wrong:
+            raise RuntimeError(
+                f"{split_name} contains {len(wrong)} sources outside "
+                f"{config.dripp.output_dir}: {wrong[:3]}"
+            )
+    assert_disjoint_sources(splits["train"], splits["validation"])
+    print("Validated loader source root and zero train/validation image overlap.")
 
 
 def main():
@@ -24,16 +50,23 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load config
     config = load_config(args.config)
-
-    # Build DataLoaders (this is the long bit)
     train_loader, val_loader, test_loader = get_data_loaders(config)
-    print(f"Built loaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
+    print(
+        f"Built loaders: train={len(train_loader)}, "
+        f"val={len(val_loader)}, test={len(test_loader)}"
+    )
+    _validate_loader_sources(config, train_loader, val_loader, test_loader)
 
-    # Save to disk
-    save_data_loaders(args.out, train_loader, val_loader, test_loader)
-    print(f"Saved DataLoaders to: {args.out}")
+    output_path = os.path.abspath(args.out)
+    temporary_path = output_path + ".tmp"
+    try:
+        save_data_loaders(temporary_path, train_loader, val_loader, test_loader)
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    print(f"Saved validated DataLoaders atomically to: {output_path}")
 
 
 if __name__ == "__main__":

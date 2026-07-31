@@ -217,6 +217,77 @@ class MaskStatsSamplingTests(unittest.TestCase):
 
 
 
+class SourceGroupedSplitTests(unittest.TestCase):
+    @staticmethod
+    def _pair(source, mask_index, image_suffix=""):
+        return {
+            "dataset": "fixture",
+            "subdataset": "site",
+            "tasks": ["segment"],
+            "class": "organ",
+            "pair": (
+                f"/tmp/{source}{image_suffix}.png",
+                f"/tmp/{source}_mask{mask_index}.png",
+            ),
+            "dim": 2,
+            "modality": "mri",
+            "identifier": f"entry-{source}-{mask_index}",
+            "source_identifier": source,
+        }
+
+    def test_all_masks_and_channels_from_one_source_stay_in_one_split(self):
+        pairs = []
+        for source_index in range(10):
+            source = f"case-{source_index}"
+            pairs.append(self._pair(source, 0))
+            pairs.append(self._pair(source, 1))
+
+        pairs.append(self._pair("case-multichannel", 0, "-channel0"))
+        pairs.append(self._pair("case-multichannel", 1, "-channel1"))
+
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "fixture"))
+            with mock.patch.object(preprocessing, "get_pairings", return_value=pairs):
+                train, val = preprocessing.get_sequences(
+                    root, split="train", val_frac=0.3, seed=42
+                )
+
+        train_sources = {record["source_identifier"] for record in train}
+        val_sources = {record["source_identifier"] for record in val}
+        self.assertFalse(train_sources & val_sources)
+        expected = {f"case-{index}" for index in range(10)} | {"case-multichannel"}
+        self.assertEqual(train_sources | val_sources, expected)
+
+        for source in train_sources:
+            self.assertFalse(any(r["source_identifier"] == source for r in val))
+        for source in val_sources:
+            self.assertFalse(any(r["source_identifier"] == source for r in train))
+
+    def test_small_dataset_keeps_one_source_for_validation_and_training(self):
+        pairs = [self._pair("case-a", 0), self._pair("case-b", 0)]
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "fixture"))
+            with mock.patch.object(preprocessing, "get_pairings", return_value=pairs):
+                train, val = preprocessing.get_sequences(
+                    root, split="train", val_frac=0.1, seed=42
+                )
+        self.assertEqual(len(train), 1)
+        self.assertEqual(len(val), 1)
+        self.assertNotEqual(
+            train[0]["source_identifier"], val[0]["source_identifier"]
+        )
+
+    def test_test_split_preserves_pair_metadata_without_resplitting(self):
+        pair = self._pair("case-test", 0)
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "fixture"))
+            with mock.patch.object(preprocessing, "get_pairings", return_value=[pair]):
+                records = preprocessing.get_sequences(root, split="test")
+        self.assertEqual(records[0]["source_identifier"], "case-test")
+        self.assertEqual(records[0]["class"], "organ")
+        self.assertEqual(records[0]["sequence"], [pair["pair"]])
+
+
 class CacheSignatureTests(unittest.TestCase):
     def test_manifest_fingerprint_changes_after_manifest_metadata_changes(self):
         with tempfile.TemporaryDirectory() as root:

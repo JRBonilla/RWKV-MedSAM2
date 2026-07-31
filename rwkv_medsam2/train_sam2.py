@@ -44,6 +44,7 @@ from .functions.func_metrics import (
 from .dataset import BalancedTaskBatchSampler
 from .utils.vis import save_vis_gif, frames_to_tb_video
 from .utils.preprocessing import load_datasets
+from .utils.teacher_refinement import assert_disjoint_sources
 
 def load_config(config_path):
     """
@@ -636,11 +637,14 @@ def load_data_loaders(load_path):
     with open(load_path, "rb") as f:
         data = pickle.load(f)
 
-    return (
-        data["train_loaders"],
-        data["val_loaders"],
-        data["test_loaders"],
+    train_loader = data["train_loaders"]
+    val_loader = data["val_loaders"]
+    test_loader = data["test_loaders"]
+    assert_disjoint_sources(
+        train_loader.dataset.sequences,
+        val_loader.dataset.sequences,
     )
+    return train_loader, val_loader, test_loader
 
 def _partial_load_sam21(model, ckpt_path, ignore_prefixes=(), logger=None):
     """

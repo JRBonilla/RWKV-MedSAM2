@@ -14,7 +14,7 @@ validation:
 
 init:
   # Load SAM2.1 tiny weights as much as possible
-  student_ckpt_path: "/root/sam2.1_hiera_tiny.pt"
+  student_ckpt_path: "/data/TrainingCheckpoints/pretrained/sam2.1_hiera_tiny.pt"
 
   # We must ignore trunk (and usually neck) because your VCR backbone differs from Hiera.
   # Start conservative (skip all image_encoder.*). Once stable, you can try narrowing this.
@@ -99,14 +99,14 @@ prompt:
 logging:
   output_dir: "/data/TrainingLogs"
   level: "INFO"
-  filename: "sam2.1_vcr.log"
+  filename: "sam2.1_vcr_v2_1.log"
   file_level: "DEBUG"
   interval: 5
   backups: 7
   train_vis_prompt_mode: box
 
 # ---- Checkpoint config --------------------------------------------------------------
-ckpt_path: "/RWKV-MedSAM2/checkpoints/sam2.1/sam2.1_vcr.pth"
+ckpt_path: "/data/TrainingCheckpoints/sam2.1/sam2.1_vcr_v2_1.pth"
 
 # ---- Teacher settings ---------------------------------------------------------------
 teacher:
