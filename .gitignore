@@ -10,3 +10,12 @@ __pycache__/
 diagnostic_outputs/
 diagnostic_external_video_outputs/
 .vscode/settings.json
+
+# Local container access settings and secrets
+.env
+.env.*
+!.env.example
+
+# Local Codex recovery files
+codex_recovered_conversation.jsonl
+codex_sessions_backup_*/

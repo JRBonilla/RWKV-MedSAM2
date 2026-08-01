@@ -1,24 +1,80 @@
 services:
   training:
-    build: .
-    image: rwkv-medsam2
-    runtime: nvidia
-    shm_size: '8gb'
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENCV_BUILD_JOBS: "${OPENCV_BUILD_JOBS:-8}"
+        CUDA_ARCH_BIN: "8.0"
+    image: rwkv-medsam2:cuda12.8
+    container_name: rwkv-medsam2-2gpu
+    hostname: rwkv-medsam2-2gpu
+    init: true
+    restart: unless-stopped
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+
+    # Do not set CUDA_VISIBLE_DEVICES here. Docker assigns the requested host
+    # GPUs and exposes them inside the container as logical devices 0 and 1.
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=0
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      RWKV_EXPECTED_GPU_COUNT: "2"
+      RWKV_MIN_SHM_GB: "12"
+      SSH_PUBLIC_KEY: "${SSH_PUBLIC_KEY:-}"
+      JUPYTER_TOKEN: "${JUPYTER_TOKEN:-}"
+      JUPYTER_CONFIG_DIR: /var/tmp/jupyter_config
+      JUPYTER_DATA_DIR: /var/tmp/jupyter_data
+      JUPYTER_RUNTIME_DIR: /var/tmp/jupyter_runtime
+      IPYTHONDIR: /var/tmp/ipython
+      XDG_CACHE_HOME: /var/tmp/cache
+      MPLCONFIGDIR: /var/tmp/matplotlib
+
     volumes:
-      - .:/workspace
-      - ./data:/workspace/data
-      - ./checkpoints:/workspace/checkpoints
-      - ./notebooks:/workspace/notebooks
+      - type: volume
+        source: rwkv_data
+        target: /data
+        volume:
+          nocopy: true
+      - type: volume
+        source: rwkv_root
+        target: /root
+        volume:
+          nocopy: true
+
     ports:
-      - "8888:8888"
-      - "6006:6006"
+      - "${SSH_BIND_ADDRESS:-0.0.0.0}:${SSH_HOST_PORT:-31092}:22"
+      - "${JUPYTER_BIND_ADDRESS:-127.0.0.1}:${JUPYTER_HOST_PORT:-8888}:8888"
+      - "${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6006}:6006"
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids:
+                - "${GPU_DEVICE_0:-0}"
+                - "${GPU_DEVICE_1:-1}"
               capabilities: [gpu]
+
+volumes:
+  rwkv_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER:-172.16.16.29},rw,nosuid,nfsvers=${NFS_VERSION:-3},proto=tcp,hard,timeo=600,retrans=2"
+      device: ":${NFS_DATA_EXPORT:-/mnt/vol1/gpudata/lugezg/jrbonill/data}"
+
+  rwkv_root:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER:-172.16.16.29},rw,nosuid,nfsvers=${NFS_VERSION:-3},proto=tcp,hard,timeo=600,retrans=2"
+      device: ":${NFS_ROOT_EXPORT:-/mnt/vol1/gpudata/lugezg/jrbonill/root}"

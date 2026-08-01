@@ -16,15 +16,14 @@ setup(
     install_requires=[
         "numpy",
         "pandas",
-        "opencv-python",
         "SimpleITK",
         "tqdm",
-        "SimpleITK",
         "scipy",
         "nibabel",
         "pydicom"
     ],
     extras_require={
+        "opencv": ["opencv-python>=4.7,<5"],
         "gpu": ["cupy-cuda12x>=13"],
     },
     python_requires= ">=3.7",

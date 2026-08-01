@@ -9,10 +9,12 @@ layout.
 From this repository:
 
 ```bash
-pip install -e dripp
+pip install -e "dripp[opencv]"
 ```
 
-This installs the `dripp` command.
+This installs the `dripp` command and the standard CPU OpenCV wheel. If your
+environment already provides `cv2` (for example, a custom CUDA-enabled OpenCV
+build), install with `pip install -e dripp` instead so pip does not replace it.
 
 ## Create A Local Config
 
