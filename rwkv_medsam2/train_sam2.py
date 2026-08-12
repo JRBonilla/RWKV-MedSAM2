@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from omegaconf import OmegaConf
 
-from ext.sam2.build_sam import build_sam2_video_predictor
+from sam2.build_sam import build_sam2_video_predictor
 
 from .functions.func_2d import train_step_2d, validate_step_2d
 from .functions.func_3d import train_step_3d, validate_step_3d
@@ -1113,7 +1113,7 @@ def as_bthw_mask(x: torch.Tensor, B: int, T: int) -> torch.Tensor:
         return x
     raise ValueError(f"Unsupported mask tensor shape: {tuple(x.shape)}")
 
-def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, scaler, epoch, logger, writer, global_step):
+def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, scaler, epoch, logger, writer, global_step, start_batch_idx=0, batch_index_offset=0, step_callback=None):
     """
     Run one mixed 2D/3D training epoch.
 
@@ -1146,6 +1146,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         scheduler = rebuilt["scheduler"]
 
     total_loss = 0.0
+    processed_steps = 0
     first_vis_2d = False
     first_vis_3d = False
     skipped_2d = 0
@@ -1161,7 +1162,8 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     ping_pong = bool(getattr(getattr(config, "logging", {}), "image_ping_pong", False))
 
     E_total = int(getattr(getattr(config, "training", {}), "epochs", 1))
-    do_viz_this_ep = (
+    disable_images = bool(getattr(getattr(config, "logging", {}), "disable_images", False))
+    do_viz_this_ep = (not disable_images) and (
         epoch == 0
         or ((epoch + 1) % image_every == 0)
         or (epoch == E_total - 1)
@@ -1329,7 +1331,8 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     teacher_2d = teacher if distillation_enabled(config, dim=2) else None
     teacher_3d = teacher if distillation_enabled(config, dim=3) else None
 
-    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", unit="batch", dynamic_ncols=True)
+    is_main_process = bool(getattr(getattr(config, "runtime", {}), "is_main_process", True))
+    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", unit="batch", dynamic_ncols=True, disable=not is_main_process)
 
     train_start_time = time.perf_counter()
     last_out_time = train_start_time
@@ -1371,7 +1374,17 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     else:
         train_vis_prompt_mode = "box"
 
-    for batch_idx, batch in enumerate(pbar):
+    for relative_batch_idx, batch in enumerate(pbar):
+        batch_idx = relative_batch_idx + int(batch_index_offset)
+        if batch_idx < int(start_batch_idx):
+            if step_callback is not None and (batch_idx == 0 or (batch_idx + 1) % 1000 == 0):
+                step_callback(
+                    epoch, batch_idx, global_step,
+                    student, optimizer, scheduler, scaler,
+                )
+            last_out_time = time.perf_counter()
+            continue
+
         _now = time.perf_counter()
         data_wait = _now - last_out_time
 
@@ -1421,6 +1434,8 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 continue
 
             loss = float(step_out["loss"])
+            if "grad_norm" in step_out:
+                writer.add_scalar("train/grad_norm", float(step_out["grad_norm"]), global_step)
 
             writer.add_scalar("train2d/loss", loss, global_step)
             writer.add_scalar("train/lr_backbone", get_lr_group(optimizer, 0), global_step)
@@ -1551,6 +1566,8 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 continue
 
             loss = float(step_out["loss"])
+            if "grad_norm" in step_out:
+                writer.add_scalar("train/grad_norm", float(step_out["grad_norm"]), global_step)
             p_loss = float(step_out["prompt_loss"])
             np_loss = step_out["non_prompt_loss"]
             np_base = step_out["non_prompt_loss_base"]
@@ -1658,7 +1675,10 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 writer.add_text("train/progress", _tb_pre("\n".join(lines)), global_step)
 
         total_loss += float(loss)
+        processed_steps += 1
         global_step += 1
+        if step_callback is not None:
+            step_callback(epoch, batch_idx, global_step, student, optimizer, scheduler, scaler)
         last_out_time = time.perf_counter()
 
     try:
@@ -1667,7 +1687,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         pass
 
     epoch_time = time.perf_counter() - train_start_time
-    avg_loss = total_loss / max(1, len(train_loader))
+    avg_loss = total_loss / max(1, processed_steps)
     logger.info(f"[Epoch {epoch}] Skipped steps: 2D={skipped_2d}, 3D={skipped_3d}")
     writer.add_scalar("train2d/skipped_steps_epoch", skipped_2d, epoch)
     writer.add_scalar("train3d/skipped_steps_epoch", skipped_3d, epoch)
@@ -1697,7 +1717,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     scheduler.step()
     return avg_loss, global_step, optimizer, scheduler
 
-def validate_epoch(student, val_loader, config, epoch: int, writer=None):
+def validate_epoch(student, val_loader, config, epoch: int, writer=None, progress_callback=None):
     """
     Run one validation epoch using dataset-produced prompt caches.
 
@@ -1733,7 +1753,8 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None):
     ping_pong = bool(getattr(getattr(config, "logging", {}), "image_ping_pong", False))
     E_total = int(getattr(getattr(config, "training", {}), "epochs", max(epoch + 1, 1)))
     is_final_epoch = (epoch == E_total - 1)
-    do_viz_this_ep = (
+    disable_images = bool(getattr(getattr(config, "logging", {}), "disable_images", False))
+    do_viz_this_ep = (not disable_images) and (
         epoch == 0
         or ((epoch + 1) % image_every == 0)
         or is_final_epoch
@@ -2216,6 +2237,8 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None):
         ema_data_wait = _ema(ema_data_wait, data_wait)
         ema_step_time = _ema(ema_step_time, step_time)
         _emit_val_progress(batch_idx, ds_name, sub_name, data_dim)
+        if progress_callback is not None:
+            progress_callback(batch_idx, len(val_loader), ds_name, sub_name, data_dim)
         last_batch_end_time = time.perf_counter()
 
         if int(data_dim) == 2 and counts.get("dice@0.5", 0) > 0:

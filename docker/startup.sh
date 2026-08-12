@@ -4,8 +4,8 @@ set -Eeuo pipefail
 readonly SERVICE_NAME="rwkv-container-start"
 readonly JUPYTER_SESSION_NAME="jupyter"
 readonly DEFAULT_JUPYTER_ROOT="/RWKV-MedSAM2"
-readonly DEFAULT_EXPECTED_GPU_COUNT="2"
-readonly DEFAULT_MIN_SHM_GB="12"
+readonly DEFAULT_EXPECTED_GPU_COUNT="4"
+readonly DEFAULT_MIN_SHM_GB="0"
 
 log() {
     printf '[%s] %s\n' "${SERVICE_NAME}" "$*"
@@ -39,10 +39,10 @@ check_gpu_count() {
     actual="$(python -c 'import torch; print(torch.cuda.device_count())')" \
         || fail "PyTorch could not query the available GPUs."
     require_unsigned_integer "detected GPU count" "${actual}"
-    [[ "${actual}" == "${expected}" ]] \
-        || fail "Expected ${expected} visible GPUs, but PyTorch detected ${actual}."
+    (( actual >= expected )) \
+        || fail "Expected at least ${expected} visible GPUs, but PyTorch detected ${actual}."
 
-    log "GPU check passed: ${actual} GPUs are visible to PyTorch."
+    log "GPU check passed: ${actual} GPUs are visible to PyTorch (${expected} required)."
 }
 
 check_shared_memory() {

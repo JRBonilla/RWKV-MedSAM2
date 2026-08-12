@@ -47,6 +47,11 @@ def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def termination_as_interrupt(_signum, _frame) -> None:
+    """Let launchers stop the supervisor while preserving resumable progress."""
+    raise KeyboardInterrupt
+
+
 def as_path(value: str | Path | None) -> Path | None:
     if value is None:
         return None
@@ -75,6 +80,20 @@ def split_int_values(values: list[str] | None) -> list[int]:
             if part:
                 out.append(int(part))
     return out
+
+
+def parse_checkpoint_overrides(values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values or []:
+        model_name, separator, checkpoint_path = str(value).partition("=")
+        model_name = model_name.strip()
+        checkpoint_path = checkpoint_path.strip()
+        if not separator or not model_name or not checkpoint_path:
+            raise ValueError(
+                f"Invalid --checkpoint-override {value!r}; expected MODEL=/path/to/checkpoint.pth"
+            )
+        overrides[model_name] = str(Path(checkpoint_path).expanduser())
+    return overrides
 
 
 def json_default(value: Any) -> Any:
@@ -356,6 +375,13 @@ def add_common_benchmark_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--loaders-pkl", default=str(DEFAULT_LOADERS_PKL), help="Pickled loaders path.")
     parser.add_argument("--helper-path", default=None, help="Optional strict_video_protocol_lib.py path.")
     parser.add_argument("--models", nargs="+", default=None, help="Models to benchmark; accepts space or comma separated values.")
+    parser.add_argument(
+        "--checkpoint-override",
+        action="append",
+        default=[],
+        metavar="MODEL=PATH",
+        help="Use an explicit checkpoint for a model; repeat for multiple models.",
+    )
     parser.add_argument("--prompt-modes", nargs="+", default=None, help="Prompt modes; accepts space or comma separated values.")
     parser.add_argument("--protocols", nargs="+", default=None, help="Protocols; accepts space or comma separated values.")
 
@@ -411,6 +437,7 @@ def normalized_config(args: argparse.Namespace) -> dict[str, Any]:
         "smoke_datasets": split_values(args.smoke_datasets, []) if args.smoke_datasets else None,
         "case_indices": split_int_values(args.case_indices),
         "reuse_prompt_mode_state_models": split_values(args.reuse_prompt_mode_state_models, DEFAULT_REUSE_STATE_MODELS),
+        "checkpoint_overrides": parse_checkpoint_overrides(args.checkpoint_override),
         "partial_save_every_rows": (
             int(args.partial_save_every_rows)
             if args.partial_save_every_rows is not None
@@ -455,6 +482,15 @@ def worker_main(args: argparse.Namespace) -> int:
     print(f"Worker loaders_pkl: {loaders_pkl}", flush=True)
 
     svp = load_strict_helper(args.helper_path)
+    for model_name, checkpoint_path in cfg["checkpoint_overrides"].items():
+        if model_name not in svp.MODEL_REGISTRY:
+            raise ValueError(f"Unknown model in --checkpoint-override: {model_name}")
+        if not Path(checkpoint_path).is_file():
+            raise FileNotFoundError(f"Checkpoint override does not exist: {checkpoint_path}")
+        entry = svp.MODEL_REGISTRY[model_name]
+        entry.checkpoint_path = checkpoint_path
+        entry.checkpoint_dir = str(Path(checkpoint_path).parent)
+        print(f"Checkpoint override: {model_name}={checkpoint_path}", flush=True)
     svp.set_determinism()
     train_loader, val_loader, test_loader = svp.load_benchmark_loaders(str(loaders_pkl))
     _ = train_loader, val_loader
@@ -555,6 +591,8 @@ def worker_command(args: argparse.Namespace, session_dir: Path, attempt_dir: Pat
         "--reuse-prompt-mode-state-models",
         *cfg["reuse_prompt_mode_state_models"],
     ]
+    for model_name, checkpoint_path in cfg["checkpoint_overrides"].items():
+        cmd.extend(["--checkpoint-override", f"{model_name}={checkpoint_path}"])
     if args.helper_path:
         cmd.extend(["--helper-path", str(args.helper_path)])
     if args.smoke_run:
@@ -706,6 +744,8 @@ def run_attempt(
 
 
 def supervisor_main(args: argparse.Namespace) -> int:
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, termination_as_interrupt)
     if not args.resume_dir:
         raise SystemExit("--resume-dir is required")
     resume_dir = as_path(args.resume_dir)
@@ -718,7 +758,7 @@ def supervisor_main(args: argparse.Namespace) -> int:
 
     session_dir = output_base / f"strict_video_console_{timestamp()}"
     session_dir.mkdir(parents=True, exist_ok=False)
-    tensorboard_command = f"tensorboard --logdir {session_dir} --host 0.0.0.0 --port 6006"
+    tensorboard_command = f"tensorboard --logdir {session_dir} --host 0.0.0.0 --port 6007"
     write_json(
         session_dir / "console_session.json",
         {

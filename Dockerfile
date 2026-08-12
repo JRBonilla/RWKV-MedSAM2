@@ -19,8 +19,8 @@ ENV TZ=Etc/UTC \
     PIP_NO_CACHE_DIR=1 \
     CUDA_HOME=/usr/local/cuda \
     RWKV_NVIDIA_PYTHON_ROOT=/usr/local/lib/python3.10/dist-packages/nvidia \
-    PATH=/usr/local/cuda/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH} \
+    PATH=/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_BIN} \
     TORCH_EXTENSIONS_DIR=/opt/torch_extensions \
     XDG_CACHE_HOME=/var/tmp/cache \
@@ -163,6 +163,7 @@ RUN python -m pip install \
         eva-decord==0.6.1 \
         gdown==5.2.0 \
         h5py==3.13.0 \
+        huggingface-hub==1.26.0 \
         hydra-core==1.3.2 \
         imageio==2.37.0 \
         imageio-ffmpeg==0.6.0 \
@@ -181,6 +182,7 @@ RUN python -m pip install \
         pillow==11.0.0 \
         psutil==7.0.0 \
         pyarrow==20.0.0 \
+        pycocotools==2.0.11 \
         pydicom==2.4.4 \
         scikit-learn==1.7.2 \
         scipy==1.15.3 \
@@ -223,7 +225,7 @@ RUN chmod 755 /usr/local/bin/rwkv-container-start /usr/local/bin/rwkv-preflight 
     && bash -n /usr/local/bin/rwkv-container-start \
     && python -c 'compile(open("/usr/local/bin/rwkv-preflight").read(), "/usr/local/bin/rwkv-preflight", "exec")'
 
-EXPOSE 22 8888 6006
+EXPOSE 22 8888 6007
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/usr/local/bin/rwkv-container-start"]

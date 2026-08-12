@@ -26,7 +26,7 @@ DEFAULT_PREPROCESSED_ROOT = Path("/data/Preprocessed_v2.1")
 DEFAULT_CHECKPOINT_ROOT = Path("/data/TrainingCheckpoints")
 DEFAULT_LOADERS_PATH = Path("/data/loaders32.pkl")
 DEFAULT_EXPECTED_DATASETS = 56
-DEFAULT_EXPECTED_GPUS = 2
+DEFAULT_EXPECTED_GPUS = 4
 LOCK_TIMEOUT_SECONDS = 8
 
 
@@ -260,8 +260,9 @@ def gpu_inventory_details(expected: int, max_utilization: int, max_memory_mib: i
         ]
     )
     rows = [row.strip() for row in result.stdout.splitlines() if row.strip()]
-    if len(rows) != expected:
-        raise PreflightError(f"expected {expected} GPUs, but nvidia-smi reported {len(rows)}")
+    if len(rows) < expected:
+        raise PreflightError(f"expected at least {expected} GPUs, but nvidia-smi reported {len(rows)}")
+    rows = rows[:expected]
 
     require_a100 = os.environ.get("RWKV_REQUIRE_A100", "1") != "0"
     descriptions = []
@@ -305,9 +306,9 @@ def torch_details(expected: int) -> str:
         )
     if not torch.cuda.is_available():
         raise PreflightError("torch.cuda.is_available() is false")
-    if torch.cuda.device_count() != expected:
+    if torch.cuda.device_count() < expected:
         raise PreflightError(
-            f"expected {expected} CUDA devices, found {torch.cuda.device_count()}"
+            f"expected at least {expected} CUDA devices, found {torch.cuda.device_count()}"
         )
 
     devices = []
@@ -350,15 +351,15 @@ def native_extension_details(expected_gpus: int) -> str:
     if not cxx_lines or not cxx_lines[0].split(":", 1)[1].strip().startswith("17"):
         raise PreflightError(f"OpenCV was not compiled in CUDA 12.8 C++17 mode: {cxx_lines}")
     cv_gpu_count = int(cv2.cuda.getCudaEnabledDeviceCount())
-    if cv_gpu_count != expected_gpus:
+    if cv_gpu_count < expected_gpus:
         raise PreflightError(
-            f"OpenCV sees {cv_gpu_count} CUDA devices; expected {expected_gpus}"
+            f"OpenCV sees {cv_gpu_count} CUDA devices; expected at least {expected_gpus}"
         )
 
     cupy = importlib.import_module("cupy")
     cupy_count = int(cupy.cuda.runtime.getDeviceCount())
-    if cupy_count != expected_gpus:
-        raise PreflightError(f"CuPy sees {cupy_count} CUDA devices; expected {expected_gpus}")
+    if cupy_count < expected_gpus:
+        raise PreflightError(f"CuPy sees {cupy_count} CUDA devices; expected at least {expected_gpus}")
 
     importlib.import_module("sam2._C")
     importlib.import_module("rwkv_medsam2")
@@ -373,10 +374,14 @@ def native_extension_details(expected_gpus: int) -> str:
 def python_package_details() -> str:
     modules = (
         "hydra",
+        "huggingface_hub",
         "nibabel",
         "numpy",
+        "openpyxl",
         "pandas",
+        "pycocotools",
         "pydicom",
+        "sklearn",
         "SimpleITK",
         "torchvision",
         "tqdm",
@@ -599,7 +604,7 @@ def checksum_manifest_details(checkpoint_root: Path, verify_hashes: bool) -> str
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check that the rebuilt two-GPU container is ready for RWKV-MedSAM2 training."
+        description="Check that the rebuilt four-GPU container is ready for RWKV-MedSAM2 training."
     )
     parser.add_argument("--repo-root", type=Path, default=DEFAULT_REPO_ROOT)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
@@ -631,7 +636,7 @@ def main() -> int:
         expected_datasets = positive_int_env(
             "RWKV_EXPECTED_DATASET_COUNT", DEFAULT_EXPECTED_DATASETS
         )
-        minimum_shm = positive_int_env("RWKV_MIN_SHM_GB", 12, allow_zero=True)
+        minimum_shm = positive_int_env("RWKV_MIN_SHM_GB", 0, allow_zero=True)
         minimum_data_free = positive_int_env("RWKV_MIN_DATA_FREE_GB", 50, allow_zero=True)
         max_gpu_utilization = positive_int_env(
             "RWKV_MAX_GPU_UTILIZATION", 10, allow_zero=True
@@ -644,10 +649,24 @@ def main() -> int:
         return reporter.finish()
 
     print("RWKV-MedSAM2 training preflight\n", flush=True)
-    reporter.check("/data NFS mount", lambda: mount_details(args.data_root, require_nfs=True))
-    reporter.check("/root NFS mount", lambda: mount_details(Path("/root"), require_nfs=True))
-    reporter.check("/data NFS locking", lambda: lock_details(args.data_root))
-    reporter.check("/root NFS locking", lambda: lock_details(Path("/root")))
+    skip_nfs_checks = os.environ.get("RWKV_SKIP_NFS_CHECKS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if skip_nfs_checks:
+        for label in (
+            "/data NFS mount",
+            "/root NFS mount",
+            "/data NFS locking",
+            "/root NFS locking",
+        ):
+            reporter.skip(label, "RWKV_SKIP_NFS_CHECKS was requested")
+    else:
+        reporter.check("/data NFS mount", lambda: mount_details(args.data_root, require_nfs=True))
+        reporter.check("/root NFS mount", lambda: mount_details(Path("/root"), require_nfs=True))
+        reporter.check("/data NFS locking", lambda: lock_details(args.data_root))
+        reporter.check("/root NFS locking", lambda: lock_details(Path("/root")))
     reporter.check(
         "local runtime storage",
         lambda: local_runtime_details(

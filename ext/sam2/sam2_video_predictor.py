@@ -12,8 +12,8 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
-from ext.sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
-from ext.sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames, load_video_frames_from_data
+from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
+from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames, load_video_frames_from_data
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -193,7 +193,7 @@ class SAM2VideoPredictor(SAM2Base):
         Returns:
           (SAM2VideoPredictor): The loaded model.
         """
-        from ext.sam2.build_sam import build_sam2_video_predictor_hf
+        from sam2.build_sam import build_sam2_video_predictor_hf
 
         sam_model = build_sam2_video_predictor_hf(model_id, **kwargs)
         return sam_model

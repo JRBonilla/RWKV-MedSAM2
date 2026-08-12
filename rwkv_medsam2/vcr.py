@@ -11,8 +11,8 @@ from typing import Tuple, Optional, List
 
 # Import custom modules for refinement and uncertainty prediction
 from .refinement import RefinementModule, UncertaintyHead
-from ext.vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
-from ext.vrwkv.utils import resize_pos_embed, DropPath
+from vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
+from vrwkv.utils import resize_pos_embed, DropPath
 
 def GroupNorm2d(num_channels: int, eps: float = 1e-6, num_groups: int = 32) -> nn.Module:
     """

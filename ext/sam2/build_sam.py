@@ -9,6 +9,7 @@ import os
 
 import torch
 from hydra import compose
+from hydra.errors import MissingConfigException
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -68,6 +69,17 @@ HF_MODEL_ID_TO_FILENAMES = {
 }
 
 
+def _compose_sam2_config(config_file, overrides):
+    """Compose configs from either a config-dir or installed-package search root."""
+    try:
+        return compose(config_name=config_file, overrides=overrides)
+    except MissingConfigException:
+        normalized = str(config_file).lstrip("/")
+        if normalized.startswith("configs/"):
+            raise
+        return compose(config_name=f"configs/{normalized}", overrides=overrides)
+
+
 def build_sam2(
     config_file,
     ckpt_path=None,
@@ -87,7 +99,7 @@ def build_sam2(
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
         ]
     # Read config and init model
-    cfg = compose(config_name=config_file, overrides=hydra_overrides_extra)
+    cfg = _compose_sam2_config(config_file, hydra_overrides_extra)
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)
@@ -108,11 +120,11 @@ def build_sam2_video_predictor(
     **kwargs,
 ):
     hydra_overrides = [
-        "++model._target_=ext.sam2.sam2_video_predictor.SAM2VideoPredictor",
+        "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
     ]
     if vos_optimized:
         hydra_overrides = [
-            "++model._target_=ext.sam2.sam2_video_predictor.SAM2VideoPredictorVOS",
+            "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictorVOS",
             "++model.compile_image_encoder=True",  # Let sam2_base handle this
         ]
 
@@ -131,7 +143,7 @@ def build_sam2_video_predictor(
     hydra_overrides.extend(hydra_overrides_extra)
 
     # Read config and init model
-    cfg = compose(config_name=config_file, overrides=hydra_overrides)
+    cfg = _compose_sam2_config(config_file, hydra_overrides)
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)

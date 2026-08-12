@@ -7,21 +7,21 @@ services:
         OPENCV_BUILD_JOBS: "${OPENCV_BUILD_JOBS:-8}"
         CUDA_ARCH_BIN: "8.0"
     image: rwkv-medsam2:cuda12.8
-    container_name: rwkv-medsam2-2gpu
-    hostname: rwkv-medsam2-2gpu
+    container_name: rwkv-medsam2-4gpu
+    hostname: rwkv-medsam2-4gpu
     init: true
     restart: unless-stopped
-    shm_size: "16gb"
     stdin_open: true
     tty: true
 
     # Do not set CUDA_VISIBLE_DEVICES here. Docker assigns the requested host
-    # GPUs and exposes them inside the container as logical devices 0 and 1.
+    # GPUs and exposes them inside the container as logical devices 0 through 3.
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      RWKV_EXPECTED_GPU_COUNT: "2"
-      RWKV_MIN_SHM_GB: "12"
+      RWKV_EXPECTED_GPU_COUNT: "4"
+      RWKV_MIN_SHM_GB: "0"
+      RWKV_SKIP_NFS_CHECKS: "1"
       SSH_PUBLIC_KEY: "${SSH_PUBLIC_KEY:-}"
       JUPYTER_TOKEN: "${JUPYTER_TOKEN:-}"
       JUPYTER_CONFIG_DIR: /var/tmp/jupyter_config
@@ -46,7 +46,7 @@ services:
     ports:
       - "${SSH_BIND_ADDRESS:-0.0.0.0}:${SSH_HOST_PORT:-31092}:22"
       - "${JUPYTER_BIND_ADDRESS:-127.0.0.1}:${JUPYTER_HOST_PORT:-8888}:8888"
-      - "${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6006}:6006"
+      - "${TENSORBOARD_BIND_ADDRESS:-127.0.0.1}:${TENSORBOARD_HOST_PORT:-6007}:6007"
 
     ulimits:
       memlock:
@@ -62,6 +62,8 @@ services:
               device_ids:
                 - "${GPU_DEVICE_0:-0}"
                 - "${GPU_DEVICE_1:-1}"
+                - "${GPU_DEVICE_2:-2}"
+                - "${GPU_DEVICE_3:-3}"
               capabilities: [gpu]
 
 volumes:

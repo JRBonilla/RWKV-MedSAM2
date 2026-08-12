@@ -6,6 +6,7 @@
 import math
 import torch
 import torch.nn.functional as F
+from ..distributed import synchronize_gradients
 
 from .func_metrics import (
     tversky_loss_from_logits,
@@ -296,9 +297,10 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
         }
 
     loss.backward()
+    synchronize_gradients(student)
 
     try:
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
     except RuntimeError as e:
         bad = []
         max_items = 50
@@ -347,6 +349,7 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
     return {
         "ok": True,
         "loss": float(loss.detach().item()),
+        "grad_norm": float(grad_norm.detach().item()),
         "prompt_loss": float(prompt_avg),
         "non_prompt_loss": np_avg,
         "non_prompt_loss_base": np_base_avg,

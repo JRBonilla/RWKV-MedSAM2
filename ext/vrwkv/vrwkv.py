@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Sequence
+from pathlib import Path
 import warnings
 import math
 
@@ -14,14 +15,30 @@ import torch.utils.checkpoint as cp
 # from mmcv.cnn.bricks.transformer import PatchEmbed
 # from mmseg.models.builder import BACKBONES
 # from mmengine.logging import MMLogger
-from ext.vrwkv.utils import resize_pos_embed, DropPath
+from vrwkv.utils import resize_pos_embed, DropPath
 
 T_MAX = 8192 # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
 # it's possible to go beyond CUDA limitations if you slice the ctx and pass the hidden state in each slice
 
 from torch.utils.cpp_extension import load
-wkv_cuda = load(name="wkv", sources=["ext/vrwkv/cuda/wkv_op.cpp", "ext/vrwkv/cuda/wkv_cuda.cu"],
-                verbose=True, extra_cuda_cflags=['-res-usage', '--maxrregcount 60', '--use_fast_math', '-O3', '-Xptxas -O3', f'-DTmax={T_MAX}'])
+
+CUDA_SOURCE_DIR = Path(__file__).resolve().parent / "cuda"
+wkv_cuda = load(
+    name="wkv",
+    sources=[
+        str(CUDA_SOURCE_DIR / "wkv_op.cpp"),
+        str(CUDA_SOURCE_DIR / "wkv_cuda.cu"),
+    ],
+    verbose=True,
+    extra_cuda_cflags=[
+        "-res-usage",
+        "--maxrregcount 60",
+        "--use_fast_math",
+        "-O3",
+        "-Xptxas -O3",
+        f"-DTmax={T_MAX}",
+    ],
+)
 
 def get_logger(name=__name__):
     """

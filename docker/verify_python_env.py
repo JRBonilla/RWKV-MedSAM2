@@ -17,6 +17,7 @@ EXPECTED_DISTRIBUTIONS = {
     "eva-decord": "0.6.1",
     "gdown": "5.2.0",
     "h5py": "3.13.0",
+    "huggingface-hub": "1.26.0",
     "hydra-core": "1.3.2",
     "imageio": "2.37.0",
     "imageio-ffmpeg": "0.6.0",
@@ -36,6 +37,7 @@ EXPECTED_DISTRIBUTIONS = {
     "pillow": "11.0.0",
     "psutil": "7.0.0",
     "pyarrow": "20.0.0",
+    "pycocotools": "2.0.11",
     "pydicom": "2.4.4",
     "scikit-learn": "1.7.2",
     "scipy": "1.15.3",
@@ -104,8 +106,10 @@ def verify_native_stack() -> None:
     cv2 = import_module("cv2")
     import_module("cupy")
     import_module("decord")
+    import_module("huggingface_hub")
     import_module("nibabel")
     import_module("pandas")
+    import_module("pycocotools")
     import_module("pydicom")
     import_module("SimpleITK")
     torch = import_module("torch")
