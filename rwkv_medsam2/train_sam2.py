@@ -11,6 +11,7 @@ import argparse
 import pickle
 import copy
 import time
+import types
 import html
 import re
 from collections import defaultdict
@@ -30,7 +31,11 @@ from omegaconf import OmegaConf
 from sam2.build_sam import build_sam2_video_predictor
 
 from .functions.func_2d import train_step_2d, validate_step_2d
-from .functions.func_3d import train_step_3d, validate_step_3d
+from .functions.func_3d import (
+    train_step_3d,
+    train_step_3d_per_volume,
+    validate_step_3d,
+)
 from .functions.func_metrics import (
     TaskAggregator,
     ModalityAggregator,
@@ -746,6 +751,133 @@ def _apply_freeze_schedule(model, config, epoch, logger=None):
             f"{'FREEZING' if do_freeze else 'UNFREEZING'} modules={freeze_modules}"
         )
 
+def _prefill_training_features(predictor, state: dict, chunk_size: int) -> dict:
+    """Fill the original predictor training cache with batched image forwards."""
+    cache = state["cached_features"]
+    frame_count = int(state["num_frames"])
+    device = state["device"]
+    for start in range(0, frame_count, int(chunk_size)):
+        end = min(start + int(chunk_size), frame_count)
+        missing = [frame for frame in range(start, end) if frame not in cache]
+        if not missing:
+            continue
+        images = state["images"][missing].to(
+            device=device, non_blocking=True
+        ).float()
+        batched_out = predictor.forward_image(images)
+        count = len(missing)
+        for offset, frame_idx in enumerate(missing):
+            frame_out = {
+                "backbone_fpn": [
+                    feature[offset : offset + 1]
+                    for feature in batched_out["backbone_fpn"]
+                ],
+                "vision_pos_enc": [
+                    position[offset : offset + 1]
+                    if int(position.shape[0]) == count
+                    else position
+                    for position in batched_out["vision_pos_enc"]
+                ],
+            }
+            cache[frame_idx] = (images[offset : offset + 1], frame_out)
+    state["cached_features"] = cache
+    return state
+
+
+def _install_external_training_prefill(predictor, chunk_size: int) -> None:
+    """Batch training-only image encoding without replacing the predictor class."""
+    if hasattr(predictor, "_rwkv_original_init_state_from_tensor"):
+        return
+    original_init = predictor.init_state_from_tensor
+
+    def wrapped_init(self, *args, **kwargs):
+        state = original_init(*args, **kwargs)
+        positional_mode = args[1] if len(args) > 1 else "train"
+        mode = kwargs.get("mode", positional_mode)
+        if mode == "train" and torch.is_grad_enabled():
+            _prefill_training_features(self, state, chunk_size=chunk_size)
+        return state
+
+    predictor.__dict__["_rwkv_original_init_state_from_tensor"] = original_init
+    predictor.init_state_from_tensor = types.MethodType(wrapped_init, predictor)
+
+
+def _optimized_predictor_build_options(config):
+    """Translate opt-in predictor, training, and VCR settings into build options."""
+    optimizations = getattr(config, "optimizations", None)
+    if optimizations is None or not bool(getattr(optimizations, "enabled", False)):
+        return {}
+
+    overrides = []
+    trunk = getattr(getattr(config.model, "image_encoder", None), "trunk", None)
+    trunk_target = str(getattr(trunk, "_target_", ""))
+    if trunk_target.endswith(".VCRBackbone"):
+        fuse_shift_mix = bool(
+            getattr(optimizations, "fuse_rwkv_shift_mix", False)
+        )
+        inplace_activations = bool(
+            getattr(optimizations, "inplace_rwkv_activations", False)
+        )
+        overrides.extend([
+            f"++model.image_encoder.trunk.fuse_shift_mix={str(fuse_shift_mix).lower()}",
+            f"++model.image_encoder.trunk.inplace_activations={str(inplace_activations).lower()}",
+        ])
+        if bool(getattr(optimizations, "efficient_vcr_backbone", False)):
+            architecture = str(
+                getattr(optimizations, "efficient_vcr_architecture", "efficient")
+            )
+            architecture_settings = {
+                "efficient": (3, 4.0),
+                "rwkv2": (2, 4.0),
+                "rwkv2_mlp2": (2, 2.0),
+            }
+            if architecture not in architecture_settings:
+                raise ValueError(
+                    f"Unknown efficient VCR architecture: {architecture}"
+                )
+            rwkv_depth, mlp_ratio = architecture_settings[architecture]
+            overrides.extend([
+                "++model.image_encoder.trunk.early_downsample_stem=true",
+                "++model.image_encoder.trunk.fused_stage_cfg.expand_ratio=1.0",
+                "++model.image_encoder.trunk.fused_stage_cfg.depth=1",
+                "++model.image_encoder.trunk.fused_stage_cfg.stride=1",
+                "++model.image_encoder.trunk.mbconv_stage_cfg.expand_ratio=1.0",
+                f"++model.image_encoder.trunk.rwkv_depth={rwkv_depth}",
+                f"++model.image_encoder.trunk.mlp_ratio={mlp_ratio}",
+            ])
+
+    options = {}
+    if overrides:
+        options["hydra_overrides_extra"] = overrides
+
+    if bool(getattr(optimizations, "use_optimized_predictor", True)):
+        chunk_size = int(getattr(optimizations, "image_feature_chunk_size", 4))
+        training_cache = int(
+            getattr(optimizations, "training_feature_cache_frames", 8)
+        )
+        gpu_chunks = int(
+            getattr(optimizations, "prediction_gpu_cache_chunks", 2)
+        )
+        cpu_chunks = int(
+            getattr(optimizations, "prediction_cpu_cache_chunks", 64)
+        )
+        pin_cpu = bool(
+            getattr(optimizations, "prediction_pin_cpu_features", True)
+        )
+        options["predictor_target"] = (
+            "rwkv_medsam2.optimized_video_predictor."
+            "OptimizedSAM2VideoPredictor"
+        )
+        options.setdefault("hydra_overrides_extra", []).extend([
+            f"++model.image_feature_chunk_size={chunk_size}",
+            f"++model.training_feature_cache_frames={training_cache}",
+            f"++model.prediction_gpu_cache_chunks={gpu_chunks}",
+            f"++model.prediction_cpu_cache_chunks={cpu_chunks}",
+            f"++model.prediction_pin_cpu_features={str(pin_cpu).lower()}",
+        ])
+    return options
+
+
 def build_student_predictor(config, logger=None):
     """
     Build the train-mode student SAM2 video predictor.
@@ -762,6 +894,7 @@ def build_student_predictor(config, logger=None):
         ckpt_path=None,  # IMPORTANT: build without strict checkpoint loading
         device=config.training.device,
         mode="train",
+        **_optimized_predictor_build_options(config),
         apply_postprocessing=False,
     )
     video_predictor.train()
@@ -775,6 +908,21 @@ def build_student_predictor(config, logger=None):
     ignore_prefixes = tuple(getattr(getattr(config, "init", {}), "ignore_prefixes", []))
     if ckpt_path:
         _partial_load_sam21(video_predictor, ckpt_path, ignore_prefixes=ignore_prefixes, logger=logger)
+
+    optimizations = getattr(config, "optimizations", None)
+    if (
+        optimizations is not None
+        and bool(getattr(optimizations, "enabled", False))
+        and bool(getattr(optimizations, "external_training_prefill", False))
+    ):
+        chunk_size = int(getattr(optimizations, "image_feature_chunk_size", 4))
+        _install_external_training_prefill(video_predictor, chunk_size)
+        if logger is not None:
+            logger.info(
+                "[safe_optimization] original predictor class with external "
+                "training-only feature prefill chunk=%d",
+                chunk_size,
+            )
 
     return video_predictor
 
@@ -1538,7 +1686,14 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             _t0 = time.perf_counter()
 
             try:
-                step_out = train_step_3d(student, teacher_3d, optimizer, batch, config, scaler)
+                optimizations = getattr(config, "optimizations", None)
+                use_per_volume = bool(
+                    optimizations is not None
+                    and getattr(optimizations, "per_volume_backward", False)
+                    and getattr(optimizations, "enabled", False)
+                )
+                step_function = train_step_3d_per_volume if use_per_volume else train_step_3d
+                step_out = step_function(student, teacher_3d, optimizer, batch, config, scaler)
             except Exception as e:
                 _save_and_log_fatal_crash(
                     stage="train3d/exception",

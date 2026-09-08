@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Sequence
 from pathlib import Path
+import os
 import warnings
 import math
 
@@ -17,14 +18,16 @@ import torch.utils.checkpoint as cp
 # from mmengine.logging import MMLogger
 from vrwkv.utils import resize_pos_embed, DropPath
 
-T_MAX = 8192 # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
+T_MAX = int(os.environ.get("VRWKV_T_MAX", "8192"))
+if T_MAX < 1:
+    raise ValueError("VRWKV_T_MAX must be a positive integer")
 # it's possible to go beyond CUDA limitations if you slice the ctx and pass the hidden state in each slice
 
 from torch.utils.cpp_extension import load
 
 CUDA_SOURCE_DIR = Path(__file__).resolve().parent / "cuda"
 wkv_cuda = load(
-    name="wkv",
+    name="wkv" if T_MAX == 8192 else f"wkv_t{T_MAX}",
     sources=[
         str(CUDA_SOURCE_DIR / "wkv_op.cpp"),
         str(CUDA_SOURCE_DIR / "wkv_cuda.cu"),
@@ -238,14 +241,48 @@ def q_shift(input, shift_pixel=1, gamma=1/4, patch_resolution=None):
     return output.flatten(2).transpose(1, 2)
 
 
+def _spatial_shift_mix(x, mix_k, mix_v, mix_r, height, width):
+    """Apply the existing spatial shift and three mixes in one compiled graph."""
+    shifted = q_shift(x, 1, 0.25, (height, width))
+    return (
+        x * mix_k + shifted * (1.0 - mix_k),
+        x * mix_v + shifted * (1.0 - mix_v),
+        x * mix_r + shifted * (1.0 - mix_r),
+    )
+
+
+def _channel_shift_mix(x, mix_k, mix_r, height, width):
+    """Apply the existing spatial shift and two mixes in one compiled graph."""
+    shifted = q_shift(x, 1, 0.25, (height, width))
+    return (
+        x * mix_k + shifted * (1.0 - mix_k),
+        x * mix_r + shifted * (1.0 - mix_r),
+    )
+
+
+_COMPILED_SPATIAL_SHIFT_MIX = torch.compile(
+    _spatial_shift_mix,
+    fullgraph=True,
+    dynamic=False,
+    options={"triton.cudagraphs": False},
+)
+_COMPILED_CHANNEL_SHIFT_MIX = torch.compile(
+    _channel_shift_mix,
+    fullgraph=True,
+    dynamic=False,
+    options={"triton.cudagraphs": False},
+)
+
+
 class VRWKV_SpatialMix(nn.Module):
     def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
                  channel_gamma=1/4, shift_pixel=1, init_mode='fancy',
-                 key_norm=False):
+                 key_norm=False, fuse_shift_mix=False):
         super().__init__()
         self.layer_id = layer_id
         self.n_layer = n_layer
         self.n_embd = n_embd
+        self.fuse_shift_mix = bool(fuse_shift_mix)
         self.device = None
         attn_sz = n_embd
         self._init_weights(init_mode)
@@ -314,10 +351,20 @@ class VRWKV_SpatialMix(nn.Module):
         # Mix x with the previous timestep to produce xk, xv, xr
         B, T, C = x.size()
         if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
+            if self.fuse_shift_mix:
+                xk, xv, xr = _COMPILED_SPATIAL_SHIFT_MIX(
+                    x,
+                    self.spatial_mix_k,
+                    self.spatial_mix_v,
+                    self.spatial_mix_r,
+                    int(patch_resolution[0]),
+                    int(patch_resolution[1]),
+                )
+            else:
+                xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
+                xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+                xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
+                xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
         else:
             xk = x
             xv = x
@@ -347,11 +394,12 @@ class VRWKV_SpatialMix(nn.Module):
 class VRWKV_ChannelMix(nn.Module):
     def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
                  channel_gamma=1/4, shift_pixel=1, hidden_rate=4, init_mode='fancy',
-                 key_norm=False):
+                 key_norm=False, fuse_shift_mix=False):
         super().__init__()
         self.layer_id = layer_id
         self.n_layer = n_layer
         self.n_embd = n_embd
+        self.fuse_shift_mix = bool(fuse_shift_mix)
         self._init_weights(init_mode)
         self.shift_pixel = shift_pixel
         self.shift_mode = shift_mode
@@ -394,9 +442,18 @@ class VRWKV_ChannelMix(nn.Module):
 
     def forward(self, x, patch_resolution):
         if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
+            if self.fuse_shift_mix:
+                xk, xr = _COMPILED_CHANNEL_SHIFT_MIX(
+                    x,
+                    self.spatial_mix_k,
+                    self.spatial_mix_r,
+                    int(patch_resolution[0]),
+                    int(patch_resolution[1]),
+                )
+            else:
+                xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
+                xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+                xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
         else:
             xk = x
             xr = x

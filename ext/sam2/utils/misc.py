@@ -217,6 +217,7 @@ def load_video_frames_from_data(
     img_std=(0.229, 0.224, 0.225),
     offload_video_to_cpu: bool = False,
     fixed_window: tuple | None = None, # e.g., (-1000, 3000) for CT; None = no window
+    defer_normalization_to_device: bool = False,
 ) -> torch.Tensor:
     """
     Load the video frames from an in-memory tensor.
@@ -227,9 +228,11 @@ def load_video_frames_from_data(
     - img_mean: A 3-tuple for per-channel mean used for normalization in the 0..1 domain.
     - img_std: A 3-tuple for per-channel std used for normalization in the 0..1 domain.
     - offload_video_to_cpu: If False, move the result to CUDA; if True, keep on CPU.
+    - defer_normalization_to_device: Return CPU-resident values in [0,255] so
+      a bounded predictor can apply mean/std normalization on the compute device.
 
     Returns:
-    - images: A float32 tensor of shape (T, 3, H, W) normalized by mean and std,
+    - images: A float32 tensor of shape (T, 3, H, W), normally normalized by mean and std,
               ready for SAM 2.
     """
     assert imgs_tensor.dim() == 4, f"Expected shape (T, C, H, W), got {tuple(imgs_tensor.shape)}"
@@ -278,6 +281,16 @@ def load_video_frames_from_data(
                 if hi <= lo + 1e-6:
                     lo, hi = float(images.min().item()), float(images.max().item())
             images = ((images - lo) / max(hi - lo, 1e-6)).clamp_(0.0, 1.0) * 255.0
+
+    if defer_normalization_to_device:
+        if not offload_video_to_cpu:
+            raise ValueError(
+                "defer_normalization_to_device requires offload_video_to_cpu=True"
+            )
+        # Preserve the resident path's arithmetic order: intensity scaling is
+        # performed on CPU, while division and mean/std normalization happen
+        # after each bounded chunk reaches the compute device.
+        return images.detach().to("cpu")
 
     # Optionally move to CUDA
     if not offload_video_to_cpu:

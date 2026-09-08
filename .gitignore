@@ -9,6 +9,8 @@ __pycache__/
 *.py[cod]
 diagnostic_outputs/
 diagnostic_external_video_outputs/
+artifacts/
+*.orig
 .vscode/settings.json
 
 # Local container access settings and secrets

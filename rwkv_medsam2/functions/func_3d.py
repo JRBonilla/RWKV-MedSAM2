@@ -14,7 +14,19 @@ from .func_metrics import (
     safe_float,
 )
 
-def train_step_3d(student, teacher, optimizer, batch, config, scaler):
+def train_step_3d(
+    student,
+    teacher,
+    optimizer,
+    batch,
+    config,
+    scaler,
+    *,
+    zero_grad=True,
+    synchronize=True,
+    clip_gradients=True,
+    optimizer_step=True,
+):
     """
     Run one 3D-as-sequence training step with dataset prompts.
 
@@ -66,7 +78,8 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
     student.train()
     if use_teacher:
         teacher.eval()
-    optimizer.zero_grad(set_to_none=True)
+    if zero_grad:
+        optimizer.zero_grad(set_to_none=True)
 
     def _zero_like_param():
         """Return a graph-connected zero scalar."""
@@ -297,10 +310,14 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
         }
 
     loss.backward()
-    synchronize_gradients(student)
+    if synchronize:
+        synchronize_gradients(student)
 
     try:
-        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+        if clip_gradients:
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+        else:
+            grad_norm = torch.zeros((), device=device)
     except RuntimeError as e:
         bad = []
         max_items = 50
@@ -335,7 +352,8 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
             "bad_grad_params": bad,
         }
 
-    optimizer.step()
+    if optimizer_step:
+        optimizer.step()
 
     def _avg_or_none(xs):
         """Average non-None tensors as a float."""
@@ -355,6 +373,137 @@ def train_step_3d(student, teacher, optimizer, batch, config, scaler):
         "non_prompt_loss_base": np_base_avg,
     }
 
+_FRAME_MAJOR_BATCH_KEYS = frozenset({"pt_list", "p_label", "bbox", "m_prompt"})
+
+
+def split_3d_batch_by_volume(batch: dict, sample: int) -> dict:
+    """Select one volume while preserving the frame-major prompt layout."""
+    batch_size = int(batch["image"].shape[0])
+    if not 0 <= int(sample) < batch_size:
+        raise IndexError(f"sample index {sample} is outside batch size {batch_size}")
+
+    result = {}
+    for key, value in batch.items():
+        if key in _FRAME_MAJOR_BATCH_KEYS and value is not None:
+            result[key] = [[frame[sample]] for frame in value]
+        elif (
+            torch.is_tensor(value)
+            and value.ndim > 0
+            and int(value.shape[0]) == batch_size
+        ):
+            result[key] = value[sample : sample + 1]
+        elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+            result[key] = [value[sample]]
+        else:
+            result[key] = value
+    return result
+
+
+def _average_output(outputs: list[dict], key: str):
+    values = [output[key] for output in outputs if output.get(key) is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+def _bad_gradient_parameters(student, max_items: int = 50) -> list[dict]:
+    bad = []
+    for name, parameter in student.named_parameters():
+        if parameter.grad is None or parameter.grad.numel() == 0:
+            continue
+        gradient = parameter.grad.detach()
+        if torch.isfinite(gradient).all():
+            continue
+        finite = gradient[torch.isfinite(gradient)]
+        bad.append(
+            {
+                "name": name,
+                "shape": tuple(gradient.shape),
+                "grad_absmax_finite": (
+                    float(finite.abs().max().item()) if finite.numel() else None
+                ),
+                "grad_min_finite": (
+                    float(finite.min().item()) if finite.numel() else None
+                ),
+                "grad_max_finite": (
+                    float(finite.max().item()) if finite.numel() else None
+                ),
+            }
+        )
+        if len(bad) >= max_items:
+            break
+    return bad
+
+
+def train_step_3d_per_volume(
+    student, teacher, optimizer, batch, config, scaler
+) -> dict:
+    """Run one logical batch while releasing each volume graph after backward.
+
+    Loss averaging, distributed synchronization, gradient clipping, and the
+    optimizer step match :func:`train_step_3d`; only the execution schedule
+    changes to reduce peak activation memory.
+    """
+    batch_size = int(batch["image"].shape[0])
+    if batch_size < 1:
+        raise ValueError("3D training batches must contain at least one volume")
+
+    optimizer.zero_grad(set_to_none=True)
+    outputs = []
+    for sample in range(batch_size):
+        small_batch = split_3d_batch_by_volume(batch, sample)
+        output = train_step_3d(
+            student,
+            teacher,
+            optimizer,
+            small_batch,
+            config,
+            scaler,
+            zero_grad=False,
+            synchronize=False,
+            clip_gradients=False,
+            optimizer_step=False,
+        )
+        del small_batch
+        if not output.get("ok"):
+            optimizer.zero_grad(set_to_none=True)
+            return output
+        outputs.append(output)
+
+    for parameter in student.parameters():
+        if parameter.grad is not None:
+            parameter.grad.div_(batch_size)
+    synchronize_gradients(student)
+
+    loss_values = {
+        "loss": _average_output(outputs, "loss"),
+        "prompt_loss": _average_output(outputs, "prompt_loss"),
+        "non_prompt_loss": _average_output(outputs, "non_prompt_loss"),
+        "non_prompt_loss_base": _average_output(
+            outputs, "non_prompt_loss_base"
+        ),
+    }
+    try:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            student.parameters(), 1.0, error_if_nonfinite=True
+        )
+    except RuntimeError as error:
+        bad = _bad_gradient_parameters(student)
+        optimizer.zero_grad(set_to_none=True)
+        return {
+            "ok": False,
+            "skip_reason": "nonfinite_3d_grad_norm",
+            **loss_values,
+            "exception": repr(error),
+            "bad_grad_params": bad,
+        }
+
+    optimizer.step()
+    return {
+        "ok": True,
+        **loss_values,
+        "grad_norm": float(grad_norm.detach().item()),
+    }
+
+
 @torch.inference_mode()
 def validate_step_3d(
     predictor,
@@ -364,6 +513,9 @@ def validate_step_3d(
     prompt_cache: dict,
     prompt_mode: str,
     normalize_coords: bool,
+    offload_video_to_cpu: bool = False,
+    offload_state_to_cpu: bool = False,
+    output_device: str | torch.device | None = None,
 ):
     """
     Validate a single 3D volume represented as a sequence of slices.
@@ -375,6 +527,14 @@ def validate_step_3d(
         prompt_cache (dict): Dataset-produced prompt cache.
         prompt_mode (str): Prompt mode, one of point, box, or mask.
         normalize_coords (bool): Whether SAM2 should normalize point/box coordinates.
+        offload_video_to_cpu: Keep normalized input frames on CPU and transfer
+            them to the image encoder on demand.
+        offload_state_to_cpu: Store compact mask-memory outputs on CPU between
+            propagation steps.
+        output_device: Device on which to accumulate the returned full-volume
+            logits. ``None`` keeps the historical behavior and uses the model
+            device; ``"cpu"`` avoids retaining one full-resolution GPU tensor
+            per frame.
 
     Returns:
         dict | None: Logits and prompt metadata, or None if no prompt is available.
@@ -406,8 +566,8 @@ def validate_step_3d(
 
     state = predictor.init_state_from_tensor(
         imgs_tensor=video_tchw,
-        offload_video_to_cpu=False,
-        offload_state_to_cpu=False,
+        offload_video_to_cpu=bool(offload_video_to_cpu),
+        offload_state_to_cpu=bool(offload_state_to_cpu),
         mode="eval",
     )
 
@@ -495,14 +655,26 @@ def validate_step_3d(
         return None
 
     _, _, H, W = video_tchw.shape
-    logits = torch.zeros((T, H, W), device=device, dtype=torch.float32)
+    logits_device = device if output_device is None else torch.device(output_device)
+    logits = torch.zeros((T, H, W), device=logits_device, dtype=torch.float32)
 
     with amp_ctx:
         for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
             state, start_frame_idx=0, max_frame_num_to_track=T, reverse=False
         ):
             tt = int(frame_idx)
-            logits[tt] = video_res_masks[0, 0].float()
+            frame_logits = video_res_masks[0, 0].float()
+            if frame_logits.device != logits_device:
+                # The destination accumulator is ordinary CPU memory. A
+                # non-blocking device-to-host copy could be read by the next
+                # CPU assignment before the transfer completes.
+                frame_logits = frame_logits.to(logits_device, non_blocking=False)
+            logits[tt] = frame_logits
+
+    if device.type == "cuda" and logits_device.type == "cpu":
+        # Complete any non-blocking device-to-host copies before returning the
+        # output or releasing the inference state.
+        torch.cuda.synchronize(device)
 
     return {
         "logits": logits,

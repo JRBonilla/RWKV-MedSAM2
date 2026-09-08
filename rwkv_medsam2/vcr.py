@@ -14,6 +14,8 @@ from .refinement import RefinementModule, UncertaintyHead
 from vrwkv.vrwkv import VRWKV_SpatialMix, VRWKV_ChannelMix
 from vrwkv.utils import resize_pos_embed, DropPath
 
+
+
 def GroupNorm2d(num_channels: int, eps: float = 1e-6, num_groups: int = 32) -> nn.Module:
     """
     Creates a GroupNorm module that normalizes across feature channels in groups.
@@ -113,6 +115,52 @@ class VCRStem(nn.Module):
         x = self.act(x)
         x = self.conv2(x)
         return x
+
+
+class VCREarlyDownsampleStem(nn.Module):
+    """Opt-in VCR stem that performs both initial reductions before stage 0.
+
+    The output channel count and the four feature-map resolutions remain the
+    same as the regular VCR backbone when stage 0 is configured with stride 1.
+    This only changes where the second 2x reduction is performed, allowing the
+    expensive CNN prefix to operate on smaller feature maps.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 112,
+        hidden_channels: int | None = None,
+        act_layer=nn.ReLU,
+        norm_layer=GroupNorm2d,
+        norm_eps: float = 1e-6,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if hidden_channels is None:
+            hidden_channels = max(1, int(out_channels) // 2)
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=int(hidden_channels),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=bias,
+        )
+        self.norm = norm_layer(int(hidden_channels), eps=norm_eps)
+        self.act = act_layer(inplace=True)
+        self.conv2 = nn.Conv2d(
+            in_channels=int(hidden_channels),
+            out_channels=int(out_channels),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv2(self.act(self.norm(self.conv1(x))))
+
 
 class FusedMbConv(nn.Module):
     """
@@ -491,7 +539,8 @@ class RWKVBlock(nn.Module):
         key_norm: bool = False,
         use_layer_scale: bool = True,
         layer_scale_init_value: float = 1e-2,
-        with_cp: bool = False
+        with_cp: bool = False,
+        fuse_shift_mix: bool = False,
     ):
         """
         Initialize an RWKV residual block.
@@ -529,7 +578,8 @@ class RWKVBlock(nn.Module):
             channel_gamma=channel_gamma,
             shift_pixel=shift_pixel,
             init_mode=init_mode,
-            key_norm=key_norm
+            key_norm=key_norm,
+            fuse_shift_mix=fuse_shift_mix,
         )
 
         # --- Sub-block B: Channel (Feedforward-like) ---
@@ -543,7 +593,8 @@ class RWKVBlock(nn.Module):
             shift_pixel=shift_pixel,
             hidden_rate=int(mlp_ratio),
             init_mode=init_mode,
-            key_norm=key_norm
+            key_norm=key_norm,
+            fuse_shift_mix=fuse_shift_mix,
         )
 
         # --- DropPath (Stochastic Depth) ---
@@ -627,6 +678,9 @@ class VCRBackbone(nn.Module):
         mbconv_stage_cfg: dict = None,
         use_uncertainty: bool = False,
         use_refinement: bool = False,
+        fuse_shift_mix: bool = False,
+        inplace_activations: bool = False,
+        early_downsample_stem: bool = False,
     ):
         """
         Initialize the CNN/RWKV backbone and optional heads.
@@ -650,7 +704,17 @@ class VCRBackbone(nn.Module):
         super().__init__()
 
         stem_out_channels = (fused_stage_cfg or {}).get('out_ch', 112)
-        self.stem = VCRStem(in_channels=in_channels, out_channels=stem_out_channels)
+        if early_downsample_stem:
+            self.stem = VCREarlyDownsampleStem(
+                in_channels=in_channels,
+                out_channels=stem_out_channels,
+            )
+        else:
+            self.stem = VCRStem(
+                in_channels=in_channels,
+                out_channels=stem_out_channels,
+            )
+        self.early_downsample_stem = bool(early_downsample_stem)
 
         # Use config parameters or defaults
         fused_cfg = fused_stage_cfg or {
@@ -717,6 +781,11 @@ class VCRBackbone(nn.Module):
             norm_layer=GroupNorm2d,
         )
 
+        if inplace_activations:
+            for module in self.modules():
+                if isinstance(module, nn.ReLU):
+                    module.inplace = True
+
         # Positional embedding for final scale
         self.with_pos_embed = with_pos_embed
         if self.with_pos_embed:
@@ -743,6 +812,7 @@ class VCRBackbone(nn.Module):
                 use_layer_scale=True,
                 layer_scale_init_value=1e-2,
                 with_cp=False,
+                fuse_shift_mix=fuse_shift_mix,
             )
             for i in range(rwkv_depth)
         ])

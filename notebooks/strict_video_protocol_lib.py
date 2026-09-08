@@ -95,6 +95,7 @@ EXT_ROOT = REPO_ROOT / "ext"
 for _p in [str(REPO_ROOT), str(EXT_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+os.environ.setdefault("VRWKV_T_MAX", "256")
 
 from rwkv_medsam2.train_sam2 import build_student_predictor, get_data_loaders, load_config
 
@@ -1000,6 +1001,27 @@ def default_model_registry() -> dict[str, ModelEntry]:
             builder="sam21_base_student",
             notes="SAM 2.1 base trained in this project.",
         ),
+        "rwkv_medsam2_final_distill": ModelEntry(
+            name="rwkv_medsam2_final_distill",
+            family="native",
+            config_path=str(REPO_ROOT / "ext/sam2/configs/sam2.1/sam2.1_vcr.yaml"),
+            builder="rwkv2_mlp2_optimized",
+            notes="Final RWKV2-MLP2 model with distillation and optimized predictor.",
+        ),
+        "rwkv_medsam2_final_nodistill": ModelEntry(
+            name="rwkv_medsam2_final_nodistill",
+            family="native",
+            config_path=str(REPO_ROOT / "ext/sam2/configs/sam2.1/sam2.1_vcr_nodistill.yaml"),
+            builder="rwkv2_mlp2_optimized",
+            notes="Final RWKV2-MLP2 model without distillation and with optimized predictor.",
+        ),
+        "sam2_1_final_base": ModelEntry(
+            name="sam2_1_final_base",
+            family="native",
+            config_path=str(REPO_ROOT / "ext/sam2/configs/sam2.1/sam2.1_hiera_t512.yaml"),
+            builder="sam21_base_optimized",
+            notes="Final Hiera base trained with matched settings and optimized predictor.",
+        ),
         "oxford_medical_sam2": ModelEntry(
             name="oxford_medical_sam2",
             family="oxford",
@@ -1093,7 +1115,7 @@ def unwrap_state_dict(obj):
 
 
 def load_rwkv_config(entry: ModelEntry):
-    if entry.builder == "sam21_base_student":
+    if entry.builder in {"sam21_base_student", "sam21_base_optimized"}:
         cfg = load_config(str(REPO_ROOT / "ext/sam2/configs/sam2.1/sam2.1_vcr.yaml"))
         base_cfg = OmegaConf.load(entry.config_path)
         cfg.model = base_cfg.model
@@ -1101,8 +1123,35 @@ def load_rwkv_config(entry: ModelEntry):
         cfg.ckpt_path = entry.checkpoint_dir
         cfg.logging.filename = "sam2.1_hiera_t512_base.log"
         cfg.init.ignore_prefixes = []
-        return cfg
-    return load_config(entry.config_path)
+    else:
+        cfg = load_config(entry.config_path)
+
+    if entry.builder in {"rwkv2_mlp2_optimized", "sam21_base_optimized"}:
+        cfg.model.memory_attention.layer.self_attention.feat_sizes = [64, 64]
+        cfg.model.memory_attention.layer.cross_attention.feat_sizes = [64, 64]
+        cfg.model.use_mask_input_as_output_without_sam = False
+        is_rwkv = entry.builder == "rwkv2_mlp2_optimized"
+        cfg.optimizations = OmegaConf.create({
+            "enabled": True,
+            "use_optimized_predictor": True,
+            "efficient_vcr_backbone": is_rwkv,
+            "efficient_vcr_architecture": "rwkv2_mlp2",
+            "external_training_prefill": False,
+            "image_feature_chunk_size": 4,
+            "training_feature_cache_frames": 8,
+            "per_volume_backward": True,
+            "prediction_gpu_cache_chunks": 2,
+            "prediction_cpu_cache_chunks": 64,
+            "prediction_pin_cpu_features": True,
+            "compile_image_encoder": False,
+            "fuse_rwkv_shift_mix": is_rwkv,
+            "inplace_rwkv_activations": is_rwkv,
+            "wkv_t_max": 256,
+        })
+        if is_rwkv:
+            cfg.model.image_encoder.trunk.fuse_shift_mix = True
+            cfg.model.image_encoder.trunk.inplace_activations = True
+    return cfg
 
 
 def initialize_rwkv_sam2_hydra():
@@ -1120,7 +1169,11 @@ def load_native_video_model(entry: ModelEntry):
     initialize_rwkv_sam2_hydra()
     model = build_student_predictor(cfg).to(DEVICE)
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    missing, unexpected = model.load_state_dict(unwrap_state_dict(ckpt), strict=False)
+    strict = entry.builder in {
+        "rwkv2_mlp2_optimized",
+        "sam21_base_optimized",
+    }
+    missing, unexpected = model.load_state_dict(unwrap_state_dict(ckpt), strict=strict)
     model.eval()
     return {"entry": entry, "predictor": model, "checkpoint": ckpt_path, "missing": len(missing), "unexpected": len(unexpected)}
 
@@ -1291,6 +1344,8 @@ def prepare_images_for_model(bundle: dict[str, Any], case: dict[str, Any]):
     imgs = ensure_image_t3hw(case["image"])
     family = bundle["entry"].family
     if family == "native":
+        if bundle["entry"].builder in {"rwkv2_mlp2_optimized", "sam21_base_optimized"}:
+            return imgs.float(), "native_loader_tensor_cpu_offload"
         return imgs.to(DEVICE, non_blocking=True).float(), "native_loader_tensor"
     if family == "oxford":
         return (external_input_to_01(imgs) * 255.0).to(DEVICE, non_blocking=True).float(), "external_0_255"
@@ -1303,7 +1358,19 @@ def init_video_state(bundle: dict[str, Any], imgs: torch.Tensor, h: int, w: int)
     predictor = bundle["predictor"]
     family = bundle["entry"].family
     if family == "native" and hasattr(predictor, "init_state_from_tensor"):
-        return predictor.init_state_from_tensor(imgs_tensor=imgs, offload_video_to_cpu=False, offload_state_to_cpu=False, mode="eval"), "init_state_from_tensor"
+        optimized = bundle["entry"].builder in {
+            "rwkv2_mlp2_optimized",
+            "sam21_base_optimized",
+        }
+        return predictor.init_state_from_tensor(
+            imgs_tensor=imgs,
+            offload_video_to_cpu=optimized,
+            offload_state_to_cpu=False,
+            mode="eval",
+        ), (
+            "init_state_from_tensor_cpu_video" if optimized
+            else "init_state_from_tensor"
+        )
     if family == "oxford":
         if hasattr(predictor, "val_init_state"):
             return predictor.val_init_state(imgs_tensor=imgs, video_height=int(h), video_width=int(w), offload_video_to_cpu=False, offload_state_to_cpu=False), "val_init_state"

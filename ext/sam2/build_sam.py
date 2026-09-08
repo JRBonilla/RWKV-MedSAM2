@@ -117,10 +117,11 @@ def build_sam2_video_predictor(
     hydra_overrides_extra=[],
     apply_postprocessing=True,
     vos_optimized=False,
+    predictor_target="sam2.sam2_video_predictor.SAM2VideoPredictor",
     **kwargs,
 ):
     hydra_overrides = [
-        "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
+        f"++model._target_={predictor_target}",
     ]
     if vos_optimized:
         hydra_overrides = [
