@@ -1,0 +1,315 @@
+{
+  "protocol_id": "encoder_replacement_positive_primary_fullscan_robustness_v3_draft",
+  "date": "2026-10-01",
+  "status": "design_specification_not_executable",
+  "launchable": false,
+  "thesis_claim": "Replace the image encoder and required neck adaptation while retaining the SAM2 prediction architecture; assess accuracy, complexity and practical efficiency.",
+  "main_comparisons": [
+    {
+      "question": "encoder replacement",
+      "models": [
+        "rwkv_medsam2_final_nodistill",
+        "corrected_hiera"
+      ]
+    },
+    {
+      "question": "distillation",
+      "models": [
+        "rwkv_medsam2_final_distill",
+        "rwkv_medsam2_final_nodistill"
+      ]
+    },
+    {
+      "question": "external references under standardized tasks",
+      "models": [
+        "oxford_medical_sam2",
+        "uoft_medsam2"
+      ]
+    }
+  ],
+  "models": {
+    "rwkv_medsam2_final_nodistill": {
+      "status": "finished_checkpoint_hash_audited",
+      "checkpoint": "/data/TrainingCheckpoints/final_retraining_20260830/nodistill/rwkv2_mlp2_final_20260830_v1/best.pth",
+      "sha256": "355a66338ec0a2d5f845c184fdf92f0d759751ebaf3cbf97615452821b5050dc"
+    },
+    "rwkv_medsam2_final_distill": {
+      "status": "finished_checkpoint_hash_audited",
+      "checkpoint": "/data/TrainingCheckpoints/final_retraining_20260830/distill/rwkv2_mlp2_final_20260830_v1/best.pth",
+      "sha256": "61e924e3d30d9312a28b23a255a14aa5222d5d74d5f7218c4b8308151fbba056"
+    },
+    "oxford_medical_sam2": {
+      "status": "finished_checkpoint_hash_audited",
+      "checkpoint": "/data/jrbonill/oxford_medsam2_env/Medical-SAM2/checkpoints/MedSAM2_pretrain.pth",
+      "sha256": "059572b072eff2e41975bf85b0dcca96bc58889db60a89e9f5b1f075236735d7"
+    },
+    "uoft_medsam2": {
+      "status": "finished_checkpoint_hash_audited",
+      "checkpoint": "/data/jrbonill/medsam2_env/MedSAM2/checkpoints/MedSAM2_latest.pt",
+      "sha256": "c92743b99f00d078bf32a3afcc38aaa9faf1c1692dffe3eaa7a90938c1991060"
+    },
+    "corrected_hiera": {
+      "status": "training_pending_final_validation_selection",
+      "checkpoint": null,
+      "sha256": null,
+      "training_directory": "/data/TrainingCheckpoints/hiera_maskfix_20260924/base/hiera_maskfix_4gpu_20260924_v1",
+      "forbidden_historical_checkpoint_sha256": "564e65c142e10c94e527e9d97b669cc22322b4fb6b5ef607ddcff3fb2a515079"
+    }
+  },
+  "shared_input": {
+    "resolution_hw": [
+      512,
+      512
+    ],
+    "channels": 3,
+    "case_batch_size": 1,
+    "encoder_frame_batch_size": 1,
+    "normalization_once": "ImageNet mean [0.485,0.456,0.406] and std [0.229,0.224,0.225]",
+    "preprocessing_status": "provenance_validation_required_before_freeze",
+    "2d_scaling": "declared byte-valued inputs / 255",
+    "3d_scaling": "one volume-wide 0.5th/99.5th percentile mapping, clipped to [0,1]",
+    "constant_intensity": "zero scaled image before ImageNet normalization",
+    "nonfinite_input": "shared rejection with coverage accounting"
+  },
+  "tasks": {
+    "independent_2d": {
+      "unit": "image/target",
+      "sequence_length": 1,
+      "memory_reset": "every image/target",
+      "cross_image_memory": false,
+      "primary_prompt_modes": [
+        "box"
+      ],
+      "box": "tight target box in canonical coordinates, persisted before model execution",
+      "primary_scoring": "predicted target on the complete image",
+      "exact_ground_truth_mask_primary": false,
+      "oxford_inference": "standardized single-image/video-predictor pathway, explicitly labelled; no confidence-memory image flow"
+    },
+    "full_3d": {
+      "unit": "complete available preprocessed physical scan/target",
+      "axis": "validated geometry/source order, frozen before execution",
+      "foreground_trimming": false,
+      "reverse_duplicate_slices": false,
+      "retain_empty_slices": true,
+      "memory_reset": "every scan/target/prompt condition",
+      "prompt_modes": [
+        "box",
+        "mask"
+      ],
+      "prompt_budget_status": "proposed_operating_point_requires_multi_support_pilot",
+      "support_count": "min(P-1, max(1, ceil(0.25*P))) where P >= 2 target-positive slices",
+      "support_selection": "rank positive slice IDs by SHA256(protocol_id|case_id|seed|slice_id); take K and persist payloads",
+      "primary_seed": 42,
+      "robustness_seeds": [
+        137,
+        2026
+      ],
+      "schedule": "offline: support frames once in physical order, then non-support frames once in physical order",
+      "mask_support_policy": "supplied annotation fixed identically across models",
+      "primary_scoring": "pool TP/FP/FN over all unprompted slices, including empty query slices",
+      "P_less_than_2": "ineligible for primary propagation task; report separately, never silently repurpose",
+      "role": "secondary_robustness",
+      "paired_manifest": "derived from frozen positive-frame cohort; same eligible 3D targets and prompts"
+    },
+    "real_video": {
+      "status": "separate task design required; not silently pooled into 3D"
+    },
+    "2d_cross_image_flow": {
+      "status": "outside primary thesis scope; optional separately specified extension"
+    },
+    "positive_3d": {
+      "role": "primary",
+      "unit": "target-positive slice sequence from a held-out stored scan",
+      "remove_empty_before_inference": true,
+      "selection": "canonical target mask contains at least one foreground pixel",
+      "sequence_indices": "dense over selected frames, retain stored slice ID mapping",
+      "prompt_modes": [
+        "box",
+        "mask"
+      ],
+      "supports": "identical stored IDs and payloads in paired full_scan condition",
+      "primary_scoring": "pooled counts over unprompted positive slices",
+      "memory_reset": "fresh for every model/target/prompt/condition",
+      "training_alignment": "positive-frame membership; not an exact training-window or augmentation replication"
+    }
+  },
+  "inference": {
+    "dtype": "float32",
+    "memory_dtype": "float32",
+    "autocast": false,
+    "tf32": false,
+    "torch_compile": false,
+    "attention_backend": "math",
+    "required_rwkv_cuda_extension": true,
+    "cpu_threads": 2,
+    "initial_state_policy": "all-frame GPU state retention, same across models; multi-support compatibility pending",
+    "controls": {
+      "use_mask_input_as_output_without_sam": true,
+      "dynamic_multimask_via_stability": false,
+      "binarize_mask_from_pts_for_mem_enc": false,
+      "fill_hole_area": 0,
+      "non_overlap_masks": false,
+      "non_overlap_masks_for_mem_enc": false,
+      "multimask_output_in_sam": false,
+      "multimask_output_for_tracking": false
+    }
+  },
+  "metrics": {
+    "primary": [
+      "Dice",
+      "IoU"
+    ],
+    "probability_threshold": 0.5,
+    "threshold_operator": ">=",
+    "both_empty_overlap": 1,
+    "one_empty_overlap": 0,
+    "primary_smoothing": 0,
+    "hd95": "secondary: independent 2D target or full 3D all-frame assisted surface distance; geometry/convention validation required",
+    "report_dimensions_separately": true,
+    "macro_hierarchy": [
+      "targets within case",
+      "cases within source cluster",
+      "sources within task",
+      "tasks within dataset",
+      "equal datasets"
+    ],
+    "confidence_intervals": {
+      "level": 0.95,
+      "method": "paired source-cluster bootstrap preserving frozen hierarchy",
+      "replicates": 2000,
+      "seed": 42
+    },
+    "equivalence_margin": null,
+    "training_seed_replicates": "one per variant unless additional completed runs become available"
+  },
+  "accuracy": {
+    "hardware": "shared A100",
+    "cohort": "all eligible frozen held-out cases",
+    "collect_publishable_speed": false,
+    "launch_concurrency": "headroom validated without disrupting Hiera training",
+    "bf16": "optional separate predeclared parity study only",
+    "recording_schema": 3,
+    "supplementary_metrics": [
+      "precision",
+      "recall",
+      "specificity",
+      "false_positive_rate",
+      "false_negative_rate",
+      "size_error",
+      "Brier",
+      "log_loss",
+      "ECE20"
+    ],
+    "prediction_archives": {
+      "binary_masks": "lossless, every evaluated slice",
+      "fp32_logits": "optional --save-logits; estimate storage before enabling",
+      "resume_and_report": "verify archive identity, SHA256 and frame coverage"
+    },
+    "boundary_postpass": {
+      "metrics": [
+        "NSD",
+        "HD95",
+        "ASSD"
+      ],
+      "status": "implemented_unrun_unvalidated",
+      "grid": "stored annotation grid; nearest-neighbor binary mask reconstruction",
+      "scope_3d": "full_scan only: all-frame assisted volumetric boundaries",
+      "units": "mm only with explicit verified spacing; otherwise separate stored pixel/voxel groups",
+      "nsd_tolerances": [
+        1,
+        2,
+        3
+      ],
+      "backend": "google-deepmind/surface-distance; version and source hash recorded",
+      "scope_primary_3d": "mean of real query-slice 2D surfaces; never concatenate gaps into a volume"
+    },
+    "sensitivity_preparation": {
+      "support_policies": [
+        "quarter_positive",
+        "single_middle_positive"
+      ],
+      "prompt_seeds": [
+        42,
+        137,
+        2026
+      ],
+      "separate_manifests": true,
+      "native_paper_reproduction": false,
+      "status": "implemented_unrun_unvalidated"
+    },
+    "primary_sequence_condition": "positive_frames",
+    "secondary_sequence_condition": "full_scan"
+  },
+  "efficiency": {
+    "implementation_status": "written_unrun_unvalidated_2026-10-02",
+    "implementation_entrypoint": "python -m rwkv_medsam2.evaluation.performance",
+    "implementation_notes": "docs/evaluation/performance-runner.md; no GPU jobs, tests, or preparation run",
+    "hardware": "Gamma, one GTX 1070",
+    "default_gpu_index": 1,
+    "concurrent_models": 1,
+    "cohort": "metadata-selected eligible subset of accuracy manifest, drawn from staged pool",
+    "sampling_status": "proposal; final membership pending case/source eligibility",
+    "2d_panel": "up to 20 distinct source clusters per dataset/task; one image/target per source",
+    "3d_panel": "up to 5 sources per dataset/task/length bin; max one scan/target per source in main panel",
+    "stress_panel": "longest eligible available scan per dataset/task, separate from aggregate and deduplicated",
+    "primary_interval": "fresh-state full prediction, prepared host inputs to host predictions including state release; CUDA synchronized",
+    "component_interval": "complete image encoder including neck; GPU-resident inputs; CUDA events",
+    "excluded_from_timing": [
+      "disk/NFS reads",
+      "input normalization",
+      "prompt generation",
+      "checkpoint loading",
+      "compilation",
+      "metrics",
+      "hashes",
+      "logging",
+      "plots"
+    ],
+    "warmup_repetitions": 3,
+    "measured_repetitions": 10,
+    "blocks": 2,
+    "model_order": "balanced and frozen before final trials",
+    "memory_fresh_process_repetitions": 3,
+    "repeat_counts_status": "proposed; pilot then freeze before final measurements",
+    "memory_outputs": [
+      "baseline_allocated",
+      "baseline_reserved",
+      "peak_allocated",
+      "peak_reserved",
+      "delta_peak_allocated",
+      "delta_peak_reserved",
+      "process_peak_RSS"
+    ],
+    "cross_machine_tolerance": null,
+    "cross_machine_tolerance_status": "justify and freeze before examining comparison results",
+    "analytical_compute": "declare MAC/FLOP convention and account for custom WKV operators; unknown ops are not zero",
+    "training_speed": "not established by this inference experiment",
+    "primary_sequence_condition": "positive_frames",
+    "secondary_sequence_condition": "full_scan robustness/stress, reported separately"
+  },
+  "artifacts": {
+    "accuracy_manifest": null,
+    "timing_manifest": null,
+    "prompt_manifest": null,
+    "source_snapshot_sha256": null
+  },
+  "release_gates": [
+    "target and source provenance",
+    "frozen test cases and prompts",
+    "canonical input and instantiated control parity",
+    "final checkpoint for each reported model",
+    "actual multi-support production-adapter tests",
+    "metric edge cases and coverage",
+    "state reset and resume/shard/merge parity",
+    "declared cross-machine tolerances and parity",
+    "frozen timing panel and repeat schedule",
+    "positive-only encoder/memory membership and paired full-scan prompt parity"
+  ],
+  "completed_compatibility_checks": [
+    "Gamma environment",
+    "four-model three-frame synthetic checks",
+    "24 one-support full stored-volume checks"
+  ],
+  "scientific_protocol_certified": false,
+  "study_split_confirmation": "User confirmed accuracy on A100 vs speed/memory on Gamma, each covering independent 2D and full 3D, on 2026-09-30."
+}

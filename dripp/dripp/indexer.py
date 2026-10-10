@@ -19,6 +19,7 @@ from .helpers import (
     get_extension,
     parse_mask_classes,
     parse_segmentation_tasks,
+    match_tasks_for_class,
     get_preprocessing_options
 )
 from .config import BASE_UNPROC, INDEX_DIR, VIDEO_EXTS, VOLUME_EXTS, DEFAULT_LOG_LEVEL, CSV_FILENAME
@@ -447,19 +448,42 @@ def build_groupings(index_data, dataset_dir, metadata):
     for sname, sub in subdatasets.items():
         train_list = list(sub["train"].values())
         test_list = list(sub["test"].values())
+        # Match mask decoding's default fallback for named subdatasets.
+        classes = mask_classes.get(sname, mask_classes.get("default", {}))
+        matched_tasks = {
+            task for cls in classes
+            for task in match_tasks_for_class(cls, seg_tasks)
+        }
+        if (train_list or test_list) and not matched_tasks:
+            raise ValueError(
+                f"No segmentation tasks match subdataset {sname!r} in {dataset_dir}. "
+                f"Mask classes: {list(classes)}. Check mask_classes and "
+                "segmentation_tasks before indexing."
+            )
         out_subdatasets.append({
             "modality": sub["modality"],
             "name": sub["name"],
-            "tasks": [
-                t for t, cls_list in seg_tasks.items()
-                if any(cls in mask_classes.get(sub["name"], {}) for cls in cls_list)
-            ],
-            "classes": mask_classes.get(sub["name"], {}),
+            "tasks": [t for t in seg_tasks if t in matched_tasks],
+            "classes": classes,
             "train": train_list,
             "test": test_list
         })
     
     return {"subdatasets": out_subdatasets}
+
+
+def register_group_tasks(dataset_name, groups, tasks):
+    """Register actual grouped subset names, including inherited mask classes."""
+    for sub in groups["subdatasets"]:
+        for task_id in sub["tasks"]:
+            entry = GLOBAL_TASKS.setdefault(task_id, {"classes": set(), "datasets": {}})
+            entry["classes"].update(tasks[task_id])
+            # Preserve actual mask-class spellings for downstream exact lookups.
+            entry["classes"].update(
+                cls for cls in sub["classes"]
+                if task_id in match_tasks_for_class(cls, tasks)
+            )
+            entry["datasets"].setdefault(dataset_name, set()).add(sub["name"])
 
 def index_dataset(dataset_name, metadata):
     """
@@ -497,17 +521,6 @@ def index_dataset(dataset_name, metadata):
     if not tasks:
         logger.error(f"No segmentation tasks defined for dataset '{dataset_name}'.")
         return
-
-    # Register the segmentation tasks with the global task map
-    for task_id, cls_list in tasks.items():
-        entry = GLOBAL_TASKS.setdefault(task_id, {"classes": set(), "datasets": {}})
-        # Collect all classes associated with this task
-        entry["classes"].update(cls_list)
-        # Find all subdatasets in this dataset that contain any of these classes
-        for subname, cls_rules in mask_classes.items():
-            if any(c in cls_rules for c in cls_list):
-                ds_map = entry["datasets"].setdefault(dataset_name, set())
-                ds_map.add(subname)
 
     train_folders = metadata.get("train_folders") or []
     test_folders = metadata.get("test_folders") or []
@@ -583,6 +596,7 @@ def index_dataset(dataset_name, metadata):
 
     groups = build_groupings(index_data, dataset_dir, metadata)
     index_data["groups"] = groups
+    register_group_tasks(dataset_name, groups, tasks)
 
     # Write the full index file.
     index_folder = os.path.join(INDEX_DIR, "Indexes")

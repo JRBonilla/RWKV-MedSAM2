@@ -1083,8 +1083,12 @@ def match_tasks_for_class(cls_name, tasks_map):
         list: A list of task names that include the given class. If none match,
         returns an empty list.
     """
+    # Treat spaces and underscores as spelling variants without renaming masks
+    # or merging genuinely different classes (e.g. left and right organs).
+    key = re.sub(r"[\s_]+", "_", cls_name.strip())
     return [task_id for task_id, class_list in tasks_map.items()
-            if cls_name in class_list]
+            if any(re.sub(r"[\s_]+", "_", name.strip()) == key
+                   for name in class_list)]
 
 def extract_mask_class(path):
     """

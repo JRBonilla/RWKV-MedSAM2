@@ -392,7 +392,9 @@ def add_common_benchmark_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smoke-datasets", nargs="+", default=None, help="Optional smoke dataset filter.")
     parser.add_argument("--smoke-max-scan-per-dataset", type=int, default=250)
     parser.add_argument("--max-test-cases", type=int, default=None)
-    parser.add_argument("--case-indices", nargs="+", default=None, help="Explicit dataset indices; accepts space or comma separated values.")
+    case_group = parser.add_mutually_exclusive_group()
+    case_group.add_argument("--case-indices", nargs="+", default=None, help="Explicit dataset indices; accepts space or comma separated values.")
+    case_group.add_argument("--case-indices-file", help="JSON file containing a nonempty list of unique dataset indices.")
 
     parser.add_argument("--partial-save-every-rows", type=int, default=None)
     parser.add_argument("--status-update-every-rows", type=int, default=25)
@@ -430,12 +432,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def normalized_config(args: argparse.Namespace) -> dict[str, Any]:
+    case_indices = split_int_values(args.case_indices)
+    if args.case_indices_file:
+        case_indices = json.loads(Path(args.case_indices_file).read_text())
+        if (not isinstance(case_indices, list) or not case_indices
+                or any(type(i) is not int or i < 0 for i in case_indices)
+                or len(set(case_indices)) != len(case_indices)):
+            raise ValueError("--case-indices-file must contain a nonempty JSON list of unique nonnegative integers")
     return {
         "models": split_values(args.models, DEFAULT_MODELS),
         "prompt_modes": split_values(args.prompt_modes, DEFAULT_PROMPT_MODES),
         "protocols": split_values(args.protocols, DEFAULT_PROTOCOLS),
         "smoke_datasets": split_values(args.smoke_datasets, []) if args.smoke_datasets else None,
-        "case_indices": split_int_values(args.case_indices),
+        "case_indices": case_indices,
         "reuse_prompt_mode_state_models": split_values(args.reuse_prompt_mode_state_models, DEFAULT_REUSE_STATE_MODELS),
         "checkpoint_overrides": parse_checkpoint_overrides(args.checkpoint_override),
         "partial_save_every_rows": (
@@ -603,7 +612,9 @@ def worker_command(args: argparse.Namespace, session_dir: Path, attempt_dir: Pat
         cmd.extend(["--smoke-datasets", *cfg["smoke_datasets"]])
     if args.max_test_cases is not None:
         cmd.extend(["--max-test-cases", str(args.max_test_cases)])
-    if cfg["case_indices"]:
+    if args.case_indices_file:
+        cmd.extend(["--case-indices-file", str(Path(args.case_indices_file).resolve())])
+    elif cfg["case_indices"]:
         cmd.extend(["--case-indices", *[str(x) for x in cfg["case_indices"]]])
     if args.visual_top_n_datasets is not None:
         cmd.extend(["--visual-top-n-datasets", str(args.visual_top_n_datasets)])

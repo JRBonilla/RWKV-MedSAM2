@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -36,7 +37,14 @@ def initialize_distributed() -> DistributedContext:
 
     torch.cuda.set_device(local_rank)
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=torch.device("cuda", local_rank))
+        options = {}
+        timeout_seconds = os.environ.get("RWKV_DISTRIBUTED_TIMEOUT_SECONDS")
+        if timeout_seconds is not None:
+            options["timeout"] = timedelta(seconds=float(timeout_seconds))
+        dist.init_process_group(
+            backend="nccl", init_method="env://",
+            device_id=torch.device("cuda", local_rank), **options,
+        )
 
     return DistributedContext(rank=rank, local_rank=local_rank, world_size=world_size)
 

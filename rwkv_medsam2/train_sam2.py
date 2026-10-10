@@ -222,7 +222,9 @@ class CheckpointManager:
             global_step=global_step,
             metric=metric,
         )
-        torch.save(state, path)
+        temporary = path + f".tmp.{os.getpid()}"
+        torch.save(state, temporary)
+        os.replace(temporary, path)
         return path
 
     def save_latest(self, model, optimizer, scheduler, scaler, epoch, global_step):
@@ -889,15 +891,28 @@ def build_student_predictor(config, logger=None):
     Returns:
         SAM2VideoPredictor: Student predictor in train mode.
     """
+    build_options = _optimized_predictor_build_options(config)
+    # The builder composes the architecture YAML again. Preserve this runtime
+    # setting from the caller instead of silently restoring the YAML default.
+    mask_bypass = getattr(config.model, "use_mask_input_as_output_without_sam", None)
+    if mask_bypass is not None:
+        build_options.setdefault("hydra_overrides_extra", []).append(
+            "++model.use_mask_input_as_output_without_sam="
+            + str(bool(mask_bypass)).lower()
+        )
     video_predictor = build_sam2_video_predictor(
         config_file=config._config_path,
         ckpt_path=None,  # IMPORTANT: build without strict checkpoint loading
         device=config.training.device,
         mode="train",
-        **_optimized_predictor_build_options(config),
+        **build_options,
         apply_postprocessing=False,
     )
     video_predictor.train()
+    if mask_bypass is not None and (
+        video_predictor.use_mask_input_as_output_without_sam != bool(mask_bypass)
+    ):
+        raise RuntimeError("Constructed predictor did not preserve mask-input handling")
 
     # Enable/disable obj-ptrs from config
     use_obj_ptrs = bool(getattr(getattr(config, "init", {}), "use_obj_ptrs_in_encoder", True))

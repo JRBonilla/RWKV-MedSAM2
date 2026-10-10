@@ -1027,6 +1027,7 @@ class BalancedTaskBatchSampler(BatchSampler):
         self.memberships = []
         self.valid_indices = []
         raw_bucket_sizes = Counter()
+        invalid_task_groups = Counter()
 
         for idx, seq in enumerate(sequences):
             ds = seq["dataset"]
@@ -1046,6 +1047,19 @@ class BalancedTaskBatchSampler(BatchSampler):
             self.memberships.append(keys)
             if keys:
                 self.valid_indices.append(idx)
+            else:
+                invalid_task_groups[(ds, sd)] += 1
+
+        if invalid_task_groups:
+            details = "; ".join(
+                f"{ds}/{sd}: {count}" for (ds, sd), count in invalid_task_groups.items()
+            )
+            raise ValueError(
+                "Training/validation records have no eligible task assignments "
+                f"({details}). Check task labels, dataset/subdataset mappings and "
+                "dimensions. Regenerate affected indexes and loaders for a new run; "
+                "historical caches must not be silently reused or rewritten."
+            )
 
         self.raw_bucket_sizes = dict(raw_bucket_sizes)
 

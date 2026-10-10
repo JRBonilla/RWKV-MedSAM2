@@ -21,3 +21,5 @@ artifacts/
 # Local Codex recovery files
 codex_recovered_conversation.jsonl
 codex_sessions_backup_*/
+
+reports/

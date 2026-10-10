@@ -260,18 +260,24 @@ def _channel_shift_mix(x, mix_k, mix_r, height, width):
     )
 
 
-_COMPILED_SPATIAL_SHIFT_MIX = torch.compile(
-    _spatial_shift_mix,
-    fullgraph=True,
-    dynamic=False,
-    options={"triton.cudagraphs": False},
-)
-_COMPILED_CHANNEL_SHIFT_MIX = torch.compile(
-    _channel_shift_mix,
-    fullgraph=True,
-    dynamic=False,
-    options={"triton.cudagraphs": False},
-)
+# Pascal evaluation must not initialize Inductor/Triton, even during import.
+# Keep the existing compiled path as the default for training environments.
+if os.environ.get("VRWKV_DISABLE_COMPILE", "0") == "1":
+    _COMPILED_SPATIAL_SHIFT_MIX = _spatial_shift_mix
+    _COMPILED_CHANNEL_SHIFT_MIX = _channel_shift_mix
+else:
+    _COMPILED_SPATIAL_SHIFT_MIX = torch.compile(
+        _spatial_shift_mix,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
+    _COMPILED_CHANNEL_SHIFT_MIX = torch.compile(
+        _channel_shift_mix,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
 
 
 class VRWKV_SpatialMix(nn.Module):

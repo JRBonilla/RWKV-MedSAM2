@@ -870,7 +870,7 @@ def main() -> None:
         train_loader, val_loader, test_loader, sampling_summary = make_loaders(
             config, args, context
         )
-        train_batches_per_epoch = len(train_loader)
+        train_batches_per_epoch = int(sampling_summary["epoch_0_training_plan"]["batches"])
         logger.info(
             "mode=%s run_id=%s rank=%d/%d device=%s global_batch=%d local_batch=%d "
             "train_batches=%d val_batches=%d optimized_predictor=%s "
@@ -938,6 +938,14 @@ def main() -> None:
             start_epoch, start_batch, global_step = restore_checkpoint(
                 args.resume, student, optimizer, scheduler
             )
+            if context.is_main:
+                # Discard only unsaved TensorBoard steps beyond the restored
+                # checkpoint, so recovery produces one unambiguous loss curve.
+                writer.close()
+                writer = SummaryWriter(
+                    log_dir=str(log_dir), flush_secs=30, max_queue=100,
+                    purge_step=global_step + 1,
+                )
             logger.info(
                 "resumed=%s epoch=%d batch=%d global_step=%d",
                 args.resume, start_epoch, start_batch, global_step,
@@ -958,6 +966,9 @@ def main() -> None:
                 "val_samples": args.val_samples,
                 "pilot": args.pilot,
                 "optimized": args.optimized,
+                "cpu_threads_per_rank": torch.get_num_threads(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "nccl_environment": {k: v for k, v in os.environ.items() if k.startswith("NCCL_")},
                 "safe_training_optimizations": safe_training,
                 "efficient_vcr_backbone": efficient_backbone,
                 "efficient_vcr_architecture": getattr(
@@ -971,8 +982,17 @@ def main() -> None:
                     args.ignore_pretrained_image_encoder
                 ),
                 "initial_model_state": args.initial_model_state or None,
+                "resume_checkpoint": args.resume or None,
                 "initial_state_metadata": initial_state_metadata,
                 "predictor_class": type(student).__name__,
+                "runtime_model_settings": {
+                    "use_mask_input_as_output_without_sam": bool(
+                        student.use_mask_input_as_output_without_sam
+                    ),
+                    "world_size": context.world_size,
+                    "global_batch_size": args.global_batch_size,
+                    "local_batch_size": args.global_batch_size // context.world_size,
+                },
                 "sampling": sampling_summary,
                 "config": OmegaConf.to_container(config, resolve=True),
             }
@@ -1010,18 +1030,26 @@ def main() -> None:
                 if utilization == utilization:
                     writer.add_scalar("system/gpu_utilization_percent", utilization, step)
                 writer.add_scalar("monitor/heartbeat", 1.0, step)
+                writer.add_scalar("progress/overall_percent", 100.0 * step / total_steps, step)
+                writer.add_scalar("progress/epoch", epoch + 1, step)
+                writer.add_scalar("progress/completed_steps", step, step)
                 writer.flush()
                 atomic_json(status_path, {
                     "state": "training", "mode": args.mode, "run_id": run_id,
                     "epoch": int(epoch), "batch_idx": int(batch_idx),
                     "global_step": int(step), "samples_per_second": samples_per_second,
                     "eta_hours": eta_hours,
+                    "total_steps": int(total_steps),
+                    "total_epochs": int(args.epochs),
+                    "overall_percent": 100.0 * step / total_steps,
+                    "world_size": context.world_size,
+                    "runtime_mask_bypass": bool(student.use_mask_input_as_output_without_sam),
                     "updated_utc": datetime.now(timezone.utc).isoformat(),
                 })
                 last_monitor, last_monitor_step = now, step
 
             recovery_seconds = max(0.0, args.recovery_minutes) * 60.0
-            if context.is_main and recovery_seconds > 0 and now - last_recovery >= recovery_seconds:
+            if context.is_main and recovery_seconds > 0 and (step == 1 or now - last_recovery >= recovery_seconds):
                 atomic_torch_save(
                     checkpoint_dir / "recovery_latest.pth",
                     checkpoint_payload(
@@ -1034,6 +1062,14 @@ def main() -> None:
                 last_recovery = now
 
         best_metric = float("-inf")
+        best_path = checkpoint_dir / "best.pth"
+        if context.is_main and args.resume and best_path.is_file():
+            best_state = torch.load(best_path, map_location="cpu", weights_only=False)
+            saved_metric = best_state.get("metric")
+            if saved_metric is not None:
+                best_metric = float(saved_metric)
+                logger.info("restored best validation metric=%.6f", best_metric)
+            del best_state
         for epoch in range(start_epoch, args.epochs):
             if hasattr(train_loader.batch_sampler, "set_epoch"):
                 train_loader.batch_sampler.set_epoch(epoch)
@@ -1046,16 +1082,21 @@ def main() -> None:
                 batch_index_offset = epoch_start_batch
             if args.matched_run:
                 reset_runtime_seed(int(config.training.seed) + 10000 * epoch)
-            average_loss, global_step, optimizer, scheduler = train_epoch(
-                student, teacher, train_loader, optimizer, scheduler, config, None,
-                epoch, logger, writer, global_step,
-                start_batch_idx=loader_start_batch,
-                batch_index_offset=batch_index_offset,
-                step_callback=step_callback,
-            )
-            average_loss = reduce_mean(average_loss, device)
-            if context.is_main:
-                writer.add_scalar("distributed/train_loss_mean", average_loss, epoch)
+            if epoch_start_batch >= train_batches_per_epoch:
+                # A pre-validation recovery already includes scheduler.step().
+                # Retry validation without advancing the schedule a second time.
+                logger.info("epoch=%d training already complete; retrying validation", epoch)
+            else:
+                average_loss, global_step, optimizer, scheduler = train_epoch(
+                    student, teacher, train_loader, optimizer, scheduler, config, None,
+                    epoch, logger, writer, global_step,
+                    start_batch_idx=loader_start_batch,
+                    batch_index_offset=batch_index_offset,
+                    step_callback=step_callback,
+                )
+                average_loss = reduce_mean(average_loss, device)
+                if context.is_main:
+                    writer.add_scalar("distributed/train_loss_mean", average_loss, epoch)
 
             barrier()
             validate_now = (
