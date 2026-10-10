@@ -1,4 +1,6 @@
-"""Grouping and regex-debugger callbacks for the DRIPP debugger app."""
+"""
+Grouping and regex-debugger callbacks for the DRIPP debugger app.
+"""
 
 import queue
 import threading
@@ -11,12 +13,6 @@ from .common import *
 class GroupingDebuggerMixin:
     """
     Provide callbacks for the grouping and regex debugger tab.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
 
     def _dataset_base_dir(self, dataset_name):
@@ -43,6 +39,7 @@ class GroupingDebuggerMixin:
             str: Normalized dataset data directory.
         """
         root = meta.get("root_directory") or ""
+
         return normalize_path(
             os.path.join(BASE_UNPROC, dataset_name, root)
             if root
@@ -61,19 +58,24 @@ class GroupingDebuggerMixin:
             str: CSV Root Folder value.
         """
         dataset_dir = os.path.abspath(os.path.normpath(dataset_dir))
-        dataset_base = os.path.abspath(os.path.normpath(self._dataset_base_dir(dataset_name)))
+        dataset_base = os.path.abspath(
+            os.path.normpath(self._dataset_base_dir(dataset_name))
+        )
 
         if os.path.normcase(dataset_dir) == os.path.normcase(dataset_base):
             return ""
 
         try:
             common = os.path.commonpath([dataset_base, dataset_dir])
-            is_inside_dataset_base = os.path.normcase(common) == os.path.normcase(dataset_base)
+            is_inside_dataset_base = os.path.normcase(common) == os.path.normcase(
+                dataset_base
+            )
         except ValueError:
             is_inside_dataset_base = False
 
         if is_inside_dataset_base:
             return normalize_path(os.path.relpath(dataset_dir, dataset_base))
+
         return normalize_path(dataset_dir)
 
     def _save_dataset_root_folder(self, dataset_name, dataset_dir, df=None):
@@ -83,7 +85,7 @@ class GroupingDebuggerMixin:
         Args:
             dataset_name (str): Dataset name from the metadata CSV.
             dataset_dir (str): Absolute or relative folder selected in the UI.
-            df (pandas.DataFrame, optional): Existing CSV dataframe to update.
+            df (pandas.DataFrame | None): Existing CSV dataframe to update.
 
         Returns:
             tuple[pandas.DataFrame, str]: Updated dataframe and saved Root Folder value.
@@ -94,8 +96,11 @@ class GroupingDebuggerMixin:
         if "Root Folder" not in df.columns:
             df["Root Folder"] = ""
 
-        root_to_save = self._root_folder_value_for_dataset_dir(dataset_name, dataset_dir)
+        root_to_save = self._root_folder_value_for_dataset_dir(
+            dataset_name, dataset_dir
+        )
         df.loc[df["Dataset Name"] == dataset_name, "Root Folder"] = root_to_save
+
         return df, root_to_save
 
     def _reload_metadata(self):
@@ -125,10 +130,11 @@ class GroupingDebuggerMixin:
             prompt_if_missing (bool): Whether to ask the user for a replacement.
 
         Returns:
-            str or None: Existing data directory, or None when unresolved.
+            str | None: Existing data directory, or None when unresolved.
         """
         meta = self.metadata.get(dataset_name, {})
         dataset_dir = self._dataset_dir_from_metadata(dataset_name, meta)
+
         if os.path.isdir(dataset_dir):
             return dataset_dir
 
@@ -139,7 +145,7 @@ class GroupingDebuggerMixin:
             "Dataset Folder Not Found",
             "DRIPP could not find the configured data folder:\n\n"
             f"{dataset_dir}\n\n"
-            "Please choose where to look for this dataset."
+            "Please choose where to look for this dataset.",
         )
         selected_dir = filedialog.askdirectory(
             title=f"Locate data folder for {dataset_name}"
@@ -148,7 +154,7 @@ class GroupingDebuggerMixin:
         if not selected_dir:
             messagebox.showwarning(
                 "Dataset Folder Required",
-                "No replacement folder was selected. DRIPP will not index this dataset until its data folder exists."
+                "No replacement folder was selected. DRIPP will not index this dataset until its data folder exists.",
             )
             return None
 
@@ -156,20 +162,21 @@ class GroupingDebuggerMixin:
         if not os.path.isdir(selected_dir):
             messagebox.showwarning(
                 "Invalid Dataset Folder",
-                "The selected folder does not exist:\n\n"
-                f"{selected_dir}"
+                "The selected folder does not exist:\n\n" f"{selected_dir}",
             )
             return None
 
         try:
-            df, _root_to_save = self._save_dataset_root_folder(dataset_name, selected_dir)
+            df, _root_to_save = self._save_dataset_root_folder(
+                dataset_name, selected_dir
+            )
             df.to_csv(self.csv_path, index=False)
             self._reload_metadata()
         except Exception as e:
             messagebox.showerror(
                 "Save Error",
                 "DRIPP found the folder but could not save it to the metadata CSV:\n\n"
-                f"{e}"
+                f"{e}",
             )
             return None
 
@@ -196,42 +203,50 @@ class GroupingDebuggerMixin:
         meta = self.metadata[name]
 
         # Collect files
-        img_types  = [e.strip() for e in self.img_ext_var.get().split(',') if e.strip()]
-        mask_types = [e.strip() for e in self.mask_ext_var.get().split(',') if e.strip()]
+        img_types = [e.strip() for e in self.img_ext_var.get().split(",") if e.strip()]
+        mask_types = [
+            e.strip() for e in self.mask_ext_var.get().split(",") if e.strip()
+        ]
 
-        train_recs = collect_files("", self.train_paths, img_types,
-                                   use_folder_identifier=False,
-                                   exclude_folders=meta.get("mask_folders"),
-                                   mask_key=meta.get("mask_key"))
+        train_recs = collect_files(
+            "",
+            self.train_paths,
+            img_types,
+            use_folder_identifier=False,
+            exclude_folders=meta.get("mask_folders"),
+            mask_key=meta.get("mask_key"),
+        )
         train_recs = sorted(train_recs, key=lambda x: x["path"])
 
-        test_recs = collect_files("", self.test_paths, img_types,
-                                  use_folder_identifier=False,
-                                  exclude_folders=meta.get("mask_folders"),
-                                  mask_key=meta.get("mask_key"))
+        test_recs = collect_files(
+            "",
+            self.test_paths,
+            img_types,
+            use_folder_identifier=False,
+            exclude_folders=meta.get("mask_folders"),
+            mask_key=meta.get("mask_key"),
+        )
         test_recs = sorted(test_recs, key=lambda x: x["path"])
 
-        mask_recs = collect_files("", self.mask_paths, mask_types,
-                                  is_mask=True,
-                                  mask_key=meta.get("mask_key"))
+        mask_recs = collect_files(
+            "", self.mask_paths, mask_types, is_mask=True, mask_key=meta.get("mask_key")
+        )
         mask_recs = sorted(mask_recs, key=lambda x: x["path"])
 
         index_data = {
             "images_train": train_recs,
-            "images_test":  test_recs,
-            "mask_files":   mask_recs
+            "images_test": test_recs,
+            "mask_files": mask_recs,
         }
 
         groups = build_groupings(index_data, base_dir, meta)
         # `Groups` is a dict { "subdatasets": [...] }; indexer writes groups=subdatasets
         subdatasets = groups.get("subdatasets", [])
-        index_data_full = {
-            **index_data,
-            "groups": subdatasets
-        }
+        index_data_full = {**index_data, "groups": subdatasets}
 
         # Ask for folder
         folder = filedialog.askdirectory(title="Select folder to save JSONs")
+
         if not folder:
             return
 
@@ -248,7 +263,7 @@ class GroupingDebuggerMixin:
         messagebox.showinfo(
             "Saved JSON",
             f"Index file saved to:\n  {idx_path}\n\n"
-            f"Groups file saved to:\n  {grp_path}"
+            f"Groups file saved to:\n  {grp_path}",
         )
 
     def px_test(self):
@@ -261,82 +276,92 @@ class GroupingDebuggerMixin:
         Returns:
             None.
         """
-        self.px_results.delete('1.0', tk.END)
-        pattern = self.px_regex.get('1.0', tk.END).strip()
-        text = self.px_test_str.get('1.0', tk.END)
+        self.px_results.delete("1.0", tk.END)
+        pattern = self.px_regex.get("1.0", tk.END).strip()
+        text = self.px_test_str.get("1.0", tk.END)
+
         if not pattern:
-            messagebox.showwarning('Input Required', 'Please enter a regex.')
+            messagebox.showwarning("Input Required", "Please enter a regex.")
             return
         try:
             regex = re.compile(pattern)
         except re.error as e:
-            self.px_results.insert(tk.END, f'Regex error: {e}\n')
+            self.px_results.insert(tk.END, f"Regex error: {e}\n")
             return
+
         matches = list(regex.finditer(text))
         if not matches:
-            self.px_results.insert(tk.END, 'No matches found.\n')
+            self.px_results.insert(tk.END, "No matches found.\n")
             return
         for i, m in enumerate(matches, 1):
-            self.px_results.insert(tk.END, f'Match {i}: {m.group(0)}\n')
+            self.px_results.insert(tk.END, f"Match {i}: {m.group(0)}\n")
             for name, val in m.groupdict().items():
-                self.px_results.insert(tk.END, f'  {name}: {val}\n')
-            self.px_results.insert(tk.END, '\n')
+                self.px_results.insert(tk.END, f"  {name}: {val}\n")
+
+            self.px_results.insert(tk.END, "\n")
 
     def on_dataset_select(self, event):
         """
         Load dataset metadata into the grouping tab controls.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
             None.
         """
         name = self.dataset_var.get()
         if hasattr(self, "index_selected_btn"):
-            self.index_selected_btn.state(['!disabled'] if name else ['disabled'])
+            self.index_selected_btn.state(["!disabled"] if name else ["disabled"])
+
         meta = self.metadata.get(name, {})
         # Load regex
-        self.regex_text.delete('1.0', tk.END)
-        regex = meta.get('grouping_regex') or ''
+        self.regex_text.delete("1.0", tk.END)
+        regex = meta.get("grouping_regex") or ""
         self.regex_text.insert(tk.END, regex)
         self.original_regex = regex
-        self.save_btn.state(['disabled'])
+        self.save_btn.state(["disabled"])
         # Load other fields
-        self.strategy_var.set(meta.get('grouping_strategy','regex-file'))
-        self.img_ext_var.set(','.join(meta.get('image_file_types',[])))
-        self.mask_ext_var.set(','.join(meta.get('mask_file_types',[])))
+        self.strategy_var.set(meta.get("grouping_strategy", "regex-file"))
+        self.img_ext_var.set(",".join(meta.get("image_file_types", [])))
+        self.mask_ext_var.set(",".join(meta.get("mask_file_types", [])))
         dataset_dir = self._dataset_dir_from_metadata(name, meta)
         self.base_var.set(dataset_dir)
         resolved_dir = self._ensure_dataset_dir(name)
+
         if resolved_dir:
             dataset_dir = resolved_dir
+
         # Resolve folders
-        self.train_paths=[]
-        self.test_paths=[]
-        self.mask_paths=[]
-        if not self.mask_paths: self.mask_paths=[dataset_dir]
-        self.save_json_btn.state(['disabled'])
+        self.train_paths = []
+        self.test_paths = []
+        self.mask_paths = []
+
+        if not self.mask_paths:
+            self.mask_paths = [dataset_dir]
+
+        self.save_json_btn.state(["disabled"])
         # Clear UI
         for iid in self.config_tree.get_children():
             self.config_tree.delete(iid)
-        for t in (self.resolved_tree,self.train_tree,self.test_tree): t.delete(*t.get_children())
+        for t in (self.resolved_tree, self.train_tree, self.test_tree):
+            t.delete(*t.get_children())
 
     def on_regex_change(self, event):
         """
         Mark the grouping regex as modified.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
             None.
         """
-        current=self.regex_text.get('1.0',tk.END).rstrip('\n')
-        if self.original_regex is not None and current!=self.original_regex:
-            self.save_btn.state(['!disabled'])
+        current = self.regex_text.get("1.0", tk.END).rstrip("\n")
+        if self.original_regex is not None and current != self.original_regex:
+            self.save_btn.state(["!disabled"])
         else:
-            self.save_btn.state(['disabled'])
+            self.save_btn.state(["disabled"])
 
     def save_regex(self):
         """
@@ -348,41 +373,44 @@ class GroupingDebuggerMixin:
         Returns:
             None.
         """
-        name          = self.dataset_var.get()
-        new_regex     = self.regex_text.get('1.0', tk.END).strip()
-        new_strategy  = self.strategy_var.get().strip()
-        new_img_ext   = self.img_ext_var.get().strip()
-        new_mask_ext  = self.mask_ext_var.get().strip()
+        name = self.dataset_var.get()
+        new_regex = self.regex_text.get("1.0", tk.END).strip()
+        new_strategy = self.strategy_var.get().strip()
+        new_img_ext = self.img_ext_var.get().strip()
+        new_mask_ext = self.mask_ext_var.get().strip()
         new_base_full = self.base_var.get().strip()
 
         try:
             df = pd.read_csv(self.csv_path)
 
             # Update known columns
-            df.loc[df['Dataset Name'] == name, 'Grouping Regex']    = new_regex
-            df.loc[df['Dataset Name'] == name, 'Grouping Strategy'] = new_strategy
-            df.loc[df['Dataset Name'] == name, 'Image File Type']   = new_img_ext
-            df.loc[df['Dataset Name'] == name, 'Mask File Type']    = new_mask_ext
+            df.loc[df["Dataset Name"] == name, "Grouping Regex"] = new_regex
+            df.loc[df["Dataset Name"] == name, "Grouping Strategy"] = new_strategy
+            df.loc[df["Dataset Name"] == name, "Image File Type"] = new_img_ext
+            df.loc[df["Dataset Name"] == name, "Mask File Type"] = new_mask_ext
 
             # Ensure a 'Root Folder' column exists
-            df, root_to_save = self._save_dataset_root_folder(name, new_base_full, df=df)
+            df, root_to_save = self._save_dataset_root_folder(
+                name, new_base_full, df=df
+            )
 
             # Write back and refresh
             df.to_csv(self.csv_path, index=False)
             self._reload_metadata()
             self.original_regex = new_regex
-            self.save_btn.state(['disabled'])
+            self.save_btn.state(["disabled"])
 
-            messagebox.showinfo('Saved',
+            messagebox.showinfo(
+                "Saved",
                 f"Updated '{name}' with:\n"
                 f" - Grouping Regex\n"
                 f" - Grouping Strategy\n"
                 f" - Image File Type\n"
                 f" - Mask File Type\n"
-                f" - Root Folder: '{root_to_save}'"
+                f" - Root Folder: '{root_to_save}'",
             )
         except Exception as e:
-            messagebox.showerror('Save Error', f'Failed to save CSV: {e}')
+            messagebox.showerror("Save Error", f"Failed to save CSV: {e}")
 
     def browse_directory(self):
         """
@@ -394,8 +422,9 @@ class GroupingDebuggerMixin:
         Returns:
             None.
         """
-        p=filedialog.askdirectory()
-        if p: self.base_var.set(normalize_path(p))
+        p = filedialog.askdirectory()
+        if p:
+            self.base_var.set(normalize_path(p))
 
     def parse_configs(self):
         """
@@ -412,120 +441,203 @@ class GroupingDebuggerMixin:
             self.config_tree.delete(i)
 
         from dripp.helpers import get_regex_configs
-        regex = self.regex_text.get('1.0', tk.END).strip()
+
+        regex = self.regex_text.get("1.0", tk.END).strip()
         if not regex:
-            messagebox.showwarning('Input Required','Please enter a grouping regex.')
+            messagebox.showwarning("Input Required", "Please enter a grouping regex.")
             return
 
-        configs = get_regex_configs(regex,{})
+        configs = get_regex_configs(regex, {})
         if not configs:
             # Show a dummy node
-            self.config_tree.insert('', 'end', text='No valid configs parsed.')
+            self.config_tree.insert("", "end", text="No valid configs parsed.")
             return
 
         for idx, cfg in enumerate(configs, start=1):
             # Top-level node: use the name if available
-            label = getattr(cfg, 'name', None) or f'Config {idx}'
-            parent = self.config_tree.insert('', 'end', text=label, open=False)
+            label = getattr(cfg, "name", None) or f"Config {idx}"
+            parent = self.config_tree.insert("", "end", text=label, open=False)
             # Add each field of the config as a child
             for field_name, field_val in cfg.__dict__.items():
-                if field_name.startswith('_'):
+                if field_name.startswith("_"):
                     continue
-                self.config_tree.insert(parent, 'end', text=field_name, values=(repr(field_val),))
+
+                self.config_tree.insert(
+                    parent, "end", text=field_name, values=(repr(field_val),)
+                )
 
     def _clear_indexing_trees(self):
+        """
+        Clear resolved files and reset train/test group labels.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         for tree in (self.resolved_tree, self.train_tree, self.test_tree):
             tree.delete(*tree.get_children())
+
         self.train_tree.master.config(text="Training Groups")
         self.test_tree.master.config(text="Testing Groups")
 
     def _resolve_indexing_paths(self, dataset_name, meta, dataset_dir):
+        """
+        Resolve configured train, test, and mask folders for an indexing job.
+
+        Args:
+            dataset_name (str): Name of the dataset being indexed, processed, or
+                rendered.
+            meta (dict): Parsed metadata for the selected dataset.
+            dataset_dir (str): Resolved raw-data root for the indexing job.
+
+        Returns:
+            tuple[list[str], list[str], list[str]]: Training folders, testing folders,
+                and mask folders.
+        """
         train_paths = []
-        for fld in meta.get('train_folders', []):
+        for fld in meta.get("train_folders", []):
             train_paths += resolve_folder(dataset_dir, fld)
+
         test_paths = []
-        for fld in meta.get('test_folders', []):
+        for fld in meta.get("test_folders", []):
             test_paths += resolve_folder(dataset_dir, fld)
-        mask_paths = resolve_mask_folders(dataset_dir, meta.get('mask_folders', []))
+
+        mask_paths = resolve_mask_folders(dataset_dir, meta.get("mask_folders", []))
         return train_paths, test_paths, mask_paths
 
-    def _display_index_result(self, dataset_name, result, train_paths, test_paths, mask_paths):
+    def _display_index_result(
+        self, dataset_name, result, train_paths, test_paths, mask_paths
+    ):
+        """
+        Populate resolved-file and split-group trees from a completed index.
+
+        Args:
+            dataset_name (str): Name of the dataset being indexed, processed, or
+                rendered.
+            result (dict): Completed index containing image records, mask records, and
+                grouped subdatasets.
+            train_paths (list[str]): Resolved training image folders.
+            test_paths (list[str]): Resolved testing image folders.
+            mask_paths (list[str]): Resolved mask folders for the indexing result.
+
+        Returns:
+            None.
+        """
         self._clear_indexing_trees()
         self.train_paths = train_paths
         self.test_paths = test_paths
         self.mask_paths = mask_paths
 
         unannotated = result.get("unannotated_groups", [])
+
         if unannotated:
             messagebox.showwarning(
                 "Unannotated Groups",
                 "The following groups were dropped (no masks found):\n\n"
-                + "\n".join(unannotated)
+                + "\n".join(unannotated),
             )
 
-        root_id = self.resolved_tree.insert('', 'end', text='Resolved', open=True)
-        fld_id = self.resolved_tree.insert(root_id, 'end', text='Folders', tags=('folder',), open=True)
-        tf_id = self.resolved_tree.insert(
-            fld_id, 'end',
-            text=f'Train Folders ({len(self.train_paths)})',
-            tags=('folder',)
+        root_id = self.resolved_tree.insert("", "end", text="Resolved", open=True)
+        fld_id = self.resolved_tree.insert(
+            root_id, "end", text="Folders", tags=("folder",), open=True
         )
+        tf_id = self.resolved_tree.insert(
+            fld_id,
+            "end",
+            text=f"Train Folders ({len(self.train_paths)})",
+            tags=("folder",),
+        )
+
         for p in self.train_paths:
-            self.resolved_tree.insert(tf_id, 'end', text=p, tags=('folder',))
+            self.resolved_tree.insert(tf_id, "end", text=p, tags=("folder",))
 
         tstf_id = self.resolved_tree.insert(
-            fld_id, 'end',
-            text=f'Test Folders ({len(self.test_paths)})',
-            tags=('folder',)
+            fld_id,
+            "end",
+            text=f"Test Folders ({len(self.test_paths)})",
+            tags=("folder",),
         )
         for p in self.test_paths:
-            self.resolved_tree.insert(tstf_id, 'end', text=p, tags=('folder',))
+            self.resolved_tree.insert(tstf_id, "end", text=p, tags=("folder",))
 
         mskf_id = self.resolved_tree.insert(
-            fld_id, 'end',
-            text=f'Mask Folders ({len(self.mask_paths)})',
-            tags=('folder',)
+            fld_id,
+            "end",
+            text=f"Mask Folders ({len(self.mask_paths)})",
+            tags=("folder",),
         )
         for p in self.mask_paths:
-            self.resolved_tree.insert(mskf_id, 'end', text=p, tags=('folder',))
+            self.resolved_tree.insert(mskf_id, "end", text=p, tags=("folder",))
 
-        files_id = self.resolved_tree.insert(root_id, 'end', text='Files', open=True)
-        all_images = result['images_train'] + result['images_test']
-        imgs_id = self.resolved_tree.insert(files_id, 'end', text=f'Images ({len(all_images)})', tags=('images',))
+        files_id = self.resolved_tree.insert(root_id, "end", text="Files", open=True)
+        all_images = result["images_train"] + result["images_test"]
+        imgs_id = self.resolved_tree.insert(
+            files_id, "end", text=f"Images ({len(all_images)})", tags=("images",)
+        )
+
         for rec in all_images:
-            self.resolved_tree.insert(imgs_id, 'end', text=rec['path'], tags=('images',))
+            self.resolved_tree.insert(
+                imgs_id, "end", text=rec["path"], tags=("images",)
+            )
 
-        masks = result['mask_files']
-        msks_id = self.resolved_tree.insert(files_id, 'end', text=f'Masks ({len(masks)})', tags=('masks',))
+        masks = result["mask_files"]
+        msks_id = self.resolved_tree.insert(
+            files_id, "end", text=f"Masks ({len(masks)})", tags=("masks",)
+        )
         for rec in masks:
-            self.resolved_tree.insert(msks_id, 'end', text=rec['path'], tags=('masks',))
+            self.resolved_tree.insert(msks_id, "end", text=rec["path"], tags=("masks",))
 
         train_count = test_count = 0
-        for group in result['groups']:
-            for split, tree in (('train', self.train_tree), ('test', self.test_tree)):
+        for group in result["groups"]:
+            for split, tree in (("train", self.train_tree), ("test", self.test_tree)):
                 for subgroup in group[split]:
-                    if split == 'train':
+                    if split == "train":
                         train_count += 1
                     else:
                         test_count += 1
 
                     node = tree.insert(
-                        '', 'end',
-                        text=subgroup['identifier'],
-                        tags=(split, 'error') if not subgroup['masks'] else (split,)
+                        "",
+                        "end",
+                        text=subgroup["identifier"],
+                        tags=(split, "error") if not subgroup["masks"] else (split,),
                     )
-                    img_node = tree.insert(node, 'end', text=f"Images ({len(subgroup['images'])})", tags=('images',))
-                    for r in subgroup['images']:
-                        tree.insert(img_node, 'end', text=r['path'], tags=('images',))
-                    m_node = tree.insert(node, 'end', text=f"Masks ({len(subgroup['masks'])})", tags=('masks',))
-                    for r in subgroup['masks']:
-                        tree.insert(m_node, 'end', text=r['path'], tags=('masks',))
+                    img_node = tree.insert(
+                        node,
+                        "end",
+                        text=f"Images ({len(subgroup['images'])})",
+                        tags=("images",),
+                    )
+                    for r in subgroup["images"]:
+                        tree.insert(img_node, "end", text=r["path"], tags=("images",))
+
+                    m_node = tree.insert(
+                        node,
+                        "end",
+                        text=f"Masks ({len(subgroup['masks'])})",
+                        tags=("masks",),
+                    )
+                    for r in subgroup["masks"]:
+                        tree.insert(m_node, "end", text=r["path"], tags=("masks",))
 
         self.train_tree.master.config(text=f"Training Groups ({train_count})")
         self.test_tree.master.config(text=f"Testing Groups ({test_count})")
-        self.save_json_btn.state(['!disabled'])
+        self.save_json_btn.state(["!disabled"])
 
     def _open_index_progress_dialog(self, title, total):
+        """
+        Create the status, log, and progress widgets for indexing jobs.
+
+        Args:
+            title (str): Title of the configuration section or progress dialog.
+            total (int): Number of indexing jobs represented by the progress bar.
+
+        Returns:
+            dict: Dialog window, status variable, progress bar, log widget, and close
+                controls.
+        """
         win = tk.Toplevel(self.root)
         win.title(title)
         win.transient(self.root)
@@ -542,15 +654,16 @@ class GroupingDebuggerMixin:
         log.pack(fill="both", expand=True)
 
         auto_close_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            body,
-            text="Close when done",
-            variable=auto_close_var
-        ).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(body, text="Close when done", variable=auto_close_var).pack(
+            anchor="w", pady=(8, 0)
+        )
 
-        close_btn = ttk.Button(body, text="Close", command=win.destroy, state="disabled")
+        close_btn = ttk.Button(
+            body, text="Close", command=win.destroy, state="disabled"
+        )
         close_btn.pack(anchor="e", pady=(8, 0))
         win.protocol("WM_DELETE_WINDOW", lambda: None)
+
         return {
             "window": win,
             "status_var": status_var,
@@ -561,21 +674,54 @@ class GroupingDebuggerMixin:
         }
 
     def _set_index_buttons_state(self, enabled):
+        """
+        Enable or disable indexing actions while respecting dataset selection.
+
+        Args:
+            enabled (bool): Whether indexing buttons should accept new actions.
+
+        Returns:
+            None.
+        """
         if hasattr(self, "index_all_btn"):
-            self.index_all_btn.state(['!disabled'] if enabled else ['disabled'])
+            self.index_all_btn.state(["!disabled"] if enabled else ["disabled"])
         if hasattr(self, "index_selected_btn"):
             selected_enabled = enabled and bool(self.dataset_var.get())
-            self.index_selected_btn.state(['!disabled'] if selected_enabled else ['disabled'])
+            self.index_selected_btn.state(
+                ["!disabled"] if selected_enabled else ["disabled"]
+            )
 
     def _append_index_progress(self, dialog, message):
+        """
+        Append a message to the indexing progress log and scroll to it.
+
+        Args:
+            dialog (dict): Progress-dialog widgets and Tk variables created for the
+                indexing jobs.
+            message (str): Message displayed in the console, progress log, or tooltip.
+
+        Returns:
+            None.
+        """
         dialog["log"].insert(tk.END, message + "\n")
         dialog["log"].see(tk.END)
 
     def _save_global_tasks_index(self):
+        """
+        Save the collected task catalog beside the dataset index artifacts.
+
+        Args:
+            None.
+
+        Returns:
+            str: Path to the task catalog JSON file.
+        """
         out_tasks = {
             task: {
                 "classes": sorted(list(info["classes"])),
-                "datasets": {ds: sorted(list(subs)) for ds, subs in info["datasets"].items()}
+                "datasets": {
+                    ds: sorted(list(subs)) for ds, subs in info["datasets"].items()
+                },
             }
             for task, info in GLOBAL_TASKS.items()
         }
@@ -583,27 +729,55 @@ class GroupingDebuggerMixin:
         os.makedirs(tasks_folder, exist_ok=True)
         base = os.path.splitext(os.path.basename(self.csv_path))[0]
         tasks_file = os.path.join(tasks_folder, f"{base}_tasks.json")
+
         with open(tasks_file, "w") as tf:
             json.dump(out_tasks, tf, indent=2)
+
         return tasks_file
 
     def _start_indexing_jobs(self, jobs, title, display_selected_result=False):
+        """
+        Run indexing in a worker thread and poll progress on the Tk thread.
+
+        Args:
+            jobs (list[tuple]): Dataset name, metadata, and resolved data directory for
+                each queued index job.
+            title (str): Title of the configuration section or progress dialog.
+            display_selected_result (bool): Whether completed indexing results populate
+                the selected dataset's trees.
+
+        Returns:
+            None.
+        """
         if not jobs:
             messagebox.showwarning("No Datasets", "No datasets are available to index.")
             return
 
+        # Workers publish messages here; only the Tk polling callback updates
+        # widgets, since Tk controls must stay on the main thread.
         progress_queue = queue.Queue()
         dialog = self._open_index_progress_dialog(title, len(jobs))
         self._set_index_buttons_state(False)
 
         def worker():
+            """
+            Index queued datasets and publish progress and results to the UI queue.
+
+            Args:
+                None.
+
+            Returns:
+                None.
+            """
             completed = succeeded = failed = skipped = 0
             for dataset_name, meta, dataset_dir in jobs:
                 progress_queue.put(("start", dataset_name))
                 if not dataset_dir:
                     skipped += 1
                     completed += 1
-                    progress_queue.put(("skip", dataset_name, "Dataset folder was not found."))
+                    progress_queue.put(
+                        ("skip", dataset_name, "Dataset folder was not found.")
+                    )
                     progress_queue.put(("progress", completed))
                     continue
                 try:
@@ -611,7 +785,10 @@ class GroupingDebuggerMixin:
                     result = index_dataset(dataset_name, meta)
                     if result is None:
                         raise RuntimeError("Indexer returned no result.")
-                    paths = self._resolve_indexing_paths(dataset_name, meta, dataset_dir)
+
+                    paths = self._resolve_indexing_paths(
+                        dataset_name, meta, dataset_dir
+                    )
                     succeeded += 1
                     completed += 1
                     progress_queue.put(("success", dataset_name, result, paths))
@@ -619,6 +796,7 @@ class GroupingDebuggerMixin:
                     failed += 1
                     completed += 1
                     progress_queue.put(("error", dataset_name, str(e)))
+
                 progress_queue.put(("progress", completed))
 
             tasks_file = None
@@ -627,9 +805,19 @@ class GroupingDebuggerMixin:
                     tasks_file = self._save_global_tasks_index()
                 except Exception as e:
                     progress_queue.put(("task_error", str(e)))
+
             progress_queue.put(("done", succeeded, failed, skipped, tasks_file))
 
         def poll():
+            """
+            Drain worker messages and update Tk widgets until indexing finishes.
+
+            Args:
+                None.
+
+            Returns:
+                None.
+            """
             try:
                 while True:
                     item = progress_queue.get_nowait()
@@ -638,35 +826,60 @@ class GroupingDebuggerMixin:
                         dialog["status_var"].set(f"Indexing {item[1]}...")
                         self._append_index_progress(dialog, f"Starting {item[1]}")
                     elif kind == "skip":
-                        self._append_index_progress(dialog, f"Skipped {item[1]}: {item[2]}")
+                        self._append_index_progress(
+                            dialog, f"Skipped {item[1]}: {item[2]}"
+                        )
                     elif kind == "success":
                         dataset_name, result, paths = item[1], item[2], item[3]
-                        image_count = len(result.get("images_train", [])) + len(result.get("images_test", []))
+                        image_count = len(result.get("images_train", [])) + len(
+                            result.get("images_test", [])
+                        )
                         mask_count = len(result.get("mask_files", []))
                         group_count = len(result.get("groups", []))
                         self._append_index_progress(
                             dialog,
-                            f"Finished {dataset_name}: {image_count} images, {mask_count} masks, {group_count} subdatasets"
+                            f"Finished {dataset_name}: {image_count} images, {mask_count} masks, {group_count} subdatasets",
                         )
+
                         if display_selected_result:
                             self._display_index_result(dataset_name, result, *paths)
                     elif kind == "error":
-                        self._append_index_progress(dialog, f"Failed {item[1]}: {item[2]}")
+                        self._append_index_progress(
+                            dialog, f"Failed {item[1]}: {item[2]}"
+                        )
                     elif kind == "task_error":
-                        self._append_index_progress(dialog, f"Could not save task index: {item[1]}")
+                        self._append_index_progress(
+                            dialog, f"Could not save task index: {item[1]}"
+                        )
                     elif kind == "progress":
                         dialog["progress"]["value"] = item[1]
                     elif kind == "done":
-                        succeeded, failed, skipped, tasks_file = item[1], item[2], item[3], item[4]
-                        dialog["status_var"].set(f"Done: {succeeded} indexed, {failed} failed, {skipped} skipped.")
+                        succeeded, failed, skipped, tasks_file = (
+                            item[1],
+                            item[2],
+                            item[3],
+                            item[4],
+                        )
+                        dialog["status_var"].set(
+                            f"Done: {succeeded} indexed, {failed} failed, {skipped} skipped."
+                        )
                         if tasks_file:
-                            self._append_index_progress(dialog, f"Saved task index: {tasks_file}")
+                            self._append_index_progress(
+                                dialog, f"Saved task index: {tasks_file}"
+                            )
+
                         self._set_index_buttons_state(True)
-                        if dialog["auto_close_var"].get() and dialog["window"].winfo_exists():
+                        if (
+                            dialog["auto_close_var"].get()
+                            and dialog["window"].winfo_exists()
+                        ):
                             dialog["window"].destroy()
                         else:
-                            dialog["close_btn"].state(['!disabled'])
-                            dialog["window"].protocol("WM_DELETE_WINDOW", dialog["window"].destroy)
+                            dialog["close_btn"].state(["!disabled"])
+                            dialog["window"].protocol(
+                                "WM_DELETE_WINDOW", dialog["window"].destroy
+                            )
+
                         return
             except queue.Empty:
                 pass
@@ -678,15 +891,27 @@ class GroupingDebuggerMixin:
         self.root.after(100, poll)
 
     def index_selected_dataset(self):
+        """
+        Start an indexing job for the selected dataset after resolving its data folder.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self._clear_indexing_trees()
         dataset_name = self.dataset_var.get()
+
         if not dataset_name:
-            messagebox.showwarning('Select Dataset', 'Please select a dataset.')
+            messagebox.showwarning("Select Dataset", "Please select a dataset.")
             return
+
         meta = self.metadata.get(dataset_name, {})
         dataset_dir = self._ensure_dataset_dir(dataset_name)
         if not dataset_dir:
             return
+
         meta = self.metadata.get(dataset_name, {})
         self._start_indexing_jobs(
             [(dataset_name, meta, dataset_dir)],
@@ -695,14 +920,35 @@ class GroupingDebuggerMixin:
         )
 
     def index_all_datasets(self):
+        """
+        Start indexing jobs for all datasets in the metadata catalog.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         jobs = []
         for dataset_name, meta in self.metadata.items():
-            dataset_dir = self._ensure_dataset_dir(dataset_name, prompt_if_missing=False)
+            dataset_dir = self._ensure_dataset_dir(
+                dataset_name, prompt_if_missing=False
+            )
             jobs.append((dataset_name, meta, dataset_dir))
+
         GLOBAL_TASKS.clear()
         self._start_indexing_jobs(jobs, "Indexing All Datasets")
 
     def test_regex(self):
+        """
+        Match the edited regex against configured files and display group previews.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.index_selected_dataset()
 
     def _copy_config_value(self):
@@ -718,13 +964,14 @@ class GroupingDebuggerMixin:
         sel = self.config_tree.selection()
         if not sel:
             return
+
         raw = self.config_tree.item(sel[0], "values")[0]
         # If it's repr-quoted, strip the quotes
-        if (raw.startswith(("'", '"')) and raw.endswith(("'", '"'))):
+        if raw.startswith(("'", '"')) and raw.endswith(("'", '"')):
             val = raw[1:-1]
         else:
             val = raw
+
         self.root.clipboard_clear()
         self.root.clipboard_append(val)
         messagebox.showinfo("Copied", f"Copied to clipboard:\n{val}")
-

@@ -1,7 +1,7 @@
-# Training entry point and loop utilities for RWKV-MedSAM2.
-#
-# Handles config loading, data loader construction, student/teacher predictor
-# setup, checkpointing, optimization, training, validation, and final testing.
+"""
+Configure RWKV-MedSAM2 training, data loading, checkpoints, optimization, and validation.
+"""
+
 import os
 import json
 import math
@@ -51,6 +51,7 @@ from .utils.vis import save_vis_gif, frames_to_tb_video
 from .utils.preprocessing import load_datasets
 from .utils.teacher_refinement import assert_disjoint_sources
 
+
 def load_config(config_path):
     """
     Loads a configuration file from a given path and resolves any variable interpolation.
@@ -68,14 +69,17 @@ def load_config(config_path):
 
     # Set Python random seeds for reproducibility
     seed = getattr(config.training, "seed", 42)
+
     if seed is not None:
         random.seed(seed)
         cp.random.seed(seed)
         torch.manual_seed(seed)
+
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
     return config
+
 
 def setup_logger(log_cfg):
     """
@@ -91,7 +95,7 @@ def setup_logger(log_cfg):
             - backups (int):      The number of log files to keep before deleting the oldest one.
 
     Returns:
-        logger (logging.Logger): The configured logger.
+        logging.Logger: The configured logger.
     """
     # Ensure the output directory exists
     os.makedirs(log_cfg.output_dir, exist_ok=True)
@@ -128,19 +132,16 @@ def setup_logger(log_cfg):
     logger.addHandler(fh)
 
     # Print info
-    logger.info(f"Logging to console at {log_cfg.level} and to {log_path} at {log_cfg.file_level}")
+    logger.info(
+        f"Logging to console at {log_cfg.level} and to {log_path} at {log_cfg.file_level}"
+    )
 
     return logger
+
 
 class CheckpointManager:
     """
     Manage latest, best, and epoch-numbered training checkpoints.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
 
     def __init__(self, ckpt_dir):
@@ -169,7 +170,9 @@ class CheckpointManager:
         """
         return model.module if hasattr(model, "module") else model
 
-    def _state_dict(self, model, optimizer, scheduler, scaler, epoch, global_step, metric=None):
+    def _state_dict(
+        self, model, optimizer, scheduler, scaler, epoch, global_step, metric=None
+    ):
         """
         Build a serializable checkpoint state.
 
@@ -195,7 +198,17 @@ class CheckpointManager:
             "metric": None if metric is None else float(metric),
         }
 
-    def _save(self, filename, model, optimizer, scheduler, scaler, epoch, global_step, metric=None):
+    def _save(
+        self,
+        filename,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        epoch,
+        global_step,
+        metric=None,
+    ):
         """
         Write a checkpoint file to disk.
 
@@ -225,6 +238,7 @@ class CheckpointManager:
         temporary = path + f".tmp.{os.getpid()}"
         torch.save(state, temporary)
         os.replace(temporary, path)
+
         return path
 
     def save_latest(self, model, optimizer, scheduler, scaler, epoch, global_step):
@@ -253,7 +267,9 @@ class CheckpointManager:
             metric=None,
         )
 
-    def save_best(self, model, optimizer, scheduler, scaler, epoch, metric, global_step):
+    def save_best(
+        self, model, optimizer, scheduler, scaler, epoch, metric, global_step
+    ):
         """
         Save a best checkpoint if ``metric`` improves.
 
@@ -281,9 +297,12 @@ class CheckpointManager:
                 global_step=global_step,
                 metric=metric,
             )
+
         return None
 
-    def save_epoch(self, model, optimizer, scheduler, scaler, epoch, global_step, metric=None):
+    def save_epoch(
+        self, model, optimizer, scheduler, scaler, epoch, global_step, metric=None
+    ):
         """
         Save an epoch-numbered checkpoint.
 
@@ -326,14 +345,17 @@ class CheckpointManager:
         state = torch.load(path, map_location=map_location)
         self._unwrap_model(model).load_state_dict(state["model"])
         metric = state.get("metric", None)
+
         if metric is not None:
             self.best_metric = float(metric)
+
         return (
             int(state.get("epoch", -1)) + 1,
             state.get("optimizer", None),
             state.get("scheduler", None),
             int(state.get("global_step", 0)),
         )
+
 
 def collate_sam2_batch(samples, allow_trim_2d=False):
     """
@@ -371,47 +393,71 @@ def collate_sam2_batch(samples, allow_trim_2d=False):
         else:
             raise ValueError(f"Unexpected image shape: {tuple(img.shape)}")
 
-        if 'dim' in s:
-            dims.append(int(s['dim']))
+        if "dim" in s:
+            dims.append(int(s["dim"]))
         else:
-            dims.append(3 if ('axis_lengths' in s or 'spacing' in s) else 2)
+            dims.append(3 if ("axis_lengths" in s or "spacing" in s) else 2)
 
     if len(set(dims)) != 1:
         raise ValueError(f"Mixed 2D/3D samples in one batch: {dims}")
+
     data_dim = dims[0]
 
     if data_dim == 3:
         if len(set(t_list)) != 1:
             raise ValueError(f"3D batches require equal T per sample; got {t_list}")
+
         T = t_list[0]
     else:
         if allow_trim_2d:
             T = min(t_list)
         else:
             if len(set(t_list)) != 1:
-                raise ValueError(f"2D batches require equal T when trimming is disabled; got {t_list}")
+                raise ValueError(
+                    f"2D batches require equal T when trimming is disabled; got {t_list}"
+                )
+
             T = t_list[0]
 
     out_c = 3 if any(c == 3 for c in c_list) else 1
 
     def _slice_to_T(x, flag):
-        """Trim a tensor to the selected sequence length."""
+        """
+        Trim a tensor to the selected sequence length.
+
+        Args:
+            x (torch.Tensor): Sample image or mask tensor to trim to the collated frame count.
+            flag (bool): Whether the sample is a 2D image requiring a sequence dimension.
+
+        Returns:
+            torch.Tensor: Time-major sample tensor trimmed to the collated frame count.
+        """
         if flag == 0:
             y = x[:T]
         else:
             y = x[:, :T]
         if y.ndim == 5 and y.shape[0] == 1:
             y = y.squeeze(0)
+
         return y
 
     def _to_channels(y):
-        """Match image channels to the batch output channel count."""
+        """
+        Match image channels to the batch output channel count.
+
+        Args:
+            y (torch.Tensor): Time-major image tensor whose channels are adapted.
+
+        Returns:
+            torch.Tensor: Image sequence with compatible channel dimensions.
+        """
         if y.shape[1] == out_c:
             return y
         if y.shape[1] == 1 and out_c == 3:
             return y.repeat(1, 3, 1, 1)
         if y.shape[1] == 3 and out_c == 1:
             return y.mean(dim=1, keepdim=True)
+
         raise ValueError(f"Cannot convert channels {y.shape[1]} -> {out_c}")
 
     imgs_buf, masks_buf = [], []
@@ -420,8 +466,8 @@ def collate_sam2_batch(samples, allow_trim_2d=False):
     modalities = []
 
     for s, flag in zip(samples, lead_axis_flags):
-        img = _slice_to_T(s['image'], flag)
-        msk = s['mask']
+        img = _slice_to_T(s["image"], flag)
+        msk = s["mask"]
         if msk.ndim == 5 and msk.shape[0] == 1:
             msk = msk[:, :T].squeeze(0)
         else:
@@ -436,18 +482,18 @@ def collate_sam2_batch(samples, allow_trim_2d=False):
         imgs_buf.append(img)
         masks_buf.append(msk)
 
-        if 'dataset' in s:
-            ds_names.append(s['dataset'])
-        if 'subdataset' in s:
-            subds_names.append(s['subdataset'])
-        if 'task_id' in s:
-            task_ids.append(s['task_id'])
-        if 'task_label' in s:
-            task_labels.append(s['task_label'])
-        if 'modality' in s:
-            modalities.append(s['modality'])
+        if "dataset" in s:
+            ds_names.append(s["dataset"])
+        if "subdataset" in s:
+            subds_names.append(s["subdataset"])
+        if "task_id" in s:
+            task_ids.append(s["task_id"])
+        if "task_label" in s:
+            task_labels.append(s["task_label"])
+        if "modality" in s:
+            modalities.append(s["modality"])
 
-        sp = s.get('spacing', None)
+        sp = s.get("spacing", None)
         if sp is not None:
             if torch.is_tensor(sp):
                 spacings.append(sp.reshape(-1))
@@ -461,54 +507,92 @@ def collate_sam2_batch(samples, allow_trim_2d=False):
     B = len(samples)
 
     def _tm_points():
-        """Convert point prompts to time-major layout."""
+        """
+        Convert point prompts to time-major layout.
+
+        Args:
+            None.
+
+        Returns:
+            list[list]: Point prompts indexed by frame and then batch sample.
+        """
         out = []
         for t in range(T):
             row = []
             for b in range(B):
-                per_seq = samples[b].get('pt_list', None)
+                per_seq = samples[b].get("pt_list", None)
                 x = None if (per_seq is None or t >= len(per_seq)) else per_seq[t]
                 if x is None or (torch.is_tensor(x) and x.numel() == 0):
                     row.append(torch.empty((0, 2), dtype=torch.int64))
                 else:
                     row.append(x)
+
             out.append(row)
+
         return out
 
     def _tm_labels():
-        """Convert point labels to time-major layout."""
+        """
+        Convert point labels to time-major layout.
+
+        Args:
+            None.
+
+        Returns:
+            list[list]: Prompt labels indexed by frame and then batch sample.
+        """
         out = []
         for t in range(T):
             row = []
             for b in range(B):
-                per_seq = samples[b].get('p_label', None)
+                per_seq = samples[b].get("p_label", None)
                 x = None if (per_seq is None or t >= len(per_seq)) else per_seq[t]
                 if x is None or (torch.is_tensor(x) and x.numel() == 0):
                     row.append(torch.empty((0,), dtype=torch.int64))
                 else:
                     row.append(x)
+
             out.append(row)
+
         return out
 
     def _tm_boxes():
-        """Convert box prompts to time-major layout."""
+        """
+        Convert box prompts to time-major layout.
+
+        Args:
+            None.
+
+        Returns:
+            list[list]: Box prompts indexed by frame and then batch sample.
+        """
         out = []
         for t in range(T):
             row = []
             for b in range(B):
-                per_seq = samples[b].get('bbox', None)
+                per_seq = samples[b].get("bbox", None)
                 x = None if (per_seq is None or t >= len(per_seq)) else per_seq[t]
                 row.append(x if x is not None else None)
+
             out.append(row)
+
         return out
 
     def _tm_mask_prompts():
-        """Convert mask prompts to time-major layout."""
+        """
+        Convert mask prompts to time-major layout.
+
+        Args:
+            None.
+
+        Returns:
+            list[list]: Mask prompts indexed by frame and then batch sample.
+        """
         out = []
         for t in range(T):
             row = []
             for b in range(B):
-                per_seq = samples[b].get('m_prompt', None)
+                per_seq = samples[b].get("m_prompt", None)
                 x = None if (per_seq is None or t >= len(per_seq)) else per_seq[t]
                 if x is None:
                     row.append(None)
@@ -519,40 +603,44 @@ def collate_sam2_batch(samples, allow_trim_2d=False):
                         else:
                             if x.ndim == 2:
                                 x = x.unsqueeze(0)
+
                             row.append(x)
                     except Exception:
                         row.append(None)
+
             out.append(row)
+
         return out
 
     out = {
-        'image':            images,
-        'mask':             masks,
-        'pt_list':          _tm_points(),
-        'p_label':          _tm_labels(),
-        'bbox':             _tm_boxes(),
-        'm_prompt':         _tm_mask_prompts(),
-        'val_prompt_cache': [s.get('val_prompt_cache', None) for s in samples],
-        'dim':              torch.as_tensor([data_dim] * B, dtype=torch.int64),
+        "image": images,
+        "mask": masks,
+        "pt_list": _tm_points(),
+        "p_label": _tm_labels(),
+        "bbox": _tm_boxes(),
+        "m_prompt": _tm_mask_prompts(),
+        "val_prompt_cache": [s.get("val_prompt_cache", None) for s in samples],
+        "dim": torch.as_tensor([data_dim] * B, dtype=torch.int64),
     }
 
     if ds_names:
-        out['dataset'] = ds_names
+        out["dataset"] = ds_names
     if subds_names:
-        out['subdataset'] = subds_names
+        out["subdataset"] = subds_names
     if spacings:
         try:
-            out['spacing'] = torch.stack(spacings, dim=0)
+            out["spacing"] = torch.stack(spacings, dim=0)
         except Exception:
-            out['spacing'] = spacings
+            out["spacing"] = spacings
     if task_ids:
-        out['task_id'] = task_ids
+        out["task_id"] = task_ids
     if task_labels:
-        out['task_label'] = task_labels
+        out["task_label"] = task_labels
     if modalities:
-        out['modality'] = modalities
+        out["modality"] = modalities
 
     return out
+
 
 def get_data_loaders(config):
     """
@@ -573,7 +661,13 @@ def get_data_loaders(config):
 
     # 2) Same loaders / sampler as before
     tasks_map = json.load(open(config.dripp.tasks_file, "r"))
-    sampler = BalancedTaskBatchSampler(train_ds.sequences, tasks_map=tasks_map, batch_size=config.training.batch_size, drop_last=True, seed=int(getattr(config.training, "seed", 42)))
+    sampler = BalancedTaskBatchSampler(
+        train_ds.sequences,
+        tasks_map=tasks_map,
+        batch_size=config.training.batch_size,
+        drop_last=True,
+        seed=int(getattr(config.training, "seed", 42)),
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -607,6 +701,7 @@ def get_data_loaders(config):
 
     return train_loader, val_loader, test_loader
 
+
 def save_data_loaders(save_path, train_loaders, val_loaders, test_loaders):
     """
     Save train, validation, and test DataLoaders to disk via pickle.
@@ -625,11 +720,15 @@ def save_data_loaders(save_path, train_loaders, val_loaders, test_loaders):
 
     # Serialize all three loaders in one file
     with open(save_path, "wb") as f:
-        pickle.dump({
-            "train_loaders": train_loaders,
-            "val_loaders":   val_loaders,
-            "test_loaders":  test_loaders,
-        }, f)
+        pickle.dump(
+            {
+                "train_loaders": train_loaders,
+                "val_loaders": val_loaders,
+                "test_loaders": test_loaders,
+            },
+            f,
+        )
+
 
 def load_data_loaders(load_path):
     """
@@ -651,7 +750,9 @@ def load_data_loaders(load_path):
         train_loader.dataset.sequences,
         val_loader.dataset.sequences,
     )
+
     return train_loader, val_loader, test_loader
+
 
 def _partial_load_sam21(model, ckpt_path, ignore_prefixes=(), logger=None):
     """
@@ -667,7 +768,12 @@ def _partial_load_sam21(model, ckpt_path, ignore_prefixes=(), logger=None):
         dict[str, int]: Counts of loaded and skipped checkpoint tensors.
     """
     if ckpt_path is None:
-        return {"loaded": 0, "skipped_prefix": 0, "skipped_missing": 0, "skipped_shape": 0}
+        return {
+            "loaded": 0,
+            "skipped_prefix": 0,
+            "skipped_missing": 0,
+            "skipped_shape": 0,
+        }
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -688,6 +794,7 @@ def _partial_load_sam21(model, ckpt_path, ignore_prefixes=(), logger=None):
         if tuple(msd[k].shape) != tuple(v.shape):
             skipped_shape += 1
             continue
+
         load_sd[k] = v
 
     missing, unexpected = model.load_state_dict(load_sd, strict=False)
@@ -708,6 +815,7 @@ def _partial_load_sam21(model, ckpt_path, ignore_prefixes=(), logger=None):
         "unexpected_after": len(unexpected),
     }
 
+
 def _set_requires_grad(module: nn.Module, flag: bool):
     """
     Set ``requires_grad`` for all parameters in a module.
@@ -722,6 +830,7 @@ def _set_requires_grad(module: nn.Module, flag: bool):
     for p in module.parameters():
         p.requires_grad = flag
 
+
 def _apply_freeze_schedule(model, config, epoch, logger=None):
     """
     Apply the configured pretrained-module freeze schedule for an epoch.
@@ -735,7 +844,9 @@ def _apply_freeze_schedule(model, config, epoch, logger=None):
     Returns:
         None.
     """
-    freeze_epochs = int(getattr(getattr(config, "init", {}), "freeze_pretrained_epochs", 0))
+    freeze_epochs = int(
+        getattr(getattr(config, "init", {}), "freeze_pretrained_epochs", 0)
+    )
     freeze_modules = list(getattr(getattr(config, "init", {}), "freeze_modules", []))
 
     if freeze_epochs <= 0 or len(freeze_modules) == 0:
@@ -745,6 +856,7 @@ def _apply_freeze_schedule(model, config, epoch, logger=None):
     for name in freeze_modules:
         if not hasattr(model, name):
             continue
+
         _set_requires_grad(getattr(model, name), not do_freeze)
 
     if logger is not None and epoch in (0, freeze_epochs):
@@ -753,21 +865,34 @@ def _apply_freeze_schedule(model, config, epoch, logger=None):
             f"{'FREEZING' if do_freeze else 'UNFREEZING'} modules={freeze_modules}"
         )
 
+
 def _prefill_training_features(predictor, state: dict, chunk_size: int) -> dict:
-    """Fill the original predictor training cache with batched image forwards."""
+    """
+    Fill the original predictor training cache with batched image forwards.
+
+    Args:
+        predictor (SAM2VideoPredictor): Predictor whose training feature cache is prepared.
+        state (dict): Training state containing images, compute device, frame count, and
+            cached features.
+        chunk_size (int): Number of frames in each feature-encoding chunk.
+
+    Returns:
+        dict: Input state updated with per-frame images and backbone features.
+    """
     cache = state["cached_features"]
     frame_count = int(state["num_frames"])
     device = state["device"]
+
     for start in range(0, frame_count, int(chunk_size)):
         end = min(start + int(chunk_size), frame_count)
         missing = [frame for frame in range(start, end) if frame not in cache]
         if not missing:
             continue
-        images = state["images"][missing].to(
-            device=device, non_blocking=True
-        ).float()
+
+        images = state["images"][missing].to(device=device, non_blocking=True).float()
         batched_out = predictor.forward_image(images)
         count = len(missing)
+
         for offset, frame_idx in enumerate(missing):
             frame_out = {
                 "backbone_fpn": [
@@ -775,29 +900,54 @@ def _prefill_training_features(predictor, state: dict, chunk_size: int) -> dict:
                     for feature in batched_out["backbone_fpn"]
                 ],
                 "vision_pos_enc": [
-                    position[offset : offset + 1]
-                    if int(position.shape[0]) == count
-                    else position
+                    (
+                        position[offset : offset + 1]
+                        if int(position.shape[0]) == count
+                        else position
+                    )
                     for position in batched_out["vision_pos_enc"]
                 ],
             }
             cache[frame_idx] = (images[offset : offset + 1], frame_out)
+
     state["cached_features"] = cache
     return state
 
 
 def _install_external_training_prefill(predictor, chunk_size: int) -> None:
-    """Batch training-only image encoding without replacing the predictor class."""
+    """
+    Batch training-only image encoding without replacing the predictor class.
+
+    Args:
+        predictor (SAM2VideoPredictor): Predictor whose training feature cache is prepared.
+        chunk_size (int): Number of frames in each feature-encoding chunk.
+
+    Returns:
+        None.
+    """
     if hasattr(predictor, "_rwkv_original_init_state_from_tensor"):
         return
+
     original_init = predictor.init_state_from_tensor
 
     def wrapped_init(self, *args, **kwargs):
+        """
+        Initialize state and prefill training features when gradients are enabled.
+
+        Args:
+            *args (tuple): Positional arguments forwarded to the wrapped implementation.
+            **kwargs (dict): Keyword arguments forwarded to the wrapped implementation.
+
+        Returns:
+            dict: Predictor state with training features prefilled when applicable.
+        """
         state = original_init(*args, **kwargs)
         positional_mode = args[1] if len(args) > 1 else "train"
         mode = kwargs.get("mode", positional_mode)
+
         if mode == "train" and torch.is_grad_enabled():
             _prefill_training_features(self, state, chunk_size=chunk_size)
+
         return state
 
     predictor.__dict__["_rwkv_original_init_state_from_tensor"] = original_init
@@ -805,7 +955,15 @@ def _install_external_training_prefill(predictor, chunk_size: int) -> None:
 
 
 def _optimized_predictor_build_options(config):
-    """Translate opt-in predictor, training, and VCR settings into build options."""
+    """
+    Translate opt-in predictor, training, and VCR settings into build options.
+
+    Args:
+        config (OmegaConf.DictConfig): Model, dataset, and training configuration.
+
+    Returns:
+        dict: Predictor target and Hydra overrides, or an empty dict when disabled.
+    """
     optimizations = getattr(config, "optimizations", None)
     if optimizations is None or not bool(getattr(optimizations, "enabled", False)):
         return {}
@@ -813,17 +971,19 @@ def _optimized_predictor_build_options(config):
     overrides = []
     trunk = getattr(getattr(config.model, "image_encoder", None), "trunk", None)
     trunk_target = str(getattr(trunk, "_target_", ""))
+
     if trunk_target.endswith(".VCRBackbone"):
-        fuse_shift_mix = bool(
-            getattr(optimizations, "fuse_rwkv_shift_mix", False)
-        )
+        fuse_shift_mix = bool(getattr(optimizations, "fuse_rwkv_shift_mix", False))
         inplace_activations = bool(
             getattr(optimizations, "inplace_rwkv_activations", False)
         )
-        overrides.extend([
-            f"++model.image_encoder.trunk.fuse_shift_mix={str(fuse_shift_mix).lower()}",
-            f"++model.image_encoder.trunk.inplace_activations={str(inplace_activations).lower()}",
-        ])
+        overrides.extend(
+            [
+                f"++model.image_encoder.trunk.fuse_shift_mix={str(fuse_shift_mix).lower()}",
+                f"++model.image_encoder.trunk.inplace_activations={str(inplace_activations).lower()}",
+            ]
+        )
+
         if bool(getattr(optimizations, "efficient_vcr_backbone", False)):
             architecture = str(
                 getattr(optimizations, "efficient_vcr_architecture", "efficient")
@@ -834,19 +994,20 @@ def _optimized_predictor_build_options(config):
                 "rwkv2_mlp2": (2, 2.0),
             }
             if architecture not in architecture_settings:
-                raise ValueError(
-                    f"Unknown efficient VCR architecture: {architecture}"
-                )
+                raise ValueError(f"Unknown efficient VCR architecture: {architecture}")
+
             rwkv_depth, mlp_ratio = architecture_settings[architecture]
-            overrides.extend([
-                "++model.image_encoder.trunk.early_downsample_stem=true",
-                "++model.image_encoder.trunk.fused_stage_cfg.expand_ratio=1.0",
-                "++model.image_encoder.trunk.fused_stage_cfg.depth=1",
-                "++model.image_encoder.trunk.fused_stage_cfg.stride=1",
-                "++model.image_encoder.trunk.mbconv_stage_cfg.expand_ratio=1.0",
-                f"++model.image_encoder.trunk.rwkv_depth={rwkv_depth}",
-                f"++model.image_encoder.trunk.mlp_ratio={mlp_ratio}",
-            ])
+            overrides.extend(
+                [
+                    "++model.image_encoder.trunk.early_downsample_stem=true",
+                    "++model.image_encoder.trunk.fused_stage_cfg.expand_ratio=1.0",
+                    "++model.image_encoder.trunk.fused_stage_cfg.depth=1",
+                    "++model.image_encoder.trunk.fused_stage_cfg.stride=1",
+                    "++model.image_encoder.trunk.mbconv_stage_cfg.expand_ratio=1.0",
+                    f"++model.image_encoder.trunk.rwkv_depth={rwkv_depth}",
+                    f"++model.image_encoder.trunk.mlp_ratio={mlp_ratio}",
+                ]
+            )
 
     options = {}
     if overrides:
@@ -854,29 +1015,23 @@ def _optimized_predictor_build_options(config):
 
     if bool(getattr(optimizations, "use_optimized_predictor", True)):
         chunk_size = int(getattr(optimizations, "image_feature_chunk_size", 4))
-        training_cache = int(
-            getattr(optimizations, "training_feature_cache_frames", 8)
-        )
-        gpu_chunks = int(
-            getattr(optimizations, "prediction_gpu_cache_chunks", 2)
-        )
-        cpu_chunks = int(
-            getattr(optimizations, "prediction_cpu_cache_chunks", 64)
-        )
-        pin_cpu = bool(
-            getattr(optimizations, "prediction_pin_cpu_features", True)
-        )
+        training_cache = int(getattr(optimizations, "training_feature_cache_frames", 8))
+        gpu_chunks = int(getattr(optimizations, "prediction_gpu_cache_chunks", 2))
+        cpu_chunks = int(getattr(optimizations, "prediction_cpu_cache_chunks", 64))
+        pin_cpu = bool(getattr(optimizations, "prediction_pin_cpu_features", True))
         options["predictor_target"] = (
-            "rwkv_medsam2.optimized_video_predictor."
-            "OptimizedSAM2VideoPredictor"
+            "rwkv_medsam2.optimized_video_predictor." "OptimizedSAM2VideoPredictor"
         )
-        options.setdefault("hydra_overrides_extra", []).extend([
-            f"++model.image_feature_chunk_size={chunk_size}",
-            f"++model.training_feature_cache_frames={training_cache}",
-            f"++model.prediction_gpu_cache_chunks={gpu_chunks}",
-            f"++model.prediction_cpu_cache_chunks={cpu_chunks}",
-            f"++model.prediction_pin_cpu_features={str(pin_cpu).lower()}",
-        ])
+        options.setdefault("hydra_overrides_extra", []).extend(
+            [
+                f"++model.image_feature_chunk_size={chunk_size}",
+                f"++model.training_feature_cache_frames={training_cache}",
+                f"++model.prediction_gpu_cache_chunks={gpu_chunks}",
+                f"++model.prediction_cpu_cache_chunks={cpu_chunks}",
+                f"++model.prediction_pin_cpu_features={str(pin_cpu).lower()}",
+            ]
+        )
+
     return options
 
 
@@ -895,11 +1050,13 @@ def build_student_predictor(config, logger=None):
     # The builder composes the architecture YAML again. Preserve this runtime
     # setting from the caller instead of silently restoring the YAML default.
     mask_bypass = getattr(config.model, "use_mask_input_as_output_without_sam", None)
+
     if mask_bypass is not None:
         build_options.setdefault("hydra_overrides_extra", []).append(
             "++model.use_mask_input_as_output_without_sam="
             + str(bool(mask_bypass)).lower()
         )
+
     video_predictor = build_sam2_video_predictor(
         config_file=config._config_path,
         ckpt_path=None,  # IMPORTANT: build without strict checkpoint loading
@@ -915,14 +1072,19 @@ def build_student_predictor(config, logger=None):
         raise RuntimeError("Constructed predictor did not preserve mask-input handling")
 
     # Enable/disable obj-ptrs from config
-    use_obj_ptrs = bool(getattr(getattr(config, "init", {}), "use_obj_ptrs_in_encoder", True))
+    use_obj_ptrs = bool(
+        getattr(getattr(config, "init", {}), "use_obj_ptrs_in_encoder", True)
+    )
     video_predictor.use_obj_ptrs_in_encoder = use_obj_ptrs
 
     # Partial-load SAM2.1 tiny weights (everything compatible)
     ckpt_path = getattr(getattr(config, "init", {}), "student_ckpt_path", None)
     ignore_prefixes = tuple(getattr(getattr(config, "init", {}), "ignore_prefixes", []))
+
     if ckpt_path:
-        _partial_load_sam21(video_predictor, ckpt_path, ignore_prefixes=ignore_prefixes, logger=logger)
+        _partial_load_sam21(
+            video_predictor, ckpt_path, ignore_prefixes=ignore_prefixes, logger=logger
+        )
 
     optimizations = getattr(config, "optimizations", None)
     if (
@@ -941,6 +1103,7 @@ def build_student_predictor(config, logger=None):
 
     return video_predictor
 
+
 def build_teacher_predictor(config):
     """
     Builds the teacher video predictor for SAM2 training.
@@ -950,51 +1113,82 @@ def build_teacher_predictor(config):
         config (dict): The configuration dictionary.
 
     Returns:
-        video_predictor (SAM2VideoPredictor): The teacher video predictor.
+        SAM2VideoPredictor: The teacher video predictor.
     """
     video_predictor = build_sam2_video_predictor(
         config_file=config.teacher._config_path,
         ckpt_path=config.teacher.ckpt_path,
         device=config.training.device,
-        mode='eval',
+        mode="eval",
         apply_postprocessing=False,
     )
 
     def _unwrap_state_dict(obj):
-        """Extract a state dict from common checkpoint wrappers."""
+        """
+        Extract a state dict from common checkpoint wrappers.
+
+        Args:
+            obj (object): Checkpoint payload containing a state dictionary or wrapper.
+
+        Returns:
+            dict | None: Parameter state dictionary, or None for an unsupported payload.
+        """
         if isinstance(obj, dict):
             for k in ["model", "state_dict", "model_state_dict", "net", "network"]:
                 if k in obj and isinstance(obj[k], dict):
                     return obj[k]
+
         return obj if isinstance(obj, dict) else None
 
     def _strip_prefix(state, prefix):
-        """Strip a shared state-dict key prefix."""
+        """
+        Strip a shared state-dict key prefix.
+
+        Args:
+            state (dict[str, torch.Tensor]): Checkpoint parameter tensors keyed by their
+                possibly prefixed names.
+            prefix (str): Leading checkpoint key prefix to remove when shared by all keys.
+
+        Returns:
+            dict: State dictionary with the prefix removed when all keys use it.
+        """
         if not isinstance(state, dict) or not state:
             return state
+
         keys = list(state.keys())
         if all(isinstance(k, str) and k.startswith(prefix) for k in keys):
-            return {k[len(prefix):]: v for k, v in state.items()}
+            return {k[len(prefix) :]: v for k, v in state.items()}
+
         return state
 
     def _pick_module(p):
-        """Pick the load target module from a predictor-like object."""
+        """
+        Pick the load target module from a predictor-like object.
+
+        Args:
+            p (object): Predictor or wrapper from which to extract a torch module.
+
+        Returns:
+            torch.nn.Module | None: Wrapped model module, or None when no module is found.
+        """
         # predictors often wrap the underlying nn.Module in `.model`
         for attr in ["model", "sam2", "net", "network"]:
             if hasattr(p, attr) and isinstance(getattr(p, attr), torch.nn.Module):
                 return getattr(p, attr)
         if isinstance(p, torch.nn.Module):
             return p
+
         return None
 
     try:
         ckpt_path = str(config.teacher.ckpt_path)
-        ckpt_obj  = torch.load(ckpt_path, map_location="cpu")
-        state     = _unwrap_state_dict(ckpt_obj)
-        state     = _strip_prefix(state, "module.")
-        state     = _strip_prefix(state, "model.")
+        ckpt_obj = torch.load(ckpt_path, map_location="cpu")
+        state = _unwrap_state_dict(ckpt_obj)
+        state = _strip_prefix(state, "module.")
+        state = _strip_prefix(state, "model.")
 
         target = _pick_module(video_predictor)
+
         if target is None or state is None:
             logging.getLogger(__name__).warning(
                 f"[Teacher] Could not explicitly load state_dict from {ckpt_path}. "
@@ -1004,7 +1198,9 @@ def build_teacher_predictor(config):
             missing, unexpected = target.load_state_dict(state, strict=False)
             n_total = len(target.state_dict())
             n_missing = len(missing)
-            loaded_ratio = 0.0 if n_total == 0 else float(n_total - n_missing) / float(n_total)
+            loaded_ratio = (
+                0.0 if n_total == 0 else float(n_total - n_missing) / float(n_total)
+            )
 
             logging.getLogger(__name__).info(
                 f"[Teacher] Explicit load from {ckpt_path} strict=False: "
@@ -1022,10 +1218,11 @@ def build_teacher_predictor(config):
             f"[Teacher] Explicit checkpoint load failed: {repr(e)}"
         )
 
-
     video_predictor.eval()
     video_predictor.use_obj_ptrs_in_encoder = True
+
     return video_predictor
+
 
 def get_effective_distill_weight(config, dim=None):
     """
@@ -1043,6 +1240,15 @@ def get_effective_distill_weight(config, dim=None):
     heavy_mult = float(getattr(training, "distill_heavy_mult", 1.0))
 
     def _weight(name):
+        """
+        Read a configured distillation weight and apply the heavy multiplier.
+
+        Args:
+            name (str): Distillation-weight field in the training configuration.
+
+        Returns:
+            float: Effective weight for the named loss component.
+        """
         return float(getattr(training, name, 0.0)) * heavy_mult
 
     if dim in (2, "2", "2d", "2D"):
@@ -1052,14 +1258,24 @@ def get_effective_distill_weight(config, dim=None):
 
     return max(_weight("lambda_distill_2d"), _weight("lambda_distill_3d"))
 
+
 def distillation_enabled(config, dim=None):
     """
     Return whether teacher distillation should run for the requested branch.
 
     This treats zero or negative effective weights as disabled, which lets
     training skip teacher construction and teacher image/video forward passes.
+
+    Args:
+        config (OmegaConf.DictConfig): Model, dataset, and training configuration.
+        dim (int | None): Dimension to check, or None to consider the configured
+            distillation weights together.
+
+    Returns:
+        bool: Whether teacher distillation is active.
     """
     return get_effective_distill_weight(config, dim=dim) > 0.0
+
 
 def _trainable(params):
     """
@@ -1073,6 +1289,7 @@ def _trainable(params):
     """
     return [p for p in params if p.requires_grad]
 
+
 def _unwrap_model(model):
     """
     Return the underlying nn.Module if wrapped in DataParallel / DDP.
@@ -1085,7 +1302,9 @@ def _unwrap_model(model):
     """
     if hasattr(model, "module") and isinstance(model.module, nn.Module):
         return model.module
+
     return model
+
 
 def setup_optimizer_and_scheduler(model, config):
     """
@@ -1103,8 +1322,8 @@ def setup_optimizer_and_scheduler(model, config):
     groups = [
         {
             "params": _trainable(
-                list(model.image_encoder.parameters()) +
-                list(model.sam_prompt_encoder.parameters())
+                list(model.image_encoder.parameters())
+                + list(model.sam_prompt_encoder.parameters())
             ),
             "lr": float(getattr(config.training, "lr_backbone", config.training.lr)),
         },
@@ -1114,10 +1333,10 @@ def setup_optimizer_and_scheduler(model, config):
         },
         {
             "params": _trainable(
-                list(model.obj_ptr_proj.parameters()) +
-                list(model.memory_encoder.parameters()) +
-                list(model.memory_attention.parameters()) +
-                list(model.mask_downsample.parameters())
+                list(model.obj_ptr_proj.parameters())
+                + list(model.memory_encoder.parameters())
+                + list(model.memory_attention.parameters())
+                + list(model.mask_downsample.parameters())
             ),
             "lr": float(config.training.mem_lr),
         },
@@ -1136,16 +1355,28 @@ def setup_optimizer_and_scheduler(model, config):
     warmup_epochs = int(config.training.warmup_epochs)
 
     def lr_lambda(epoch):
-        """Return the warmup/cosine learning-rate multiplier."""
+        """
+        Return the warmup/cosine learning-rate multiplier.
+
+        Args:
+            epoch (int): Zero-based training epoch.
+
+        Returns:
+            float: Learning-rate scale for the scheduler.
+        """
         if epoch < warmup_epochs:
             return float(epoch + 1) / max(1, warmup_epochs)
+
         progress = float(epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     return {"optimizer": opt, "scheduler": sched}
 
-def _rebuild_optimizer_and_scheduler_after_unfreeze(model, config, old_optimizer, old_scheduler, logger=None):
+
+def _rebuild_optimizer_and_scheduler_after_unfreeze(
+    model, config, old_optimizer, old_scheduler, logger=None
+):
     """
     Rebuild optimizer and scheduler after modules are unfrozen.
 
@@ -1176,6 +1407,7 @@ def _rebuild_optimizer_and_scheduler_after_unfreeze(model, config, old_optimizer
     for i, new_group in enumerate(new_optimizer.param_groups):
         if i >= len(old_optimizer.param_groups):
             continue
+
         old_group = old_optimizer.param_groups[i]
         new_group["lr"] = old_group["lr"]
         if "initial_lr" in old_group:
@@ -1194,6 +1426,7 @@ def _rebuild_optimizer_and_scheduler_after_unfreeze(model, config, old_optimizer
     for i, new_group in enumerate(new_optimizer.param_groups):
         if i >= len(old_optimizer.param_groups):
             continue
+
         new_group["lr"] = old_optimizer.param_groups[i]["lr"]
         if "initial_lr" in old_optimizer.param_groups[i]:
             new_group["initial_lr"] = old_optimizer.param_groups[i]["initial_lr"]
@@ -1207,6 +1440,7 @@ def _rebuild_optimizer_and_scheduler_after_unfreeze(model, config, old_optimizer
         )
 
     return {"optimizer": new_optimizer, "scheduler": new_scheduler}
+
 
 def _dim_from_batch(b):
     """
@@ -1238,7 +1472,9 @@ def _dim_from_batch(b):
                     return 2
                 if s in ("3", "3d", "true"):
                     return 3
+
     return None
+
 
 def as_btc(x: torch.Tensor) -> torch.Tensor:
     """
@@ -1254,7 +1490,9 @@ def as_btc(x: torch.Tensor) -> torch.Tensor:
         return x
     if x.ndim == 4:
         return x.unsqueeze(1)
+
     raise ValueError(f"Unsupported image tensor shape: {tuple(x.shape)}")
+
 
 def as_bthw_mask(x: torch.Tensor, B: int, T: int) -> torch.Tensor:
     """
@@ -1274,9 +1512,26 @@ def as_bthw_mask(x: torch.Tensor, B: int, T: int) -> torch.Tensor:
         return x[:, 0].unsqueeze(1).expand(B, T, *x.shape[-2:])
     if x.ndim == 4 and x.shape[0] == B and x.shape[1] == T:
         return x
+
     raise ValueError(f"Unsupported mask tensor shape: {tuple(x.shape)}")
 
-def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, scaler, epoch, logger, writer, global_step, start_batch_idx=0, batch_index_offset=0, step_callback=None):
+
+def train_epoch(
+    student,
+    teacher,
+    train_loader,
+    optimizer,
+    scheduler,
+    config,
+    scaler,
+    epoch,
+    logger,
+    writer,
+    global_step,
+    start_batch_idx=0,
+    batch_index_offset=0,
+    step_callback=None,
+):
     """
     Run one mixed 2D/3D training epoch.
 
@@ -1292,6 +1547,11 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         logger (logging.Logger): Training logger.
         writer (SummaryWriter): TensorBoard writer.
         global_step (int): Current global step.
+        start_batch_idx (int): First batch index to process when resuming within the epoch.
+        batch_index_offset (int): Offset added to local batch indices for full-epoch
+            progress and logging.
+        step_callback (Callable | None): Optional callback receiving epoch, batch index,
+            global step, model, optimizer, scheduler, and scaler.
 
     Returns:
         tuple[float, int, torch.optim.Optimizer, object]: Average loss, updated global
@@ -1300,7 +1560,10 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     student.train()
     _apply_freeze_schedule(student, config, epoch, logger=logger)
 
-    freeze_epochs = int(getattr(getattr(config, "init", {}), "freeze_pretrained_epochs", 0))
+    freeze_epochs = int(
+        getattr(getattr(config, "init", {}), "freeze_pretrained_epochs", 0)
+    )
+
     if freeze_epochs > 0 and epoch == freeze_epochs:
         rebuilt = _rebuild_optimizer_and_scheduler_after_unfreeze(
             student, config, optimizer, scheduler, logger=logger
@@ -1325,26 +1588,49 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     ping_pong = bool(getattr(getattr(config, "logging", {}), "image_ping_pong", False))
 
     E_total = int(getattr(getattr(config, "training", {}), "epochs", 1))
-    disable_images = bool(getattr(getattr(config, "logging", {}), "disable_images", False))
+    disable_images = bool(
+        getattr(getattr(config, "logging", {}), "disable_images", False)
+    )
     do_viz_this_ep = (not disable_images) and (
-        epoch == 0
-        or ((epoch + 1) % image_every == 0)
-        or (epoch == E_total - 1)
+        epoch == 0 or ((epoch + 1) % image_every == 0) or (epoch == E_total - 1)
     )
 
     gif_dir = os.path.join(writer.log_dir, "gifs")
     os.makedirs(gif_dir, exist_ok=True)
 
-    text_every_steps = int(getattr(getattr(config, "logging", {}), "tb_text_every_train_steps", 100))
+    text_every_steps = int(
+        getattr(getattr(config, "logging", {}), "tb_text_every_train_steps", 100)
+    )
 
     def _tb_pre(txt):
-        """Wrap text as escaped preformatted HTML."""
-        return "<pre style=\"font-family: monospace; white-space: pre;\">" + html.escape(str(txt)) + "</pre>"
+        """
+        Wrap text as escaped preformatted HTML.
+
+        Args:
+            txt (object): Value converted to text and escaped for TensorBoard display.
+
+        Returns:
+            str: HTML-safe preformatted text.
+        """
+        return (
+            '<pre style="font-family: monospace; white-space: pre;">'
+            + html.escape(str(txt))
+            + "</pre>"
+        )
 
     def _tensor_stats(x):
-        """Return tensor shape, dtype, and finite-value stats."""
+        """
+        Return tensor shape, dtype, and finite-value stats.
+
+        Args:
+            x (object): Tensor or value to inspect for diagnostic logging.
+
+        Returns:
+            dict: Tensor diagnostics, or the Python type name for a non-tensor input.
+        """
         if not torch.is_tensor(x):
             return {"kind": type(x).__name__}
+
         y = x.detach().float()
         out = {
             "shape": tuple(y.shape),
@@ -1355,17 +1641,33 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         if y.numel():
             finite = y[torch.isfinite(y)]
             if finite.numel():
-                out.update({
-                    "min": float(finite.min().item()),
-                    "max": float(finite.max().item()),
-                    "mean": float(finite.mean().item()),
-                    "std": float(finite.std().item()) if finite.numel() > 1 else 0.0,
-                    "absmax": float(finite.abs().max().item()),
-                })
+                out.update(
+                    {
+                        "min": float(finite.min().item()),
+                        "max": float(finite.max().item()),
+                        "mean": float(finite.mean().item()),
+                        "std": (
+                            float(finite.std().item()) if finite.numel() > 1 else 0.0
+                        ),
+                        "absmax": float(finite.abs().max().item()),
+                    }
+                )
+
         return out
 
     def _log_nonfinite_skip(stage, batch_idx, batch, extra=None):
-        """Log a non-finite training skip."""
+        """
+        Log a non-finite training skip.
+
+        Args:
+            stage (str): Training stage where the failure occurred.
+            batch_idx (int): Current batch index within the epoch.
+            batch (dict): Collated images, masks, prompts, and sample metadata.
+            extra (dict | None): Optional additional diagnostic context to log or save.
+
+        Returns:
+            None.
+        """
         extra = extra or {}
         ds = batch.get("dataset", "NA")
         sub = batch.get("subdataset", "NA")
@@ -1402,7 +1704,18 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             writer.flush()
 
     def _save_crash_artifacts(batch, batch_idx, stage, extra=None):
-        """Save model and batch artifacts for a fatal error."""
+        """
+        Save model and batch artifacts for a fatal error.
+
+        Args:
+            batch (dict): Collated images, masks, prompts, and sample metadata.
+            batch_idx (int): Current batch index within the epoch.
+            stage (str): Training stage where the failure occurred.
+            extra (dict | None): Optional additional diagnostic context to log or save.
+
+        Returns:
+            tuple[str, str]: Emergency checkpoint path and saved batch path.
+        """
         extra = extra or {}
 
         crash_dir = os.path.join(config.ckpt_path, "crash")
@@ -1410,11 +1723,11 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
         ckpt_path = os.path.join(
             crash_dir,
-            f"crash_ep{int(epoch):04d}_step{int(global_step):07d}_batch{int(batch_idx):06d}.pth"
+            f"crash_ep{int(epoch):04d}_step{int(global_step):07d}_batch{int(batch_idx):06d}.pth",
         )
         batch_path = os.path.join(
             crash_dir,
-            f"crash_batch_ep{int(epoch):04d}_step{int(global_step):07d}_batch{int(batch_idx):06d}.pt"
+            f"crash_batch_ep{int(epoch):04d}_step{int(global_step):07d}_batch{int(batch_idx):06d}.pt",
         )
 
         state = {
@@ -1431,13 +1744,18 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         torch.save(state, ckpt_path)
 
         cpu_batch = {}
+
         for k, v in batch.items():
             if torch.is_tensor(v):
                 cpu_batch[k] = v.detach().cpu()
             elif isinstance(v, list):
-                cpu_batch[k] = [x.detach().cpu() if torch.is_tensor(x) else x for x in v]
+                cpu_batch[k] = [
+                    x.detach().cpu() if torch.is_tensor(x) else x for x in v
+                ]
             elif isinstance(v, tuple):
-                cpu_batch[k] = tuple(x.detach().cpu() if torch.is_tensor(x) else x for x in v)
+                cpu_batch[k] = tuple(
+                    x.detach().cpu() if torch.is_tensor(x) else x for x in v
+                )
             else:
                 cpu_batch[k] = v
 
@@ -1453,9 +1771,22 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         return ckpt_path, batch_path
 
     def _save_and_log_fatal_crash(stage, batch_idx, batch, extra=None):
-        """Save crash artifacts and log fatal-error context."""
+        """
+        Save crash artifacts and log fatal-error context.
+
+        Args:
+            stage (str): Training stage where the failure occurred.
+            batch_idx (int): Current batch index within the epoch.
+            batch (dict): Collated images, masks, prompts, and sample metadata.
+            extra (dict | None): Optional additional diagnostic context to log or save.
+
+        Returns:
+            None.
+        """
         extra = extra or {}
-        ckpt_path, batch_path = _save_crash_artifacts(batch, batch_idx, stage, extra=extra)
+        ckpt_path, batch_path = _save_crash_artifacts(
+            batch, batch_idx, stage, extra=extra
+        )
         msg_lines = [
             f"[FATAL_CRASH] stage={stage}",
             f"epoch={epoch}",
@@ -1464,23 +1795,43 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
             f"crash_checkpoint={ckpt_path}",
             f"crash_batch={batch_path}",
         ]
+
         for k, v in extra.items():
             msg_lines.append(f"{k}={v}")
+
         msg = "\n".join(msg_lines)
         logger.exception(msg)
         print(msg)
+
         if writer is not None:
             writer.add_text("train/error_fatal", _tb_pre(msg), global_step)
             writer.flush()
 
     def get_lr_group(opt, i):
-        """Return a parameter-group learning rate."""
-        return float(opt.param_groups[i]["lr"]) if i < len(opt.param_groups) else float("nan")
+        """
+        Return a parameter-group learning rate.
+
+        Args:
+            opt (torch.optim.Optimizer): Optimizer containing the parameter groups.
+            i (int): Index of the frame, sample, or parameter group.
+
+        Returns:
+            float: Group learning rate, or NaN when the group index is unavailable.
+        """
+        return (
+            float(opt.param_groups[i]["lr"])
+            if i < len(opt.param_groups)
+            else float("nan")
+        )
 
     lam2d = float(getattr(getattr(config, "training", {}), "lambda_distill_2d", 0.0))
     lam3d = float(getattr(getattr(config, "training", {}), "lambda_distill_3d", 0.0))
-    nonprompt_scale = float(getattr(getattr(config, "training", {}), "nonprompt_scale", 1.0))
-    heavy_mult = float(getattr(getattr(config, "training", {}), "distill_heavy_mult", 1.0))
+    nonprompt_scale = float(
+        getattr(getattr(config, "training", {}), "nonprompt_scale", 1.0)
+    )
+    heavy_mult = float(
+        getattr(getattr(config, "training", {}), "distill_heavy_mult", 1.0)
+    )
     tau = float(getattr(getattr(config, "training", {}), "distill_temperature", 1.0))
 
     writer.add_scalar("train/lambda_distill_2d", lam2d, epoch)
@@ -1488,14 +1839,30 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     writer.add_scalar("train/nonprompt_scale", nonprompt_scale, epoch)
     writer.add_scalar("train/distill_heavy_mult", heavy_mult, epoch)
     writer.add_scalar("train/distill_temperature", tau, epoch)
-    writer.add_scalar("train/effective_lambda_distill_2d", get_effective_distill_weight(config, dim=2), epoch)
-    writer.add_scalar("train/effective_lambda_distill_3d", get_effective_distill_weight(config, dim=3), epoch)
+    writer.add_scalar(
+        "train/effective_lambda_distill_2d",
+        get_effective_distill_weight(config, dim=2),
+        epoch,
+    )
+    writer.add_scalar(
+        "train/effective_lambda_distill_3d",
+        get_effective_distill_weight(config, dim=3),
+        epoch,
+    )
 
     teacher_2d = teacher if distillation_enabled(config, dim=2) else None
     teacher_3d = teacher if distillation_enabled(config, dim=3) else None
 
-    is_main_process = bool(getattr(getattr(config, "runtime", {}), "is_main_process", True))
-    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", unit="batch", dynamic_ncols=True, disable=not is_main_process)
+    is_main_process = bool(
+        getattr(getattr(config, "runtime", {}), "is_main_process", True)
+    )
+    pbar = tqdm(
+        train_loader,
+        desc=f"Train Epoch {epoch}",
+        unit="batch",
+        dynamic_ncols=True,
+        disable=not is_main_process,
+    )
 
     train_start_time = time.perf_counter()
     last_out_time = train_start_time
@@ -1504,30 +1871,71 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     step_time_counts = {2: 0, 3: 0}
 
     def _upd(k, v, beta=0.9):
-        """Update an exponential moving average."""
+        """
+        Update an exponential moving average.
+
+        Args:
+            k (str): Name of the progress metric to update.
+            v (float | None): New observation, or None to leave the accumulator unchanged.
+            beta (float): Weight assigned to the previous moving-average value.
+
+        Returns:
+            None.
+        """
         ema[k] = v if (ema[k] is None) else (beta * ema[k] + (1 - beta) * v)
 
     def _train_progress_stats(batch_idx):
-        """Return training progress counters."""
+        """
+        Return training progress counters.
+
+        Args:
+            batch_idx (int): Current batch index within the epoch.
+
+        Returns:
+            tuple[float, float, int, int]: Elapsed seconds, completion percentage, completed
+                batches, and total batches.
+        """
         elapsed = time.perf_counter() - train_start_time
         batches_done = batch_idx + 1
         total_batches = len(train_loader) if hasattr(train_loader, "__len__") else -1
-        pct = (100.0 * batches_done / total_batches) if total_batches > 0 else float("nan")
+        pct = (
+            (100.0 * batches_done / total_batches)
+            if total_batches > 0
+            else float("nan")
+        )
+
         return elapsed, pct, batches_done, total_batches
 
     def _record_step_time(data_dim, step_time):
-        """Track and log running average step time for one data dimension."""
+        """
+        Track and log running average step time for one data dimension.
+
+        Args:
+            data_dim (int): Source dimensionality, either 2 or 3.
+            step_time (float): Elapsed duration of the training step in seconds.
+
+        Returns:
+            float: Updated average step duration in seconds.
+        """
         data_dim = int(data_dim)
         step_time_totals[data_dim] += float(step_time)
         step_time_counts[data_dim] += 1
         avg_step_time = step_time_totals[data_dim] / max(1, step_time_counts[data_dim])
+
         if writer is not None:
-            writer.add_scalar(f"train_step/{data_dim}d_step_time_avg_s", float(avg_step_time), global_step)
+            writer.add_scalar(
+                f"train_step/{data_dim}d_step_time_avg_s",
+                float(avg_step_time),
+                global_step,
+            )
+
         return avg_step_time
 
-    train_vis_prompt_mode = str(
-        getattr(getattr(config, "logging", {}), "train_vis_prompt_mode", "box")
-    ).strip().lower()
+    train_vis_prompt_mode = (
+        str(getattr(getattr(config, "logging", {}), "train_vis_prompt_mode", "box"))
+        .strip()
+        .lower()
+    )
     if train_vis_prompt_mode in ("bbox", "boxes"):
         train_vis_prompt_mode = "box"
     elif train_vis_prompt_mode in ("click", "clicks", "points"):
@@ -1540,11 +1948,19 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     for relative_batch_idx, batch in enumerate(pbar):
         batch_idx = relative_batch_idx + int(batch_index_offset)
         if batch_idx < int(start_batch_idx):
-            if step_callback is not None and (batch_idx == 0 or (batch_idx + 1) % 1000 == 0):
+            if step_callback is not None and (
+                batch_idx == 0 or (batch_idx + 1) % 1000 == 0
+            ):
                 step_callback(
-                    epoch, batch_idx, global_step,
-                    student, optimizer, scheduler, scaler,
+                    epoch,
+                    batch_idx,
+                    global_step,
+                    student,
+                    optimizer,
+                    scheduler,
+                    scaler,
                 )
+
             last_out_time = time.perf_counter()
             continue
 
@@ -1553,10 +1969,12 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
         ds_name = batch.get("dataset", "NA")
         sub_name = batch.get("subdataset", "NA")
+
         if isinstance(ds_name, (list, tuple)):
             ds_name = ds_name[0]
         if isinstance(sub_name, (list, tuple)):
             sub_name = sub_name[0]
+
         pbar.set_description(f"Train Epoch {epoch} - [{ds_name}/{sub_name}]")
 
         data_dim = _dim_from_batch(batch)
@@ -1566,10 +1984,13 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
         if data_dim == 2:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+
             _t0 = time.perf_counter()
 
             try:
-                step_out = train_step_2d(student, teacher_2d, optimizer, batch, config, scaler)
+                step_out = train_step_2d(
+                    student, teacher_2d, optimizer, batch, config, scaler
+                )
             except Exception as e:
                 _save_and_log_fatal_crash(
                     stage="train2d/exception",
@@ -1581,6 +2002,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+
             step_time = time.perf_counter() - _t0
             avg_step_time = _record_step_time(2, step_time)
 
@@ -1598,10 +2020,14 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
             loss = float(step_out["loss"])
             if "grad_norm" in step_out:
-                writer.add_scalar("train/grad_norm", float(step_out["grad_norm"]), global_step)
+                writer.add_scalar(
+                    "train/grad_norm", float(step_out["grad_norm"]), global_step
+                )
 
             writer.add_scalar("train2d/loss", loss, global_step)
-            writer.add_scalar("train/lr_backbone", get_lr_group(optimizer, 0), global_step)
+            writer.add_scalar(
+                "train/lr_backbone", get_lr_group(optimizer, 0), global_step
+            )
             writer.add_scalar("train/lr_mask", get_lr_group(optimizer, 1), global_step)
             writer.add_scalar("train/lr_mem", get_lr_group(optimizer, 2), global_step)
 
@@ -1615,15 +2041,21 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                     video_tchw = img_seq.to(device, non_blocking=True).float()
 
                     gt = mask_seq.to(device, non_blocking=True)
+
                     if gt.ndim == 4 and gt.shape[1] == 1:
                         gt_thw = gt[:, 0].float()
                     elif gt.ndim == 3:
                         gt_thw = gt.float()
                     else:
-                        raise ValueError(f"Unexpected mask shape for 2D viz: {tuple(gt.shape)}")
+                        raise ValueError(
+                            f"Unexpected mask shape for 2D viz: {tuple(gt.shape)}"
+                        )
 
                     prompt_cache = None
-                    if "val_prompt_cache" in batch and len(batch["val_prompt_cache"]) > 0:
+                    if (
+                        "val_prompt_cache" in batch
+                        and len(batch["val_prompt_cache"]) > 0
+                    ):
                         prompt_cache = batch["val_prompt_cache"][0]
 
                     if prompt_cache is not None:
@@ -1651,7 +2083,12 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                             threshold=0.5,
                             ping_pong=ping_pong,
                         )
-                        writer.add_video("train2d/vis", frames_to_tb_video(frames), epoch, fps=gif_fps)
+                        writer.add_video(
+                            "train2d/vis",
+                            frames_to_tb_video(frames),
+                            epoch,
+                            fps=gif_fps,
+                        )
                         first_vis_2d = True
 
             _upd("2d_data", data_wait)
@@ -1661,17 +2098,29 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 loss=f"{float(loss):.4f}",
                 progress=f"{pct:.2f}%" if pct == pct else f"{batches_done}",
                 elapsed=f"{elapsed:.1f}s",
-                data2d=f"{ema['2d_data']:.3f}s" if ema["2d_data"] is not None else "n/a",
-                step2d=f"{ema['2d_step']:.3f}s" if ema["2d_step"] is not None else "n/a",
+                data2d=(
+                    f"{ema['2d_data']:.3f}s" if ema["2d_data"] is not None else "n/a"
+                ),
+                step2d=(
+                    f"{ema['2d_step']:.3f}s" if ema["2d_step"] is not None else "n/a"
+                ),
                 avg2d=f"{avg_step_time:.3f}s",
             )
 
-            if writer is not None and text_every_steps > 0 and (global_step % text_every_steps == 0):
+            if (
+                writer is not None
+                and text_every_steps > 0
+                and (global_step % text_every_steps == 0)
+            ):
                 lines = [
                     f"Epoch {epoch} training progress",
                     f"global_step={global_step}",
                     f"batch={batches_done}/{total_batches}",
-                    f"progress={pct:.2f}%" if pct == pct else f"progress=batch {batches_done}",
+                    (
+                        f"progress={pct:.2f}%"
+                        if pct == pct
+                        else f"progress=batch {batches_done}"
+                    ),
                     f"elapsed_s={elapsed:.2f}",
                     f"dataset={ds_name}/{sub_name}",
                     f"dim={data_dim}",
@@ -1685,19 +2134,26 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 if ema.get("2d_step") is not None:
                     lines.append(f"ema_2d_step_s={ema['2d_step']:.4f}")
                 if step_time_counts.get(2, 0) > 0:
-                    lines.append(f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}")
+                    lines.append(
+                        f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}"
+                    )
                 if ema.get("3d_data") is not None:
                     lines.append(f"ema_3d_data_wait_s={ema['3d_data']:.4f}")
                 if ema.get("3d_step") is not None:
                     lines.append(f"ema_3d_step_s={ema['3d_step']:.4f}")
                 if step_time_counts.get(3, 0) > 0:
-                    lines.append(f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}")
+                    lines.append(
+                        f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}"
+                    )
 
-                writer.add_text("train/progress", _tb_pre("\n".join(lines)), global_step)
+                writer.add_text(
+                    "train/progress", _tb_pre("\n".join(lines)), global_step
+                )
 
         else:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+
             _t0 = time.perf_counter()
 
             try:
@@ -1707,8 +2163,12 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                     and getattr(optimizations, "per_volume_backward", False)
                     and getattr(optimizations, "enabled", False)
                 )
-                step_function = train_step_3d_per_volume if use_per_volume else train_step_3d
-                step_out = step_function(student, teacher_3d, optimizer, batch, config, scaler)
+                step_function = (
+                    train_step_3d_per_volume if use_per_volume else train_step_3d
+                )
+                step_out = step_function(
+                    student, teacher_3d, optimizer, batch, config, scaler
+                )
             except Exception as e:
                 _save_and_log_fatal_crash(
                     stage="train3d/exception",
@@ -1720,6 +2180,7 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+
             step_time = time.perf_counter() - _t0
             avg_step_time = _record_step_time(3, step_time)
 
@@ -1737,19 +2198,29 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
             loss = float(step_out["loss"])
             if "grad_norm" in step_out:
-                writer.add_scalar("train/grad_norm", float(step_out["grad_norm"]), global_step)
+                writer.add_scalar(
+                    "train/grad_norm", float(step_out["grad_norm"]), global_step
+                )
+
             p_loss = float(step_out["prompt_loss"])
             np_loss = step_out["non_prompt_loss"]
             np_base = step_out["non_prompt_loss_base"]
 
             writer.add_scalar("train3d/loss", loss, global_step)
             writer.add_scalar("train3d/prompt_loss", p_loss, global_step)
-            if np_loss is not None:
-                writer.add_scalar("train3d/non_prompt_loss", float(np_loss), global_step)
-            if np_base is not None:
-                writer.add_scalar("train3d/non_prompt_loss_base", float(np_base), global_step)
 
-            writer.add_scalar("train/lr_backbone", get_lr_group(optimizer, 0), global_step)
+            if np_loss is not None:
+                writer.add_scalar(
+                    "train3d/non_prompt_loss", float(np_loss), global_step
+                )
+            if np_base is not None:
+                writer.add_scalar(
+                    "train3d/non_prompt_loss_base", float(np_base), global_step
+                )
+
+            writer.add_scalar(
+                "train/lr_backbone", get_lr_group(optimizer, 0), global_step
+            )
             writer.add_scalar("train/lr_mask", get_lr_group(optimizer, 1), global_step)
             writer.add_scalar("train/lr_mem", get_lr_group(optimizer, 2), global_step)
 
@@ -1763,15 +2234,21 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                     video_tchw = img_seq.to(device, non_blocking=True).float()
 
                     gt = mask_seq.to(device, non_blocking=True)
+
                     if gt.ndim == 4 and gt.shape[1] == 1:
                         gt_thw = gt[:, 0].float()
                     elif gt.ndim == 3:
                         gt_thw = gt.float()
                     else:
-                        raise ValueError(f"Unexpected mask shape for 3D viz: {tuple(gt.shape)}")
+                        raise ValueError(
+                            f"Unexpected mask shape for 3D viz: {tuple(gt.shape)}"
+                        )
 
                     prompt_cache = None
-                    if "val_prompt_cache" in batch and len(batch["val_prompt_cache"]) > 0:
+                    if (
+                        "val_prompt_cache" in batch
+                        and len(batch["val_prompt_cache"]) > 0
+                    ):
                         prompt_cache = batch["val_prompt_cache"][0]
 
                     if prompt_cache is not None:
@@ -1790,7 +2267,11 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                         logits_seq = out["logits"].detach().cpu()
 
                         gif_path = os.path.join(gif_dir, f"train3d_ep{epoch:04d}.gif")
-                        vis_thr = float(getattr(getattr(config, "training", {}), "vis_threshold", 0.55))
+                        vis_thr = float(
+                            getattr(
+                                getattr(config, "training", {}), "vis_threshold", 0.55
+                            )
+                        )
                         _, frames = save_vis_gif(
                             img_seq,
                             mask_seq,
@@ -1800,7 +2281,12 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                             threshold=vis_thr,
                             ping_pong=ping_pong,
                         )
-                        writer.add_video("train3d/vis", frames_to_tb_video(frames), epoch, fps=gif_fps)
+                        writer.add_video(
+                            "train3d/vis",
+                            frames_to_tb_video(frames),
+                            epoch,
+                            fps=gif_fps,
+                        )
                         first_vis_3d = True
 
             _upd("3d_data", data_wait)
@@ -1810,17 +2296,29 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 loss=f"{float(loss):.4f}",
                 progress=f"{pct:.2f}%" if pct == pct else f"{batches_done}",
                 elapsed=f"{elapsed:.1f}s",
-                data3d=f"{ema['3d_data']:.3f}s" if ema["3d_data"] is not None else "n/a",
-                step3d=f"{ema['3d_step']:.3f}s" if ema["3d_step"] is not None else "n/a",
+                data3d=(
+                    f"{ema['3d_data']:.3f}s" if ema["3d_data"] is not None else "n/a"
+                ),
+                step3d=(
+                    f"{ema['3d_step']:.3f}s" if ema["3d_step"] is not None else "n/a"
+                ),
                 avg3d=f"{avg_step_time:.3f}s",
             )
 
-            if writer is not None and text_every_steps > 0 and (global_step % text_every_steps == 0):
+            if (
+                writer is not None
+                and text_every_steps > 0
+                and (global_step % text_every_steps == 0)
+            ):
                 lines = [
                     f"Epoch {epoch} training progress",
                     f"global_step={global_step}",
                     f"batch={batches_done}/{total_batches}",
-                    f"progress={pct:.2f}%" if pct == pct else f"progress=batch {batches_done}",
+                    (
+                        f"progress={pct:.2f}%"
+                        if pct == pct
+                        else f"progress=batch {batches_done}"
+                    ),
                     f"elapsed_s={elapsed:.2f}",
                     f"dataset={ds_name}/{sub_name}",
                     f"dim={data_dim}",
@@ -1834,21 +2332,31 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
                 if ema.get("2d_step") is not None:
                     lines.append(f"ema_2d_step_s={ema['2d_step']:.4f}")
                 if step_time_counts.get(2, 0) > 0:
-                    lines.append(f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}")
+                    lines.append(
+                        f"avg_2d_step_s={step_time_totals[2] / step_time_counts[2]:.4f}"
+                    )
                 if ema.get("3d_data") is not None:
                     lines.append(f"ema_3d_data_wait_s={ema['3d_data']:.4f}")
                 if ema.get("3d_step") is not None:
                     lines.append(f"ema_3d_step_s={ema['3d_step']:.4f}")
                 if step_time_counts.get(3, 0) > 0:
-                    lines.append(f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}")
+                    lines.append(
+                        f"avg_3d_step_s={step_time_totals[3] / step_time_counts[3]:.4f}"
+                    )
 
-                writer.add_text("train/progress", _tb_pre("\n".join(lines)), global_step)
+                writer.add_text(
+                    "train/progress", _tb_pre("\n".join(lines)), global_step
+                )
 
         total_loss += float(loss)
         processed_steps += 1
         global_step += 1
+
         if step_callback is not None:
-            step_callback(epoch, batch_idx, global_step, student, optimizer, scheduler, scaler)
+            step_callback(
+                epoch, batch_idx, global_step, student, optimizer, scheduler, scaler
+            )
+
         last_out_time = time.perf_counter()
 
     try:
@@ -1864,10 +2372,20 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
     logger.info(f"[Epoch {epoch}] Train avg loss: {avg_loss:.4f}")
     writer.add_scalar("train/loss", float(avg_loss), epoch)
     writer.add_scalar("train/epoch_time_s", float(epoch_time), epoch)
+
     if step_time_counts.get(2, 0) > 0:
-        writer.add_scalar("train/2d_step_time_avg_s", float(step_time_totals[2] / step_time_counts[2]), epoch)
+        writer.add_scalar(
+            "train/2d_step_time_avg_s",
+            float(step_time_totals[2] / step_time_counts[2]),
+            epoch,
+        )
     if step_time_counts.get(3, 0) > 0:
-        writer.add_scalar("train/3d_step_time_avg_s", float(step_time_totals[3] / step_time_counts[3]), epoch)
+        writer.add_scalar(
+            "train/3d_step_time_avg_s",
+            float(step_time_totals[3] / step_time_counts[3]),
+            epoch,
+        )
+
     logger.info(
         f"[Epoch {epoch}] Timing: epoch={epoch_time:.2f}s, "
         f"2D_step_avg={(step_time_totals[2] / step_time_counts[2]) if step_time_counts[2] else float('nan'):.4f}s, "
@@ -1885,9 +2403,13 @@ def train_epoch(student, teacher, train_loader, optimizer, scheduler, config, sc
 
     writer.flush()
     scheduler.step()
+
     return avg_loss, global_step, optimizer, scheduler
 
-def validate_epoch(student, val_loader, config, epoch: int, writer=None, progress_callback=None):
+
+def validate_epoch(
+    student, val_loader, config, epoch: int, writer=None, progress_callback=None
+):
     """
     Run one validation epoch using dataset-produced prompt caches.
 
@@ -1897,6 +2419,8 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         config (OmegaConf.DictConfig): Validation and logging configuration.
         epoch (int): Epoch index.
         writer (SummaryWriter | None): Optional TensorBoard writer.
+        progress_callback (Callable | None): Optional callback receiving batch index, loader
+            length, dataset, subdataset, and dimensionality.
 
     Returns:
         dict[str, float]: Aggregate validation metrics.
@@ -1912,25 +2436,40 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
     task_agg = TaskAggregator(tasks_map=tasks_map)
     modality_agg = ModalityAggregator()
 
-    text_every_batches = int(getattr(getattr(config, "logging", {}), "tb_text_every_val_batches", 50))
+    text_every_batches = int(
+        getattr(getattr(config, "logging", {}), "tb_text_every_val_batches", 50)
+    )
 
     def _tb_pre(txt):
-        """Wrap text as escaped preformatted HTML."""
-        return "<pre style=\"font-family: monospace; white-space: pre;\">" + html.escape(str(txt)) + "</pre>"
+        """
+        Wrap text as escaped preformatted HTML.
+
+        Args:
+            txt (object): Value converted to text and escaped for TensorBoard display.
+
+        Returns:
+            str: HTML-safe preformatted text.
+        """
+        return (
+            '<pre style="font-family: monospace; white-space: pre;">'
+            + html.escape(str(txt))
+            + "</pre>"
+        )
 
     image_every = int(getattr(getattr(config, "logging", {}), "image_every", 5))
     gif_fps = int(getattr(getattr(config, "logging", {}), "image_fps", 2))
     ping_pong = bool(getattr(getattr(config, "logging", {}), "image_ping_pong", False))
     E_total = int(getattr(getattr(config, "training", {}), "epochs", max(epoch + 1, 1)))
-    is_final_epoch = (epoch == E_total - 1)
-    disable_images = bool(getattr(getattr(config, "logging", {}), "disable_images", False))
+    is_final_epoch = epoch == E_total - 1
+    disable_images = bool(
+        getattr(getattr(config, "logging", {}), "disable_images", False)
+    )
     do_viz_this_ep = (not disable_images) and (
-        epoch == 0
-        or ((epoch + 1) % image_every == 0)
-        or is_final_epoch
+        epoch == 0 or ((epoch + 1) % image_every == 0) or is_final_epoch
     )
 
     gif_dir = None
+
     if writer is not None:
         gif_dir = os.path.join(writer.log_dir, "gifs")
         os.makedirs(gif_dir, exist_ok=True)
@@ -1962,17 +2501,29 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
     fg_bin_counts = defaultdict(int)
 
     val_cfg = getattr(config, "validation", {})
-    compute_global_prob_metrics = bool(getattr(val_cfg, "compute_global_prob_metrics", False))
+    compute_global_prob_metrics = bool(
+        getattr(val_cfg, "compute_global_prob_metrics", False)
+    )
 
     all_probs = [] if compute_global_prob_metrics else None
     all_labels = [] if compute_global_prob_metrics else None
 
     def _normalize_modes(x):
-        """Normalize prompt-mode names."""
+        """
+        Normalize prompt-mode names.
+
+        Args:
+            x (str | Iterable[str] | None): Configured prompt modes as one string, a sequence,
+                or no value.
+
+        Returns:
+            list[str]: Valid prompt modes in their original order.
+        """
         if x is None:
             return []
         if isinstance(x, str):
             x = [x]
+
         out = []
         for m in x:
             mm = str(m).strip().lower()
@@ -1982,13 +2533,17 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                 out.append("box")
             elif mm in ("mask", "masks"):
                 out.append("mask")
+
         dedup = []
         for m in out:
             if m not in dedup:
                 dedup.append(m)
+
         return dedup
 
-    default_modes = _normalize_modes(getattr(val_cfg, "default_prompt_modes", ["point", "box", "mask"]))
+    default_modes = _normalize_modes(
+        getattr(val_cfg, "default_prompt_modes", ["point", "box", "mask"])
+    )
     if len(default_modes) == 0:
         default_modes = ["point", "box", "mask"]
 
@@ -1996,10 +2551,22 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
     prompt_modes_by_dataset = getattr(val_cfg, "prompt_modes_by_dataset", {})
 
     def _resolve_prompt_modes(task_id, task_label, dataset_name, subdataset_name):
-        """Resolve validation prompt modes for a sample."""
+        """
+        Resolve validation prompt modes for a sample.
+
+        Args:
+            task_id (str): Task identifier used to resolve prompt overrides.
+            task_label (str): Display label used to resolve task-specific prompt overrides.
+            dataset_name (str): Dataset name used to resolve prompt overrides.
+            subdataset_name (str): Optional subdataset name used to resolve prompt overrides.
+
+        Returns:
+            list[str]: Prompt modes selected for the task and dataset.
+        """
         for key in (task_id, task_label):
             if key is None:
                 continue
+
             key = str(key)
             if key in prompt_modes_by_task:
                 modes = _normalize_modes(prompt_modes_by_task[key])
@@ -2022,8 +2589,18 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         return list(default_modes)
 
     def _mode_prefix(mode, data_dim):
-        """Return the metric prefix for a prompt mode."""
+        """
+        Return the metric prefix for a prompt mode.
+
+        Args:
+            mode (str): Validation prompt mode used to select the metric namespace.
+            data_dim (int): Source dimensionality, either 2 or 3.
+
+        Returns:
+            str: Prompt-specific metric namespace ending in a slash.
+        """
         tag = {"point": "point", "box": "box", "mask": "mask"}[mode]
+
         return f"{tag}/" if int(data_dim) == 2 else f"{tag}/"
 
     val_start_time = time.perf_counter()
@@ -2032,16 +2609,46 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
     ema_step_time = None
 
     def _ema(old, new, beta=0.9):
-        """Update an exponential moving average."""
+        """
+        Update an exponential moving average.
+
+        Args:
+            old (float | None): Previous moving average, or None before initialization.
+            new (float): New scalar observation to incorporate.
+            beta (float): Weight assigned to the previous moving-average value.
+
+        Returns:
+            float: Initialized or updated moving average.
+        """
         return float(new) if old is None else float(beta * old + (1.0 - beta) * new)
 
     def _safe_metric(name):
-        """Return an averaged metric or NaN."""
+        """
+        Return an averaged metric or NaN.
+
+        Args:
+            name (str): Metric key in the accumulated validation totals and counts.
+
+        Returns:
+            float: Metric mean, or NaN when no observations were recorded.
+        """
         c = counts.get(name, 0)
+
         return float(totals[name] / c) if c > 0 else float("nan")
 
     def _emit_val_progress(batch_idx, ds_name, sub_name, data_dim):
-        """Emit validation progress to TensorBoard."""
+        """
+        Emit validation progress to TensorBoard.
+
+        Args:
+            batch_idx (int): Current batch index within the epoch.
+            ds_name (str): Dataset name included in progress reporting.
+            sub_name (str): Subdataset name included in progress reporting.
+            data_dim (int): Source dimensionality, either 2 or 3.
+
+        Returns:
+            None.
+        """
         if writer is None:
             return
         if text_every_batches <= 0:
@@ -2052,7 +2659,11 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         elapsed = time.perf_counter() - val_start_time
         batches_done = batch_idx + 1
         total_batches = len(val_loader) if hasattr(val_loader, "__len__") else -1
-        pct = (100.0 * batches_done / total_batches) if total_batches > 0 else float("nan")
+        pct = (
+            (100.0 * batches_done / total_batches)
+            if total_batches > 0
+            else float("nan")
+        )
 
         lines = [
             f"Epoch {epoch} validation progress",
@@ -2061,16 +2672,35 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
             f"dataset={ds_name}/{sub_name}",
             f"dim={data_dim}",
             f"elapsed_s={elapsed:.2f}",
-            f"ema_data_wait_s={ema_data_wait:.4f}" if ema_data_wait is not None else "ema_data_wait_s=NA",
-            f"ema_step_s={ema_step_time:.4f}" if ema_step_time is not None else "ema_step_s=NA",
+            (
+                f"ema_data_wait_s={ema_data_wait:.4f}"
+                if ema_data_wait is not None
+                else "ema_data_wait_s=NA"
+            ),
+            (
+                f"ema_step_s={ema_step_time:.4f}"
+                if ema_step_time is not None
+                else "ema_step_s=NA"
+            ),
         ]
 
-        for key in ("dice@0.5", "iou@0.5", "dice_best", "iou_best", "dice3d@0.5", "iou3d@0.5", "dice3d@best", "iou3d@best"):
+        for key in (
+            "dice@0.5",
+            "iou@0.5",
+            "dice_best",
+            "iou_best",
+            "dice3d@0.5",
+            "iou3d@0.5",
+            "dice3d@best",
+            "iou3d@best",
+        ):
             val = _safe_metric(key)
             if val == val:
                 lines.append(f"{key}={val:.6f}")
 
-        writer.add_text("val/progress", _tb_pre("\n".join(lines)), epoch * 100000 + batches_done)
+        writer.add_text(
+            "val/progress", _tb_pre("\n".join(lines)), epoch * 100000 + batches_done
+        )
 
     pbar = tqdm(val_loader, desc=f"Val Epoch {epoch}", unit="batch", dynamic_ncols=True)
 
@@ -2080,6 +2710,7 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         step_t0 = time.perf_counter()
 
         data_dim = _dim_from_batch(batch)
+
         if data_dim is None:
             raise ValueError("Batch missing 'dim' (2 or 3).")
 
@@ -2089,11 +2720,13 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
             ds_name = ds_name[0]
         if isinstance(sub_name, (list, tuple)):
             sub_name = sub_name[0]
+
         pbar.set_description(f"Val Epoch {epoch} - [{ds_name}/{sub_name}]")
 
         t_id = batch.get("task_id", None)
         if isinstance(t_id, (list, tuple)):
             t_id = t_id[0]
+
         t_lab = batch.get("task_label", None)
         if isinstance(t_lab, (list, tuple)):
             t_lab = t_lab[0]
@@ -2101,7 +2734,12 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         task_label = None
         if task_agg is not None:
             task_label = task_agg.label_for(t_id if t_id is not None else t_lab)
-        safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_label) if task_label is not None else "task")
+
+        safe_task = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "_",
+            str(task_label) if task_label is not None else "task",
+        )
 
         mod = batch.get("modality", None)
         if isinstance(mod, (list, tuple)):
@@ -2113,15 +2751,25 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         visualize_this_batch = False
         if do_viz_this_ep and writer is not None:
             if int(data_dim) == 2:
-                visualize_this_batch = (not logged_images_2d) if not is_final_epoch else (task_label not in vis_tasks_done)
+                visualize_this_batch = (
+                    (not logged_images_2d)
+                    if not is_final_epoch
+                    else (task_label not in vis_tasks_done)
+                )
             else:
-                visualize_this_batch = (not logged_images_3d) if not is_final_epoch else (task_label not in vis_tasks_done)
+                visualize_this_batch = (
+                    (not logged_images_3d)
+                    if not is_final_epoch
+                    else (task_label not in vis_tasks_done)
+                )
 
         device = student.device
         imgs = as_btc(batch["image"]).to(device, non_blocking=True).float()
         B, T, C, H, W = imgs.shape
 
-        gt_thw_all = as_bthw_mask(batch["mask"].to(device, non_blocking=True), B, T).float()
+        gt_thw_all = as_bthw_mask(
+            batch["mask"].to(device, non_blocking=True), B, T
+        ).float()
         gt_thw_all = (gt_thw_all > 0.5).to(torch.uint8)
 
         val_prompt_cache_all = batch.get("val_prompt_cache", [None] * B)
@@ -2133,8 +2781,9 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
             video_tchw = imgs[b]
             gt_thw = gt_thw_all[b]
 
-            nonempty = (gt_thw.sum(dim=(1, 2)) > 0)
+            nonempty = gt_thw.sum(dim=(1, 2)) > 0
             n_valid_frames = int(nonempty.sum().item())
+
             if n_valid_frames == 0:
                 continue
 
@@ -2143,19 +2792,27 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
             sample_ds = ds_name
             sample_sub = sub_name
 
-            if isinstance(batch.get("task_id", None), (list, tuple)) and b < len(batch["task_id"]):
+            if isinstance(batch.get("task_id", None), (list, tuple)) and b < len(
+                batch["task_id"]
+            ):
                 sample_task_id = batch["task_id"][b]
             elif t_id is not None:
                 sample_task_id = t_id
 
-            if isinstance(batch.get("task_label", None), (list, tuple)) and b < len(batch["task_label"]):
+            if isinstance(batch.get("task_label", None), (list, tuple)) and b < len(
+                batch["task_label"]
+            ):
                 sample_task_label = batch["task_label"][b]
             elif t_lab is not None:
                 sample_task_label = t_lab
 
-            if isinstance(batch.get("dataset", None), (list, tuple)) and b < len(batch["dataset"]):
+            if isinstance(batch.get("dataset", None), (list, tuple)) and b < len(
+                batch["dataset"]
+            ):
                 sample_ds = batch["dataset"][b]
-            if isinstance(batch.get("subdataset", None), (list, tuple)) and b < len(batch["subdataset"]):
+            if isinstance(batch.get("subdataset", None), (list, tuple)) and b < len(
+                batch["subdataset"]
+            ):
                 sample_sub = batch["subdataset"][b]
 
             prompt_modes = _resolve_prompt_modes(
@@ -2165,7 +2822,9 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                 sample_sub,
             )
 
-            sample_prompt_cache = val_prompt_cache_all[b] if b < len(val_prompt_cache_all) else None
+            sample_prompt_cache = (
+                val_prompt_cache_all[b] if b < len(val_prompt_cache_all) else None
+            )
             if sample_prompt_cache is None:
                 continue
 
@@ -2194,7 +2853,11 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
 
                 logits_t = out["logits"]
 
-                if visualize_this_batch and viz_logits is None and prompt_mode == prompt_modes[0]:
+                if (
+                    visualize_this_batch
+                    and viz_logits is None
+                    and prompt_mode == prompt_modes[0]
+                ):
                     viz_logits = logits_t.detach().cpu()
                     viz_img = batch["image"][b].detach().cpu()
 
@@ -2207,11 +2870,16 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                 dices = []
                 ious = []
                 fg_fracs = []
+
                 for kslice in range(gt_np.shape[0]):
-                    d, i = dice_iou(torch.from_numpy(pred05[kslice]), torch.from_numpy(gt_np[kslice]))
+                    d, i = dice_iou(
+                        torch.from_numpy(pred05[kslice]),
+                        torch.from_numpy(gt_np[kslice]),
+                    )
                     dices.append(d)
                     ious.append(i)
                     fg_fracs.append(float(gt_np[kslice].mean()))
+
                 dice05 = float(np.mean(dices))
                 iou05 = float(np.mean(ious))
 
@@ -2225,14 +2893,20 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                     pred = (logits_np > float(thr)).astype(np.uint8)
                     d_thr = []
                     i_thr = []
+
                     for kslice in range(gt_np.shape[0]):
-                        d, i = dice_iou(torch.from_numpy(pred[kslice]), torch.from_numpy(gt_np[kslice]))
+                        d, i = dice_iou(
+                            torch.from_numpy(pred[kslice]),
+                            torch.from_numpy(gt_np[kslice]),
+                        )
                         d_thr.append(d)
                         i_thr.append(i)
+
                     d_m = float(np.mean(d_thr))
                     i_m = float(np.mean(i_thr))
                     avg_d_list.append(d_m)
                     avg_i_list.append(i_m)
+
                     if d_m > best_d:
                         best_d = d_m
                         best_i = i_m
@@ -2277,7 +2951,9 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
 
                 if int(data_dim) == 3:
                     pred_best_vol = (logits_np > best_thr).astype(np.uint8)
-                    d3, i3 = dice_iou(torch.from_numpy(pred_best_vol), torch.from_numpy(gt_np))
+                    d3, i3 = dice_iou(
+                        torch.from_numpy(pred_best_vol), torch.from_numpy(gt_np)
+                    )
                     d3 = float(d3)
                     i3 = float(i3)
 
@@ -2287,7 +2963,9 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                     counts[f"{mode_prefix}iou3d@best"] += 1
 
                     pred05_vol = (logits_np > 0.0).astype(np.uint8)
-                    d305, i305 = dice_iou(torch.from_numpy(pred05_vol), torch.from_numpy(gt_np))
+                    d305, i305 = dice_iou(
+                        torch.from_numpy(pred05_vol), torch.from_numpy(gt_np)
+                    )
                     d305 = float(d305)
                     i305 = float(i305)
 
@@ -2341,12 +3019,15 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                         "iou@avg_thr": iou_avg,
                     }
                     if int(data_dim) == 3:
-                        sample_metrics.update({
-                            "dice3d@0.5": d305,
-                            "iou3d@0.5": i305,
-                            "dice3d@best": d3,
-                            "iou3d@best": i3,
-                        })
+                        sample_metrics.update(
+                            {
+                                "dice3d@0.5": d305,
+                                "iou3d@0.5": i305,
+                                "dice3d@best": d3,
+                                "iou3d@best": i3,
+                            }
+                        )
+
                     task_agg.update(
                         task_label if task_label is not None else safe_task,
                         sample_metrics,
@@ -2366,12 +3047,15 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                         "iou@avg_thr": iou_avg,
                     }
                     if int(data_dim) == 3:
-                        sample_metrics.update({
-                            "dice3d@0.5": d305,
-                            "iou3d@0.5": i305,
-                            "dice3d@best": d3,
-                            "iou3d@best": i3,
-                        })
+                        sample_metrics.update(
+                            {
+                                "dice3d@0.5": d305,
+                                "iou3d@0.5": i305,
+                                "dice3d@best": d3,
+                                "iou3d@best": i3,
+                            }
+                        )
+
                     modality_agg.update(
                         modality_label,
                         sample_metrics,
@@ -2381,7 +3065,13 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                         n_items=1,
                     )
 
-        if visualize_this_batch and writer is not None and viz_logits is not None and viz_img is not None and gif_dir is not None:
+        if (
+            visualize_this_batch
+            and writer is not None
+            and viz_logits is not None
+            and viz_img is not None
+            and gif_dir is not None
+        ):
             if is_final_epoch:
                 gif_name = f"val{'2d' if int(data_dim)==2 else '3d'}_task-{safe_task}_ep{epoch:04d}.gif"
                 tb_tag = f"val{'2d' if int(data_dim)==2 else '3d'}/vis/{safe_task}"
@@ -2394,12 +3084,24 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
                 else:
                     logged_images_3d = True
 
-            gif_path = os.path.join(gif_dir, gif_name) if gif_dir is not None else gif_name
+            gif_path = (
+                os.path.join(gif_dir, gif_name) if gif_dir is not None else gif_name
+            )
             try:
                 img_seq = viz_img
                 mask_seq = batch["mask"][0].detach().cpu()
-                _, frames_v = save_vis_gif(img_seq, mask_seq, viz_logits, gif_path, fps=gif_fps, threshold=0.5, ping_pong=ping_pong)
-                writer.add_video(tb_tag, frames_to_tb_video(frames_v), epoch, fps=gif_fps)
+                _, frames_v = save_vis_gif(
+                    img_seq,
+                    mask_seq,
+                    viz_logits,
+                    gif_path,
+                    fps=gif_fps,
+                    threshold=0.5,
+                    ping_pong=ping_pong,
+                )
+                writer.add_video(
+                    tb_tag, frames_to_tb_video(frames_v), epoch, fps=gif_fps
+                )
             except Exception as e:
                 print("[WARN] Visualization skipped:", repr(e))
 
@@ -2407,14 +3109,18 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         ema_data_wait = _ema(ema_data_wait, data_wait)
         ema_step_time = _ema(ema_step_time, step_time)
         _emit_val_progress(batch_idx, ds_name, sub_name, data_dim)
+
         if progress_callback is not None:
             progress_callback(batch_idx, len(val_loader), ds_name, sub_name, data_dim)
+
         last_batch_end_time = time.perf_counter()
 
         if int(data_dim) == 2 and counts.get("dice@0.5", 0) > 0:
             pbar.set_postfix(dice2d=f"{(totals['dice@0.5']/counts['dice@0.5']):.3f}")
         if int(data_dim) == 3 and counts.get("dice3d@0.5", 0) > 0:
-            pbar.set_postfix(dice3d=f"{(totals['dice3d@0.5']/counts['dice3d@0.5']):.3f}")
+            pbar.set_postfix(
+                dice3d=f"{(totals['dice3d@0.5']/counts['dice3d@0.5']):.3f}"
+            )
 
     try:
         pbar.close()
@@ -2442,16 +3148,27 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
             metrics[f"iou@0.5|{key}"] = float(fg_bin_totals_iou[key] / c)
 
     if total_frames_all > 0:
-        metrics["debug/val_pred_fg_frac"] = float(sum_pred_frac / max(1, total_frames_all))
+        metrics["debug/val_pred_fg_frac"] = float(
+            sum_pred_frac / max(1, total_frames_all)
+        )
         metrics["debug/val_prob_mean"] = float(sum_prob_mean / max(1, total_frames_all))
-        metrics["debug/val_empty_slice_rate_all"] = float(empty_slice_count_all / max(1, total_frames_all))
+        metrics["debug/val_empty_slice_rate_all"] = float(
+            empty_slice_count_all / max(1, total_frames_all)
+        )
+
         if total_frames_gt > 0:
-            metrics["debug/val_gt_fg_frac"] = float(sum_gt_frac / max(1, total_frames_gt))
-            metrics["debug/val_empty_slice_rate_gt"] = float(empty_slice_count_gt / max(1, total_frames_all))
+            metrics["debug/val_gt_fg_frac"] = float(
+                sum_gt_frac / max(1, total_frames_gt)
+            )
+            metrics["debug/val_empty_slice_rate_gt"] = float(
+                empty_slice_count_gt / max(1, total_frames_all)
+            )
 
     if writer is not None:
         for k, v in metrics.items():
-            if isinstance(v, (int, float)) and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            if isinstance(v, (int, float)) and not (
+                isinstance(v, float) and (math.isnan(v) or math.isinf(v))
+            ):
                 writer.add_scalar(f"val/{k}", float(v), epoch)
 
         if "dice3d@0.5" in metrics:
@@ -2459,15 +3176,21 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
         if "dice3d@best" in metrics:
             writer.add_scalar("val3d/dice@best", float(metrics["dice3d@best"]), epoch)
         if "dice3d@best_vol" in metrics:
-            writer.add_scalar("val3d/dice@best_vol", float(metrics["dice3d@best_vol"]), epoch)
+            writer.add_scalar(
+                "val3d/dice@best_vol", float(metrics["dice3d@best_vol"]), epoch
+            )
         if "iou3d@0.5" in metrics:
             writer.add_scalar("val3d/iou@0.5", float(metrics["iou3d@0.5"]), epoch)
         if "iou3d@best" in metrics:
             writer.add_scalar("val3d/iou@best", float(metrics["iou3d@best"]), epoch)
         if "iou3d@best_vol" in metrics:
-            writer.add_scalar("val3d/iou@best_vol", float(metrics["iou3d@best_vol"]), epoch)
+            writer.add_scalar(
+                "val3d/iou@best_vol", float(metrics["iou3d@best_vol"]), epoch
+            )
 
-        writer.add_text("val/summary", f"[Epoch {epoch}] Validation metrics: {metrics}", epoch)
+        writer.add_text(
+            "val/summary", f"[Epoch {epoch}] Validation metrics: {metrics}", epoch
+        )
 
         if task_agg is not None:
             task_agg.log_to_tensorboard(writer, epoch, split="val")
@@ -2508,6 +3231,7 @@ def validate_epoch(student, val_loader, config, epoch: int, writer=None, progres
 
     return metrics
 
+
 def main(config_path, resume, multi_gpu, amp):
     """
     Run the full train/validation/test workflow from a config file.
@@ -2546,13 +3270,19 @@ def main(config_path, resume, multi_gpu, amp):
     opt_all = setup_optimizer_and_scheduler(student, config)
     optimizer, scheduler = opt_all["optimizer"], opt_all["scheduler"]
 
-    run_dir = os.path.join(config.logging.output_dir, "tb", datetime.now().strftime("%Y%m%d-%H%M%S"))
+    run_dir = os.path.join(
+        config.logging.output_dir, "tb", datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
     writer = SummaryWriter(log_dir=run_dir, flush_secs=5, max_queue=10)
     writer.add_hparams(
         {
             "bs": int(getattr(config.training, "batch_size", 1)),
             "epochs": int(getattr(config.training, "epochs", 1)),
-            "lr_backbone": float(getattr(config.training, "lr_backbone", getattr(config.training, "lr", 1e-4))),
+            "lr_backbone": float(
+                getattr(
+                    config.training, "lr_backbone", getattr(config.training, "lr", 1e-4)
+                )
+            ),
             "lr_mask": float(getattr(config.training, "mask_lr", 1e-4)),
             "lr_mem": float(getattr(config.training, "mem_lr", 1e-4)),
             "weight_decay": float(getattr(config.training, "weight_decay", 0.0)),
@@ -2563,6 +3293,7 @@ def main(config_path, resume, multi_gpu, amp):
     global_step = 0
 
     scaler = None
+
     if multi_gpu and torch.cuda.device_count() > 1:
         student = torch.nn.DataParallel(student)
         if teacher is not None:
@@ -2607,27 +3338,51 @@ def main(config_path, resume, multi_gpu, amp):
                 Returns:
                     str | None: Selected metric key, or None when no IoU metric exists.
                 """
-                for k in ("iou_best", "iou@0.5", "iou@avg_thr", "iou3d@best", "iou3d@0.5", "iou3d@best_vol"):
+                for k in (
+                    "iou_best",
+                    "iou@0.5",
+                    "iou@avg_thr",
+                    "iou3d@best",
+                    "iou3d@0.5",
+                    "iou3d@best_vol",
+                ):
                     if k in m:
                         return k
+
                 iou_keys = [k for k in m.keys() if "iou" in k]
                 return max(iou_keys, key=lambda x: m[x]) if iou_keys else None
 
             prim_key = _primary_iou(val_metrics)
             prim_val = float(val_metrics[prim_key]) if prim_key else -float("inf")
 
-            ckpt_mgr.save_latest(student, optimizer, scheduler, scaler, epoch, global_step)
+            ckpt_mgr.save_latest(
+                student, optimizer, scheduler, scaler, epoch, global_step
+            )
+
             if prim_val > getattr(ckpt_mgr, "best_metric", -1):
-                ckpt_mgr.save_best(student, optimizer, scheduler, scaler, epoch, metric=prim_val, global_step=global_step)
-            logger.info(f"[Epoch {epoch}] Val ({prim_key}): {prim_val:.4f} | all: {val_metrics}")
+                ckpt_mgr.save_best(
+                    student,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    metric=prim_val,
+                    global_step=global_step,
+                )
+
+            logger.info(
+                f"[Epoch {epoch}] Val ({prim_key}): {prim_val:.4f} | all: {val_metrics}"
+            )
 
     final_epoch_idx = E
     test_metrics = validate_epoch(student, test_loader, config, final_epoch_idx, writer)
     for k, v in test_metrics.items():
         writer.add_scalar(f"test/{k}", float(v), final_epoch_idx)
+
     logger.info(f"Final test: {test_metrics}")
 
     writer.close()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -2641,5 +3396,5 @@ if __name__ == "__main__":
         config_path=args.config,
         resume=args.resume,
         multi_gpu=args.multi_gpu,
-        amp=args.amp
+        amp=args.amp,
     )

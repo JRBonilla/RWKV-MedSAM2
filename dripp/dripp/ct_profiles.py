@@ -1,4 +1,6 @@
-"""Validated CT intensity profiles shared by DRIPP and its debugger."""
+"""
+Validated CT intensity profiles shared by DRIPP and its debugger.
+"""
 
 from __future__ import annotations
 
@@ -8,17 +10,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-
 SCHEMA_VERSION = 2
 
 
 class CTProfileError(ValueError):
-    """Raised when a CT profile file is missing, incompatible, or invalid."""
+    """
+    Raised when a CT profile file is missing, incompatible, or invalid.
+    """
 
 
 @dataclass(frozen=True)
 class CTProfile:
-    """Fixed window and global z-score parameters for one CT subdataset."""
+    """
+    Fixed window and global z-score parameters for one CT subdataset.
+    """
 
     name: str
     intensity_space: str
@@ -32,37 +37,83 @@ class CTProfile:
 
     @property
     def window_width(self) -> float:
+        """
+        Return the extent of the fixed CT intensity window.
+
+        Args:
+            None.
+
+        Returns:
+            float: Upper bound minus lower bound in the profile's intensity space.
+        """
         return self.window_upper - self.window_lower
 
     @property
     def window_level(self) -> float:
+        """
+        Return the center of the fixed CT intensity window.
+
+        Args:
+            None.
+
+        Returns:
+            float: Midpoint of the upper and lower intensity bounds.
+        """
         return (self.window_upper + self.window_lower) / 2.0
 
 
 def _finite_number(value, field: str) -> float:
+    """
+    Parse a CT profile field as a finite floating-point number.
+
+    Args:
+        value (object): Raw profile field value to convert to a finite float.
+        field (str): CT profile field name included in validation errors.
+
+    Returns:
+        float: Validated numeric value; raises CTProfileError for invalid input.
+    """
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
         raise CTProfileError(f"CT profile field {field!r} must be numeric") from exc
     if not math.isfinite(number):
         raise CTProfileError(f"CT profile field {field!r} must be finite")
+
     return number
 
 
 def _parse_profile(name: str, raw: Mapping) -> CTProfile:
+    """
+    Validate one completed profile and construct its typed representation.
+
+    Args:
+        name (str): Exact subdataset name associated with this profile.
+        raw (Mapping): Unvalidated profile fields loaded from the JSON document.
+
+    Returns:
+        CTProfile: Fixed intensity window, normalization statistics, and source counts.
+    """
     if raw.get("stats_basis") != "full_after_window":
-        raise CTProfileError(f"CT profile {name!r} was not computed from the full windowed data")
+        raise CTProfileError(
+            f"CT profile {name!r} was not computed from the full windowed data"
+        )
     if raw.get("window_stats_compatible") is not True:
-        raise CTProfileError(f"CT profile {name!r} does not contain window-compatible statistics")
+        raise CTProfileError(
+            f"CT profile {name!r} does not contain window-compatible statistics"
+        )
 
     lower = _finite_number(raw.get("window_lower"), "window_lower")
     upper = _finite_number(raw.get("window_upper"), "window_upper")
     mean = _finite_number(raw.get("mean"), "mean")
     std = _finite_number(raw.get("std"), "std")
+
     if upper <= lower:
         raise CTProfileError(f"CT profile {name!r} has an empty or reversed window")
     if std <= 0:
-        raise CTProfileError(f"CT profile {name!r} has a non-positive standard deviation")
+        raise CTProfileError(
+            f"CT profile {name!r} has a non-positive standard deviation"
+        )
 
     try:
         count = int(raw.get("count"))
@@ -70,12 +121,19 @@ def _parse_profile(name: str, raw: Mapping) -> CTProfile:
         failed_count = int(raw.get("failed_image_count"))
     except (TypeError, ValueError) as exc:
         raise CTProfileError(f"CT profile {name!r} has invalid count fields") from exc
-    if count <= 0 or source_count <= 0 or failed_count < 0 or failed_count > source_count:
+    if (
+        count <= 0
+        or source_count <= 0
+        or failed_count < 0
+        or failed_count > source_count
+    ):
         raise CTProfileError(f"CT profile {name!r} has inconsistent count fields")
 
     intensity_space = str(raw.get("intensity_space", "")).strip().lower()
     if intensity_space not in {"hu", "display"}:
-        raise CTProfileError(f"CT profile {name!r} has unsupported intensity_space={intensity_space!r}")
+        raise CTProfileError(
+            f"CT profile {name!r} has unsupported intensity_space={intensity_space!r}"
+        )
 
     return CTProfile(
         name=name,
@@ -91,7 +149,17 @@ def _parse_profile(name: str, raw: Mapping) -> CTProfile:
 
 
 def load_ct_profiles(path, expected_dataset: str | None = None) -> dict[str, CTProfile]:
-    """Load and fully validate a schema-v2 dataset CT profile file."""
+    """
+    Load and fully validate a schema-v2 dataset CT profile file.
+
+    Args:
+        path (str | pathlib.Path): Path to the dataset CT profile JSON file.
+        expected_dataset (str | None): Expected dataset name, or None to accept the name
+            recorded in the profile file.
+
+    Returns:
+        dict[str, CTProfile]: Validated profiles keyed by exact subdataset name.
+    """
 
     profile_path = Path(path)
     if not profile_path.is_file():
@@ -100,12 +168,15 @@ def load_ct_profiles(path, expected_dataset: str | None = None) -> dict[str, CTP
         with profile_path.open("r", encoding="utf-8") as handle:
             document = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        raise CTProfileError(f"Could not read CT profile file {profile_path}: {exc}") from exc
+        raise CTProfileError(
+            f"Could not read CT profile file {profile_path}: {exc}"
+        ) from exc
 
     if document.get("schema_version") != SCHEMA_VERSION:
         raise CTProfileError(
             f"CT profile file {profile_path} is legacy or incompatible; expected schema_version={SCHEMA_VERSION}"
         )
+
     dataset_name = str(document.get("dataset_name", "")).strip()
     if not dataset_name:
         raise CTProfileError(f"CT profile file {profile_path} has no dataset_name")
@@ -113,20 +184,42 @@ def load_ct_profiles(path, expected_dataset: str | None = None) -> dict[str, CTP
         raise CTProfileError(
             f"CT profile dataset mismatch: expected {expected_dataset!r}, found {dataset_name!r}"
         )
+
     raw_profiles = document.get("profiles")
     if not isinstance(raw_profiles, dict) or not raw_profiles:
-        raise CTProfileError(f"CT profile file {profile_path} has no completed profiles")
-    return {str(name): _parse_profile(str(name), raw) for name, raw in raw_profiles.items()}
+        raise CTProfileError(
+            f"CT profile file {profile_path} has no completed profiles"
+        )
+
+    return {
+        str(name): _parse_profile(str(name), raw) for name, raw in raw_profiles.items()
+    }
 
 
-def select_ct_profile(profiles: Mapping[str, CTProfile], subdataset_name: str | None) -> CTProfile:
-    """Select an exact subdataset profile; unnamed groups may explicitly use ``default``."""
+def select_ct_profile(
+    profiles: Mapping[str, CTProfile], subdataset_name: str | None
+) -> CTProfile:
+    """
+    Select an exact subdataset profile; unnamed groups may explicitly use ``default``.
+
+    Args:
+        profiles (Mapping[str, CTProfile]): Validated CT intensity profiles keyed by
+            subdataset name.
+        subdataset_name (str | None): Subdataset name to resolve, or None for an unnamed
+            group.
+
+    Returns:
+        CTProfile: Profile for the requested subdataset; raises CTProfileError when
+            absent.
+    """
 
     requested = str(subdataset_name).strip() if subdataset_name is not None else ""
     key = requested or "default"
+
     if key not in profiles:
         available = ", ".join(sorted(profiles)) or "none"
         raise CTProfileError(
             f"No exact CT profile for subdataset {key!r}; available profiles: {available}"
         )
+
     return profiles[key]

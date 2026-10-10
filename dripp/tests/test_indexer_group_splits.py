@@ -1,3 +1,7 @@
+"""
+Test consistent split assignment for related groups with the same identifier.
+"""
+
 import unittest
 from unittest.mock import patch
 
@@ -5,20 +9,43 @@ from dripp.indexer import build_groupings
 
 
 class RelatedGroupSplitTests(unittest.TestCase):
+    """
+    Check that related image/mask groups remain on one dataset split.
+    """
+
     def test_groups_with_same_identifier_stay_on_same_split(self):
+        """
+        Verify that related groups with the same identifier share a dataset split.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         base = "/data/research/Cardiac MRI/Fixed_Niftis_v2"
         patients = ("SCD0000101", "SCD0000201")
         images = []
         masks = []
+
         for patient in patients:
             for phase in ("00", "01"):
                 name = f"{patient}_phase{phase}"
-                images.append({"path": f"{base}/{name}/{name}_image.nii.gz", "id": name})
-                for class_name in ("bloodpool", "myocardium", "epicardium", "endocardium"):
-                    masks.append({
-                        "path": f"{base}/{name}/{name}_{class_name}_mask.nii.gz",
-                        "id": f"{name}_{class_name}",
-                    })
+                images.append(
+                    {"path": f"{base}/{name}/{name}_image.nii.gz", "id": name}
+                )
+                for class_name in (
+                    "bloodpool",
+                    "myocardium",
+                    "epicardium",
+                    "endocardium",
+                ):
+                    masks.append(
+                        {
+                            "path": f"{base}/{name}/{name}_{class_name}_mask.nii.gz",
+                            "id": f"{name}_{class_name}",
+                        }
+                    )
 
         metadata = {
             "train_ratio": 0.5,
@@ -45,7 +72,9 @@ class RelatedGroupSplitTests(unittest.TestCase):
             "mask_files": masks,
         }
 
-        with patch("dripp.indexer.random.random", side_effect=(0.1, 0.9)) as random_value:
+        with patch(
+            "dripp.indexer.random.random", side_effect=(0.1, 0.9)
+        ) as random_value:
             result = build_groupings(index_data, base, metadata)
 
         subdataset = result["subdatasets"][0]
@@ -58,10 +87,12 @@ class RelatedGroupSplitTests(unittest.TestCase):
             {group["identifier"] for group in subdataset["test"]},
             {"SCD0000201"},
         )
-        self.assertTrue(all(
-            len(group["masks"]) == 4
-            for group in subdataset["train"] + subdataset["test"]
-        ))
+        self.assertTrue(
+            all(
+                len(group["masks"]) == 4
+                for group in subdataset["train"] + subdataset["test"]
+            )
+        )
 
 
 if __name__ == "__main__":

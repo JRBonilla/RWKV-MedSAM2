@@ -1,4 +1,6 @@
-"""Researcher-friendly command-line interface for DRIPP."""
+"""
+Researcher-friendly command-line interface for DRIPP.
+"""
 
 import argparse
 import json
@@ -9,14 +11,41 @@ from . import config
 
 
 def _csv_path():
+    """
+    Resolve the configured dataset metadata CSV path.
+
+    Args:
+        None.
+
+    Returns:
+        str: Normalized path under the configured unprocessed-data root.
+    """
     return os.path.normpath(os.path.join(config.BASE_UNPROC, config.CSV_FILENAME))
 
 
 def _print_error(message):
+    """
+    Print a command-line error message to standard error.
+
+    Args:
+        message (str): Message displayed in the console, progress log, or tooltip.
+
+    Returns:
+        None.
+    """
     print(f"Error: {message}", file=sys.stderr)
 
 
 def _require_csv():
+    """
+    Resolve the dataset CSV and ensure it exists.
+
+    Args:
+        None.
+
+    Returns:
+        str: Existing metadata CSV path; raises FileNotFoundError when missing.
+    """
     csv_path = _csv_path()
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
@@ -24,16 +53,36 @@ def _require_csv():
             "Update [paths] base_unproc/csv_filename in dripp.ini, or run "
             "`dripp config init` to create a local config template."
         )
+
     return csv_path
 
 
 def _load_metadata():
+    """
+    Read dataset metadata from the configured CSV.
+
+    Args:
+        None.
+
+    Returns:
+        dict: Dataset names mapped to parsed metadata.
+    """
     from .helpers import load_dataset_metadata
 
     return load_dataset_metadata(_require_csv())
 
 
 def _print_nested(title, values):
+    """
+    Print a configuration section and its nested field values.
+
+    Args:
+        title (str): Title of the configuration section or progress dialog.
+        values (dict): Configuration field names mapped to their active values.
+
+    Returns:
+        None.
+    """
     print(f"{title}:")
     for key, value in values.items():
         if isinstance(value, dict):
@@ -45,31 +94,62 @@ def _print_nested(title, values):
 
 
 def cmd_config_show(_args):
+    """
+    Print the active configuration and the files from which it was loaded.
+
+    Args:
+        _args (argparse.Namespace): Parsed command options, unused by this handler.
+
+    Returns:
+        int: Zero after printing the configuration.
+    """
     summary = config.get_config_summary()
     print("DRIPP configuration")
     print("===================")
     loaded = summary.pop("config_files_loaded")
     print("Config files loaded:")
+
     for path in loaded:
         print(f"  {path}")
+
     print()
     for section, values in summary.items():
         _print_nested(section, values)
         print()
+
     return 0
 
 
 def cmd_config_init(args):
+    """
+    Write a local configuration template with optional overwrite.
+
+    Args:
+        args (argparse.Namespace): Parsed options for the selected command.
+
+    Returns:
+        int: Zero on success or two if the destination already exists.
+    """
     try:
         path = config.write_default_config(args.path, overwrite=args.force)
     except FileExistsError as exc:
         _print_error(f"{exc}\nUse --force to overwrite it.")
         return 2
+
     print(f"Wrote DRIPP config template: {path}")
     return 0
 
 
 def cmd_datasets_list(_args):
+    """
+    List configured datasets, modalities, and preprocessing status.
+
+    Args:
+        _args (argparse.Namespace): Parsed command options, unused by this handler.
+
+    Returns:
+        int: Zero on success or two when metadata cannot be loaded.
+    """
     try:
         metadata = _load_metadata()
     except Exception as exc:
@@ -85,16 +165,28 @@ def cmd_datasets_list(_args):
         modalities = ", ".join(meta.get("modalities") or ["default"])
         state = "preprocessed" if meta.get("preprocessed") else "not preprocessed"
         print(f"  {name} [{modalities}] - {state}")
+
     return 0
 
 
 def _save_tasks(csv_path, global_tasks):
+    """
+    Serialize the global task catalog using sorted class and subdataset names.
+
+    Args:
+        csv_path (str): Metadata CSV path whose filename determines the task catalog
+            filename.
+        global_tasks (dict): Collected task memberships with class and
+            dataset/subdataset sets.
+
+    Returns:
+        None.
+    """
     tasks = {
         task: {
             "classes": sorted(list(info["classes"])),
             "datasets": {
-                ds: sorted(list(subs))
-                for ds, subs in info["datasets"].items()
+                ds: sorted(list(subs)) for ds, subs in info["datasets"].items()
             },
         }
         for task, info in global_tasks.items()
@@ -103,12 +195,23 @@ def _save_tasks(csv_path, global_tasks):
     os.makedirs(tasks_folder, exist_ok=True)
     base = os.path.splitext(os.path.basename(csv_path))[0]
     tasks_file = os.path.join(tasks_folder, f"{base}_tasks.json")
+
     with open(tasks_file, "w", encoding="utf-8") as tf:
         json.dump(tasks, tf, indent=2)
+
     print(f"Saved task summary: {tasks_file}")
 
 
 def cmd_index(args):
+    """
+    Index one selected dataset or the complete metadata catalog.
+
+    Args:
+        args (argparse.Namespace): Parsed options for the selected command.
+
+    Returns:
+        int: Zero after indexing or two for invalid inputs or startup failures.
+    """
     try:
         csv_path = _require_csv()
         metadata = _load_metadata()
@@ -121,8 +224,10 @@ def cmd_index(args):
         if args.dataset not in metadata:
             _print_error(f"Dataset {args.dataset!r} was not found in {csv_path}.")
             return 2
+
         index_dataset(args.dataset, metadata[args.dataset])
         print(f"Indexed dataset: {args.dataset}")
+
         return 0
 
     for name, meta in metadata.items():
@@ -130,12 +235,23 @@ def cmd_index(args):
             index_dataset(name, meta)
         except Exception as exc:
             _print_error(f"Error indexing {name!r}: {exc}")
+
     _save_tasks(csv_path, GLOBAL_TASKS)
     print("Indexing complete.")
+
     return 0
 
 
 def cmd_preprocess(args):
+    """
+    Process the selected datasets and export the dataset manager.
+
+    Args:
+        args (argparse.Namespace): Parsed options for the selected command.
+
+    Returns:
+        int: Zero on success, one for processing failure, or two for invalid inputs.
+    """
     if args.start_at and not args.all:
         _print_error("--start-at can only be used with preprocess --all.")
         return 2
@@ -156,9 +272,11 @@ def cmd_preprocess(args):
             if args.dataset not in manager.metadata:
                 _print_error(f"Dataset {args.dataset!r} was not found in {csv_path}.")
                 return 2
+
             manager.process_dataset(args.dataset, max_groups=args.max_groups)
         else:
             manager.process_all(start_at=args.start_at, max_groups=args.max_groups)
+
         export_path = os.path.join(config.BASE_PROC, "dataset_manager.pkl")
         manager.export(export_path)
     except Exception as exc:
@@ -170,6 +288,15 @@ def cmd_preprocess(args):
 
 
 def cmd_debugger(_args):
+    """
+    Open the Tk preprocessing debugger and run its event loop.
+
+    Args:
+        _args (argparse.Namespace): Parsed command options, unused by this handler.
+
+    Returns:
+        int: Zero after closing the debugger or two for an import failure.
+    """
     try:
         import tkinter as tk
         from .debugger.debugger import PreprocessingDebuggerApp
@@ -180,45 +307,87 @@ def cmd_debugger(_args):
     root = tk.Tk()
     PreprocessingDebuggerApp(root)
     root.mainloop()
+
     return 0
 
 
 def build_parser():
+    """
+    Build the DRIPP command parser and its subcommands.
+
+    Args:
+        None.
+
+    Returns:
+        argparse.ArgumentParser: Parser for configuration, dataset listing, indexing,
+            preprocessing, and debugging.
+    """
     parser = argparse.ArgumentParser(
         prog="dripp",
         description="DRIPP dataset indexing and preprocessing tools.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    config_parser = subparsers.add_parser("config", help="Inspect or create DRIPP config files.")
+    config_parser = subparsers.add_parser(
+        "config", help="Inspect or create DRIPP config files."
+    )
     config_sub = config_parser.add_subparsers(dest="config_command", required=True)
 
-    show_parser = config_sub.add_parser("show", help="Show the active DRIPP configuration.")
+    show_parser = config_sub.add_parser(
+        "show", help="Show the active DRIPP configuration."
+    )
     show_parser.set_defaults(func=cmd_config_show)
 
-    init_parser = config_sub.add_parser("init", help="Write a commented dripp.ini template.")
-    init_parser.add_argument("--path", default="dripp.ini", help="Destination config path.")
-    init_parser.add_argument("--force", action="store_true", help="Overwrite an existing file.")
+    init_parser = config_sub.add_parser(
+        "init", help="Write a commented dripp.ini template."
+    )
+    init_parser.add_argument(
+        "--path", default="dripp.ini", help="Destination config path."
+    )
+    init_parser.add_argument(
+        "--force", action="store_true", help="Overwrite an existing file."
+    )
     init_parser.set_defaults(func=cmd_config_init)
 
-    datasets_parser = subparsers.add_parser("datasets", help="Inspect configured datasets.")
-    datasets_sub = datasets_parser.add_subparsers(dest="datasets_command", required=True)
-    list_parser = datasets_sub.add_parser("list", help="List datasets from the configured CSV.")
+    datasets_parser = subparsers.add_parser(
+        "datasets", help="Inspect configured datasets."
+    )
+    datasets_sub = datasets_parser.add_subparsers(
+        dest="datasets_command", required=True
+    )
+    list_parser = datasets_sub.add_parser(
+        "list", help="List datasets from the configured CSV."
+    )
     list_parser.set_defaults(func=cmd_datasets_list)
 
-    index_parser = subparsers.add_parser("index", help="Index one dataset or all datasets.")
+    index_parser = subparsers.add_parser(
+        "index", help="Index one dataset or all datasets."
+    )
     index_group = index_parser.add_mutually_exclusive_group(required=True)
     index_group.add_argument("--dataset", help="Dataset name to index.")
     index_group.add_argument("--all", action="store_true", help="Index all datasets.")
     index_parser.set_defaults(func=cmd_index)
 
-    preprocess_parser = subparsers.add_parser("preprocess", help="Preprocess one dataset or all datasets.")
+    preprocess_parser = subparsers.add_parser(
+        "preprocess", help="Preprocess one dataset or all datasets."
+    )
     preprocess_group = preprocess_parser.add_mutually_exclusive_group(required=True)
     preprocess_group.add_argument("--dataset", help="Dataset name to preprocess.")
-    preprocess_group.add_argument("--all", action="store_true", help="Preprocess all datasets.")
-    preprocess_parser.add_argument("--start-at", help="Dataset name to resume from when using --all.")
-    preprocess_parser.add_argument("--max-groups", type=int, default=0, help="Maximum groups per split; 0 means no limit.")
-    preprocess_parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration for this run.")
+    preprocess_group.add_argument(
+        "--all", action="store_true", help="Preprocess all datasets."
+    )
+    preprocess_parser.add_argument(
+        "--start-at", help="Dataset name to resume from when using --all."
+    )
+    preprocess_parser.add_argument(
+        "--max-groups",
+        type=int,
+        default=0,
+        help="Maximum groups per split; 0 means no limit.",
+    )
+    preprocess_parser.add_argument(
+        "--gpu", action="store_true", help="Enable GPU acceleration for this run."
+    )
     preprocess_parser.set_defaults(func=cmd_preprocess)
 
     debugger_parser = subparsers.add_parser("debugger", help="Launch the Tk debugger.")
@@ -228,8 +397,19 @@ def build_parser():
 
 
 def main(argv=None):
+    """
+    Parse command-line options and invoke the selected command.
+
+    Args:
+        argv (list[str] | None): Argument tokens to parse, or None to read the process
+            command line.
+
+    Returns:
+        int: Exit status returned by the command handler.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
+
     return args.func(args)
 
 

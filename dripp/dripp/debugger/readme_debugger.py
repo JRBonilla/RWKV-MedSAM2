@@ -1,4 +1,6 @@
-"""README viewer tab for the DRIPP debugger app."""
+"""
+README viewer tab for the DRIPP debugger app.
+"""
 
 import tkinter.font as tkfont
 import webbrowser
@@ -9,12 +11,6 @@ from .common import *
 class ReadmeDebuggerMixin:
     """
     Provide a rich README viewer tab for the debugger app.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
 
     def _readme_path(self):
@@ -158,6 +154,7 @@ class ReadmeDebuggerMixin:
         except OSError:
             self._show_readme_not_found()
             self.readme_text.configure(state="disabled")
+
             return
 
         self._render_readme_markdown(content)
@@ -254,13 +251,16 @@ class ReadmeDebuggerMixin:
             r"(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[[^\]]+\]\([^)]+\))"
         )
         pos = 0
+
         for match in pattern.finditer(text):
             if match.start() > pos:
-                self.readme_text.insert(tk.END, text[pos:match.start()], base_tags)
+                self.readme_text.insert(tk.END, text[pos : match.start()], base_tags)
 
             token = match.group(0)
             if token.startswith("`"):
-                self.readme_text.insert(tk.END, token[1:-1], base_tags + ("inline_code",))
+                self.readme_text.insert(
+                    tk.END, token[1:-1], base_tags + ("inline_code",)
+                )
             elif token.startswith("**"):
                 self.readme_text.insert(tk.END, token[2:-2], base_tags + ("bold",))
             elif token.startswith("*"):

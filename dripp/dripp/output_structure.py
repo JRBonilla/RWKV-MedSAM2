@@ -1,9 +1,10 @@
-"""Output folder structure rendering for DRIPP preprocessing."""
+"""
+Output folder structure rendering for DRIPP preprocessing.
+"""
 
 import os
 import re
 import string
-
 
 DEFAULT_GROUP_FOLDER_TEMPLATE = "{dataset}/{modality}/{subdataset}/{split}/{id_parts}"
 DEFAULT_IMAGES_FOLDER = "images"
@@ -20,23 +21,56 @@ SUPPORTED_OUTPUT_STRUCTURE_TOKENS = {
 
 
 class OutputStructureError(ValueError):
-    """Raised when an output structure setting cannot be rendered safely."""
+    """
+    Raised when an output structure setting cannot be rendered safely.
+    """
 
 
 def _path_parts(value):
+    """
+    Split a relative folder expression on either path separator.
+
+    Args:
+        value (str): Setting or cell value to normalize, validate, or format.
+
+    Returns:
+        list[str]: Nonempty path segments in their original order.
+    """
     return [part for part in re.split(r"[\\/]+", str(value).strip()) if part]
 
 
 def _normalize_relative_path(parts):
+    """
+    Join path segments and normalize separators for metadata storage.
+
+    Args:
+        parts (list[str]): Relative folder segments to join or validate.
+
+    Returns:
+        str: Normalized relative path using forward slashes, or an empty string for no
+            parts.
+    """
     return os.path.normpath(os.path.join(*parts)).replace("\\", "/") if parts else ""
 
 
 def _validate_relative_parts(parts, label):
+    """
+    Reject empty paths and segments that escape the relative output structure.
+
+    Args:
+        parts (list[str]): Relative folder segments to join or validate.
+        label (str): Display label used in the editor or validation error messages.
+
+    Returns:
+        None.
+    """
     if not parts:
         raise OutputStructureError(f"{label} cannot be empty.")
     for part in parts:
         if part in {".", ".."}:
-            raise OutputStructureError(f"{label} cannot contain '.' or '..' path segments.")
+            raise OutputStructureError(
+                f"{label} cannot contain '.' or '..' path segments."
+            )
         if os.path.isabs(part):
             raise OutputStructureError(f"{label} must be relative.")
 
@@ -64,6 +98,7 @@ def validate_leaf_folder(value, label):
     _validate_relative_parts(parts, label)
     if len(parts) != 1:
         raise OutputStructureError(f"{label} must be a single folder name.")
+
     return parts[0]
 
 
@@ -83,7 +118,9 @@ def validate_group_folder_template(template):
     if os.path.isabs(raw):
         raise OutputStructureError("Group Folder Template must be relative.")
     if re.search(r"(^|[\\/])($|[\\/])", raw):
-        raise OutputStructureError("Group Folder Template cannot contain empty path segments.")
+        raise OutputStructureError(
+            "Group Folder Template cannot contain empty path segments."
+        )
 
     formatter = string.Formatter()
     try:
@@ -95,32 +132,64 @@ def validate_group_folder_template(template):
         if field_name is None:
             continue
         if _format_spec or _conversion:
-            raise OutputStructureError("Group Folder Template tokens cannot use format specifiers.")
+            raise OutputStructureError(
+                "Group Folder Template tokens cannot use format specifiers."
+            )
         if field_name not in SUPPORTED_OUTPUT_STRUCTURE_TOKENS:
-            allowed = ", ".join(f"{{{token}}}" for token in sorted(SUPPORTED_OUTPUT_STRUCTURE_TOKENS))
+            allowed = ", ".join(
+                f"{{{token}}}" for token in sorted(SUPPORTED_OUTPUT_STRUCTURE_TOKENS)
+            )
             raise OutputStructureError(
                 f"Unknown token '{{{field_name}}}' in Group Folder Template. Supported tokens: {allowed}."
             )
 
     parts = _path_parts(raw)
     _validate_relative_parts(parts, "Group Folder Template")
+
     return "/".join(parts)
 
 
 def _render_template_segment(segment, context):
+    """
+    Resolve a folder-template segment and omit empty substitutions.
+
+    Args:
+        segment (str): Filename tag or folder-template segment to select or render.
+        context (dict[str, str]): Resolved placeholder values used to render the
+            template or filename.
+
+    Returns:
+        list[str]: Rendered path segments, or an empty list when the substitution is
+            empty.
+    """
     try:
         rendered = segment.format(**context)
     except KeyError as exc:
-        raise OutputStructureError(f"Unknown token '{{{exc.args[0]}}}' in Group Folder Template.") from exc
+        raise OutputStructureError(
+            f"Unknown token '{{{exc.args[0]}}}' in Group Folder Template."
+        ) from exc
     if not rendered.strip():
         return []
+
     return _path_parts(rendered)
 
 
 def _id_parts(composite_id, split):
+    """
+    Split a composite identifier while removing its leading split prefix.
+
+    Args:
+        composite_id (str): Stable composite group identifier used for pairing and
+            output naming.
+        split (str): Dataset split associated with the source identifier.
+
+    Returns:
+        list[str]: Identifier components used to build nested group folders.
+    """
     parts = str(composite_id).split("_")
     if parts and parts[0] == split:
         parts = parts[1:]
+
     return parts or [str(composite_id)]
 
 
@@ -168,16 +237,23 @@ def render_output_dirs(
     }
 
     rendered_parts = []
+
     for segment in template.split("/"):
         rendered_parts.extend(_render_template_segment(segment, context))
+
     _validate_relative_parts(rendered_parts, "Rendered Group Folder Template")
 
     group_rel = _normalize_relative_path(rendered_parts)
     group_dir = os.path.normpath(os.path.join(base_proc, group_rel)).replace("\\", "/")
+
     return {
         "group_dir": group_dir,
-        "img_out_dir": os.path.normpath(os.path.join(group_dir, image_leaf)).replace("\\", "/"),
-        "mask_out_dir": os.path.normpath(os.path.join(group_dir, mask_leaf)).replace("\\", "/"),
+        "img_out_dir": os.path.normpath(os.path.join(group_dir, image_leaf)).replace(
+            "\\", "/"
+        ),
+        "mask_out_dir": os.path.normpath(os.path.join(group_dir, mask_leaf)).replace(
+            "\\", "/"
+        ),
     }
 
 
@@ -193,6 +269,22 @@ def render_preview(
 ):
     """
     Render example image and mask paths for settings preview text.
+
+    Args:
+        group_folder_template (str): Relative output folder template containing
+            supported placeholder fields.
+        images_folder (str): Leaf folder name for processed images.
+        masks_folder (str): Leaf folder name for processed masks.
+        dataset_name (str): Name of the dataset being indexed, processed, or rendered.
+        modality (str): Image modality used for filtering or modality-specific
+            normalization.
+        subdataset_name (str | None): Subdataset name to resolve, or None for an unnamed
+            group.
+        split (str): Dataset split associated with the source identifier.
+        identifier (str): Source identifier used by the output-path preview.
+
+    Returns:
+        tuple[str, str]: Relative image and mask directory paths.
     """
     dirs = render_output_dirs(
         "",
@@ -205,4 +297,5 @@ def render_preview(
         images_folder,
         masks_folder,
     )
+
     return dirs["img_out_dir"].lstrip("/"), dirs["mask_out_dir"].lstrip("/")

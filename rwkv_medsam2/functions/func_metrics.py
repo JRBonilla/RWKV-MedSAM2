@@ -1,15 +1,16 @@
-# Metric, loss, and aggregation helpers for RWKV-MedSAM2.
-#
-# Includes task/modality aggregators, segmentation losses, Dice/IoU, HD95,
-# calibration metrics, AUC helpers, and prompt geometry utilities.
+"""
+Compute segmentation losses and metrics and aggregate task and modality results.
+"""
+
 import torch
 import json
-import cupy as cp # type: ignore
+import cupy as cp  # type: ignore
 import numpy as np
-from cupyx.scipy.ndimage import distance_transform_edt, binary_erosion # type: ignore
+from cupyx.scipy.ndimage import distance_transform_edt, binary_erosion  # type: ignore
 import torch.nn.functional as F
 from collections import defaultdict
 from typing import Any, List, Dict, Optional
+
 
 class TaskAggregator:
     """
@@ -22,12 +23,13 @@ class TaskAggregator:
     Accepts either a flat id->label map, a full catalog (with classes/datasets),
     or a file path to a JSON containing either structure.
     """
+
     def __init__(self, tasks_map: Optional[Dict[str, Any] | str] = None):
         """
         Initialize task display labels and running aggregate stores.
 
         Args:
-            tasks_map (dict | str | None): Task label mapping or JSON file path.
+            tasks_map (Optional[Dict[str, Any] | str]): Task label mapping or JSON file path.
 
         Returns:
             None.
@@ -50,13 +52,18 @@ class TaskAggregator:
         self.cnt: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
         # Per-task 2D/3D item counts (for percentage reporting)
-        self.dim_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"2d": 0, "3d": 0})
+        self.dim_counts: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: {"2d": 0, "3d": 0}
+        )
 
         # Keys averaged with volume weight
         self._vol_keys = {
-            'iou3d@0.5', 'dice3d@0.5',
-            'iou3d@best', 'dice3d@best',
-            'iou3d@best_vol', 'dice3d@best_vol'
+            "iou3d@0.5",
+            "dice3d@0.5",
+            "iou3d@best",
+            "dice3d@best",
+            "iou3d@best_vol",
+            "dice3d@best_vol",
         }
 
     @staticmethod
@@ -69,23 +76,27 @@ class TaskAggregator:
           otherwise prettify the key (underscores -> spaces).
 
         Args:
-            raw (dict[str, Any]): Raw task or modality mapping.
+            raw (Dict[str, Any]): Raw task or modality mapping.
 
         Returns:
             dict[str, str]: Display-label mapping keyed by id.
         """
         if not raw:
             return {}
+
         first_val = next(iter(raw.values()))
         if isinstance(first_val, str):
             return {str(k): str(v) for k, v in raw.items()}
+
         disp: Dict[str, str] = {}
         for k, v in raw.items():
             if isinstance(v, dict) and isinstance(v.get("label"), str):
                 label = v["label"]
             else:
                 label = str(k).replace("_", " ")
+
             disp[str(k)] = label
+
         return disp
 
     def label_for(self, task_id_or_label: Any) -> str:
@@ -102,6 +113,7 @@ class TaskAggregator:
             return "unknown"
         if isinstance(task_id_or_label, dict):
             return "unknown"
+
         tid = str(task_id_or_label)
         return self._display_map.get(tid, tid)
 
@@ -119,23 +131,24 @@ class TaskAggregator:
         Update aggregates for a task.
 
         Args:
-            task_label: human-friendly label (bucket id is fine)
-            metrics: dict of metric_name -> value
-            slice_weight: weight for slice-based metrics (usually #valid frames)
-            vol_weight: weight for volume-based metrics (usually #volumes)
-            dim: 2 or 3 for this batch (used only for 2d%/3d% reporting)
-            n_items: how many items contributed in this update call
-                     (e.g., batch size). If not given, counts as 1.
+            task_label (str): Task label or bucket identifier to update.
+            metrics (Dict[str, float]): Metric names mapped to observed scalar values.
+            slice_weight (int): Weight for slice-based metrics (usually #valid frames).
+            vol_weight (int): Weight for volume-based metrics (usually #volumes).
+            dim (Optional[int]): Batch dimensionality for the 2D/3D composition counts.
+            n_items (Optional[int]): Number of contributing items for dimensionality counts;
+                defaults to one.
 
         Returns:
             None.
         """
         # --- Update metrics ---
         for k, v in metrics.items():
-            if k in ('n', 'best_thr', 'best_thr3d', 'n_vol'):
+            if k in ("n", "best_thr", "best_thr3d", "n_vol"):
                 continue
             if not isinstance(v, (int, float)):
                 continue
+
             w = vol_weight if (k in self._vol_keys) else slice_weight
             self.sum[task_label][k] += float(v) * float(w)
             self.cnt[task_label][k] += float(w)
@@ -161,6 +174,7 @@ class TaskAggregator:
         out: Dict[str, Dict[str, float]] = {}
         for task, kv in self.sum.items():
             out[task] = {k: (kv[k] / max(1.0, self.cnt[task][k])) for k in kv.keys()}
+
         return out
 
     def log_to_tensorboard(self, writer, epoch: int, split: str = "val"):
@@ -192,7 +206,7 @@ class TaskAggregator:
         Render a fixed-width aligned table. If show_dim_pct=True, includes 2d% / 3d%.
 
         Args:
-            top_keys (list[str] | None): Metric columns to include.
+            top_keys (Optional[List[str]]): Metric columns to include.
             decimals (int): Number of decimal places.
             fenced (bool): Whether to wrap the table in a Markdown code fence.
             fence_lang (str): Code-fence language tag.
@@ -206,12 +220,20 @@ class TaskAggregator:
             return "No per-task metrics."
 
         if top_keys is None:
-            top_keys = ['dice_best', 'iou_best', 'dice@0.5', 'iou@0.5', 'pr_auc', 'roc_auc']
+            top_keys = [
+                "dice_best",
+                "iou_best",
+                "dice@0.5",
+                "iou@0.5",
+                "pr_auc",
+                "roc_auc",
+            ]
 
         # Build header
-        header = ['task']
+        header = ["task"]
         if show_dim_pct:
-            header += ['2d%', '3d%']
+            header += ["2d%", "3d%"]
+
         header += top_keys
 
         # Build rows (strings)
@@ -223,6 +245,7 @@ class TaskAggregator:
                 dc = self.dim_counts.get(task, {"2d": 0, "3d": 0})
                 n2d, n3d = int(dc.get("2d", 0)), int(dc.get("3d", 0))
                 tot = n2d + n3d
+
                 if tot > 0:
                     p2d = 100.0 * n2d / tot
                     p3d = 100.0 * n3d / tot
@@ -233,6 +256,7 @@ class TaskAggregator:
             for k in top_keys:
                 v = per_task.get(task, {}).get(k, 0.0)
                 row.append(f"{float(v):.{decimals}f}")
+
             rows.append(row)
 
         # Compute column widths
@@ -243,11 +267,20 @@ class TaskAggregator:
 
         # Format one row (left align col 0, right align rest)
         def fmt_row(cells: List[str]) -> str:
-            """Format one aligned table row."""
+            """
+            Format one aligned table row.
+
+            Args:
+                cells (List[str]): Formatted values for the table columns.
+
+            Returns:
+                str: Padded table row with two spaces between columns.
+            """
             parts = []
             for j, cell in enumerate(cells):
                 w = col_widths[j]
                 parts.append(cell.ljust(w) if j == 0 else cell.rjust(w))
+
             return "  ".join(parts)
 
         # Build table text
@@ -255,15 +288,19 @@ class TaskAggregator:
         lines.append(fmt_row(["-" * w for w in col_widths]))
         for row in rows:
             lines.append(fmt_row(row))
+
         table = "\n".join(lines)
 
         # Wrap in a code fence so TensorBoard uses monospace
         if fenced:
             return f"```{fence_lang}\n{table}\n```"
+
         return table
 
+
 class ModalityAggregator(TaskAggregator):
-    """Keeps weighted running averages of metrics per imaging modality.
+    """
+    Keeps weighted running averages of metrics per imaging modality.
 
     This behaves like TaskAggregator but uses modality labels
     (for example "ct", "mri", "us") as the keys. It also tracks how many
@@ -276,7 +313,8 @@ class ModalityAggregator(TaskAggregator):
         Initialize modality display labels and aggregate stores.
 
         Args:
-            modalities_map (dict | str | None): Modality label mapping or JSON file path.
+            modalities_map (Optional[Dict[str, Any] | str]): Modality label mapping or JSON file
+                path.
 
         Returns:
             None.
@@ -321,7 +359,7 @@ class ModalityAggregator(TaskAggregator):
         modality's metrics, analogous to TaskAggregator.format_text_table.
 
         Args:
-            top_keys (list[str] | None): Metric columns to include.
+            top_keys (Optional[List[str]]): Metric columns to include.
             decimals (int): Number of decimal places.
             fenced (bool): Whether to wrap the table in a Markdown code fence.
             fence_lang (str): Code-fence language tag.
@@ -335,12 +373,20 @@ class ModalityAggregator(TaskAggregator):
             return "No per-modality metrics."
 
         if top_keys is None:
-            top_keys = ['dice_best', 'iou_best', 'dice@0.5', 'iou@0.5', 'pr_auc', 'roc_auc']
+            top_keys = [
+                "dice_best",
+                "iou_best",
+                "dice@0.5",
+                "iou@0.5",
+                "pr_auc",
+                "roc_auc",
+            ]
 
         # Header row
-        header = ['modality']
+        header = ["modality"]
         if show_dim_pct:
-            header += ['2d%', '3d%']
+            header += ["2d%", "3d%"]
+
         header += top_keys
 
         # Build rows
@@ -351,6 +397,7 @@ class ModalityAggregator(TaskAggregator):
                 dc = self.dim_counts.get(mod, {"2d": 0, "3d": 0})
                 n2d, n3d = int(dc.get("2d", 0)), int(dc.get("3d", 0))
                 tot = n2d + n3d
+
                 if tot > 0:
                     p2d = 100.0 * n2d / tot
                     p3d = 100.0 * n3d / tot
@@ -365,6 +412,7 @@ class ModalityAggregator(TaskAggregator):
                     row.append(f"{float(v):.{decimals}f}")
                 else:
                     row.append("nan")
+
             rows.append(row)
 
         # Column widths
@@ -374,22 +422,34 @@ class ModalityAggregator(TaskAggregator):
         ]
 
         def fmt_row(cells: List[str]) -> str:
-            """Format one aligned table row."""
+            """
+            Format one aligned table row.
+
+            Args:
+                cells (List[str]): Formatted values for the table columns.
+
+            Returns:
+                str: Padded table row with two spaces between columns.
+            """
             parts = []
             for j, cell in enumerate(cells):
                 w = col_widths[j]
                 parts.append(cell.ljust(w) if j == 0 else cell.rjust(w))
+
             return "  ".join(parts)
 
         lines = [fmt_row(header)]
         lines.append(fmt_row(["-" * w for w in col_widths]))
         for row in rows:
             lines.append(fmt_row(row))
+
         table = "\n".join(lines)
 
         if fenced:
             return f"```{fence_lang}\n{table}\n```"
+
         return table
+
 
 def safe_float(x):
     """
@@ -408,14 +468,22 @@ def safe_float(x):
     if torch.is_tensor(x):
         if x.numel() == 1:
             return float(x.detach().float().item())
+
         return None
     try:
         return float(x)
     except Exception:
         return None
 
+
 @torch.jit.script
-def tversky_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 0.3, beta:  float = 0.7, smooth: float = 1.0) -> torch.Tensor:
+def tversky_loss_from_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    smooth: float = 1.0,
+) -> torch.Tensor:
     """
     Asymmetric Tversky loss (Dice generalization) computed from logits.
     alpha weights FP, beta weights FN. For tiny FG, beta > alpha helps recall.
@@ -439,34 +507,42 @@ def tversky_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, alpha:
     fn = ((1.0 - p) * g).sum(dim=1)
 
     tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+
     return (1.0 - tversky).mean()
 
+
 @torch.jit.script
-def soft_dice_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def soft_dice_loss_from_logits(
+    logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
     """
     Computes the soft Dice loss between the output probabilities of a binary
     classification model and the corresponding ground truth labels. The loss is
     computed as 1 - (2 * intersection + eps) / (sum of probabilities + eps)
 
     Args:
-        logits (torch.Tensor): The output logits of a binary classification model
-        targets (torch.Tensor): The ground truth labels
-        eps (float, optional): Epsilon value to avoid division by zero. Defaults to 1e-6
+        logits (torch.Tensor): The output logits of a binary classification model.
+        targets (torch.Tensor): The ground truth labels.
+        eps (float): Epsilon value to avoid division by zero. Defaults to 1e-6.
 
     Returns:
-        torch.Tensor: The soft Dice loss
+        torch.Tensor: The soft Dice loss.
     """
     probs = torch.sigmoid(logits)
     # Flatten over all non-batch dims to avoid dynamic dim tuples in TorchScript
-    probs_f   = probs.reshape(probs.size(0), -1)
+    probs_f = probs.reshape(probs.size(0), -1)
     targets_f = targets.to(probs.dtype).reshape(targets.size(0), -1)
     inter = (probs_f * targets_f).sum(dim=1)
     denom = probs_f.sum(dim=1) + targets_f.sum(dim=1) + eps
-    dice  = (2.0 * inter + eps) / denom
+    dice = (2.0 * inter + eps) / denom
+
     return (1.0 - dice).mean()
 
+
 @torch.jit.script
-def binary_focal_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0, alpha: float = -1.0) -> torch.Tensor:
+def binary_focal_loss_with_logits(
+    logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0, alpha: float = -1.0
+) -> torch.Tensor:
     """
     Computes the binary focal loss between the output probabilities of a binary
     classification model and the corresponding ground truth labels. The loss is
@@ -475,28 +551,31 @@ def binary_focal_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, g
     weighting the positive and negative classes differently.
 
     Args:
-        logits (torch.Tensor): The output logits of a binary classification model
-        targets (torch.Tensor): The ground truth labels
-        gamma (float, optional): The power to which the probability of the true
+        logits (torch.Tensor): The output logits of a binary classification model.
+        targets (torch.Tensor): The ground truth labels.
+        gamma (float): The power to which the probability of the true
             class is raised. Defaults to 2.0
-        alpha (float, optional): The weighting factor for the positive class if
+        alpha (float): The weighting factor for the positive class if
             alpha >= 0.0. Defaults to -1.0, which disables weighting.
 
     Returns:
-        torch.Tensor: The binary focal loss
+        torch.Tensor: The binary focal loss.
     """
     # Base BCE per-element
-    t    = targets.to(logits.dtype)
-    bce  = F.binary_cross_entropy_with_logits(logits, t, reduction='none')
-    p    = torch.sigmoid(logits)
-    p_t  = torch.where(t > 0, p, 1.0 - p)
+    t = targets.to(logits.dtype)
+    bce = F.binary_cross_entropy_with_logits(logits, t, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = torch.where(t > 0, p, 1.0 - p)
     loss = (1.0 - p_t).pow(gamma) * bce
+
     # Optional alpha balancing without creating new tensors in TorchScript
     if alpha >= 0.0:
         pos = loss * alpha
         neg = loss * (1.0 - alpha)
         loss = torch.where(t > 0, pos, neg)
+
     return loss.mean()
+
 
 def compute_hd95(pred_mask: torch.Tensor, gt_mask: torch.Tensor, spacing=None) -> float:
     """
@@ -517,27 +596,41 @@ def compute_hd95(pred_mask: torch.Tensor, gt_mask: torch.Tensor, spacing=None) -
     Returns:
         float: The 95th percentile of the Hausdorff Distance between the two masks.
     """
-    assert pred_mask.shape == gt_mask.shape, "pred_mask and gt_mask must have the same shape"
+    assert (
+        pred_mask.shape == gt_mask.shape
+    ), "pred_mask and gt_mask must have the same shape"
     x, y = pred_mask, gt_mask
     ndim = x.ndim
+
     if spacing is None:
         spacing = (1.0,) * ndim
+
     spacing = tuple(float(s) for s in spacing)
 
     # Check for empty masks
     p_any = bool((x != 0).any().item())
     g_any = bool((y != 0).any().item())
+
     if not p_any and not g_any:
         return 0.0
     if p_any ^ g_any:
-        return float('nan')
+        return float("nan")
 
     # Helper to convert torch.Tensor to cupy.ndarray
     def _to_cupy_bool(t: torch.Tensor) -> "cp.ndarray":
-        """Convert a tensor mask to a CuPy boolean array."""
+        """
+        Convert a tensor mask to a CuPy boolean array.
+
+        Args:
+            t (torch.Tensor): Stored frame index.
+
+        Returns:
+            cp.ndarray: GPU boolean mask, using DLPack for CUDA tensors.
+        """
         t = (t != 0).to(torch.uint8).contiguous()
         if t.is_cuda:
             return cp.from_dlpack(torch.utils.dlpack.to_dlpack(t)).astype(cp.bool_)
+
         return cp.asarray(t.cpu().numpy(), dtype=cp.bool_)
 
     # Convert to cupy
@@ -548,7 +641,7 @@ def compute_hd95(pred_mask: torch.Tensor, gt_mask: torch.Tensor, spacing=None) -
     if int(pm.sum()) == 0 and int(gm.sum()) == 0:
         return 0.0
     if int(pm.sum()) == 0 or int(gm.sum()) == 0:
-        return float('nan')
+        return float("nan")
 
     # Compute surface (zeros at surface)
     se = cp.ones((3,) * pm.ndim, dtype=cp.bool_)
@@ -575,6 +668,7 @@ def compute_hd95(pred_mask: torch.Tensor, gt_mask: torch.Tensor, spacing=None) -
 
     return float(cp.asnumpy(d95))
 
+
 def dice_iou(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-8):
     """
     Compute Dice and IoU for flattened binary masks.
@@ -595,7 +689,9 @@ def dice_iou(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-8):
     dice = (2 * inter + eps) / (ps + gs + eps)
     union = ps + gs - inter
     iou = (inter + eps) / (union + eps)
+
     return float(dice.item()), float(iou.item())
+
 
 def ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
     """
@@ -611,16 +707,24 @@ def ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
     """
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     e = 0.0
+
     for i in range(n_bins):
         lo, hi = bins[i], bins[i + 1]
-        m = (probs >= lo) & (probs < hi) if i < n_bins - 1 else (probs >= lo) & (probs <= hi)
+        m = (
+            (probs >= lo) & (probs < hi)
+            if i < n_bins - 1
+            else (probs >= lo) & (probs <= hi)
+        )
         if not np.any(m):
             continue
+
         conf = float(np.mean(probs[m]))
         acc = float(np.mean(labels[m]))
         w = float(np.mean(m))
         e += w * abs(acc - conf)
+
     return float(e)
+
 
 def try_auc(y_true: np.ndarray, y_score: np.ndarray):
     """
@@ -638,11 +742,14 @@ def try_auc(y_true: np.ndarray, y_score: np.ndarray):
 
         if len(np.unique(y_true)) <= 1:
             return float("nan"), float("nan")
+
         roc = float(roc_auc_score(y_true, y_score))
         pr = float(average_precision_score(y_true, y_score))
+
         return roc, pr
     except Exception:
         return float("nan"), float("nan")
+
 
 def fg_bin(fg_frac: float) -> str:
     """
@@ -660,7 +767,9 @@ def fg_bin(fg_frac: float) -> str:
         return "fg0.05-0.2%"
     if fg_frac < 0.01:
         return "fg0.2-1%"
+
     return "fg>1%"
+
 
 def sigmoid_np(logits: np.ndarray) -> np.ndarray:
     """
@@ -683,6 +792,7 @@ def sigmoid_np(logits: np.ndarray) -> np.ndarray:
 
     return out
 
+
 def bbox_from_mask(mask_hw: torch.Tensor, pad: int = 5):
     """
     Build an XYXY bounding box from a 2D binary mask.
@@ -697,8 +807,10 @@ def bbox_from_mask(mask_hw: torch.Tensor, pad: int = 5):
     ys, xs = torch.nonzero(mask_hw, as_tuple=True)
     if ys.numel() == 0:
         return None
+
     y0 = max(int(ys.min().item()) - pad, 0)
     y1 = min(int(ys.max().item()) + pad, int(mask_hw.shape[0]) - 1)
     x0 = max(int(xs.min().item()) - pad, 0)
     x1 = min(int(xs.max().item()) + pad, int(mask_hw.shape[1]) - 1)
+
     return torch.tensor([x0, y0, x1, y1], dtype=torch.float32, device=mask_hw.device)

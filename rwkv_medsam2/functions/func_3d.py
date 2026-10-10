@@ -1,7 +1,6 @@
-# Per-batch 3D-as-sequence training and validation steps for RWKV-MedSAM2.
-#
-# Uses dataset-provided prompts, optional teacher distillation, and SAM2 video
-# propagation over volume slices.
+"""
+Train and validate volumes as slice sequences with SAM2 propagation and optional distillation.
+"""
 
 import math
 import torch
@@ -13,6 +12,7 @@ from .func_metrics import (
     binary_focal_loss_with_logits,
     safe_float,
 )
+
 
 def train_step_3d(
     student,
@@ -37,65 +37,89 @@ def train_step_3d(
         batch (dict): Collated 3D sequence batch.
         config (OmegaConf.DictConfig): Training configuration.
         scaler (object | None): AMP scaler placeholder; bf16 autocast is used directly.
+        zero_grad (bool): Whether to clear existing gradients before processing the batch.
+        synchronize (bool): Whether to average gradients across distributed ranks after
+            backward.
+        clip_gradients (bool): Whether to clip gradients before the optimizer update.
+        optimizer_step (bool): Whether to update parameters after accumulating gradients.
 
     Returns:
         dict: Step status, aggregate losses, and skip diagnostics on failure.
     """
-    device      = config.training.device
-    out_size    = int(config.training.out_size)
+    device = config.training.device
+    out_size = int(config.training.out_size)
 
     # Loss weights
-    bce_w    = float(getattr(config.training, "bce_weight", 0.5))
-    dice_w   = float(getattr(config.training, "dice_weight", 1.0))
-    focal_w  = float(getattr(config.training, "focal_weight", 0.0))
-    f_gamma  = float(getattr(config.training, "focal_gamma", 2.0))
-    f_alpha  = float(getattr(config.training, "focal_alpha", -1.0))
+    bce_w = float(getattr(config.training, "bce_weight", 0.5))
+    dice_w = float(getattr(config.training, "dice_weight", 1.0))
+    focal_w = float(getattr(config.training, "focal_weight", 0.0))
+    f_gamma = float(getattr(config.training, "focal_gamma", 2.0))
+    f_alpha = float(getattr(config.training, "focal_alpha", -1.0))
 
     # Distillation heavy
-    lam_base   = float(getattr(config.training, "lambda_distill_3d", 0.0))
+    lam_base = float(getattr(config.training, "lambda_distill_3d", 0.0))
     heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
-    lam        = lam_base * heavy_mult
+    lam = lam_base * heavy_mult
     use_teacher = teacher is not None and lam > 0.0
-    tau        = float(getattr(config.training, "distill_temperature", 1.0))
+    tau = float(getattr(config.training, "distill_temperature", 1.0))
 
     # Clip controls
-    posw_max   = float(getattr(config.training, "pos_weight_max", 8.0))
+    posw_max = float(getattr(config.training, "pos_weight_max", 8.0))
     logit_clip = float(getattr(config.training, "logit_clip", 12.0))
     frame_clip = float(getattr(config.training, "frame_loss_clip", 5.0))
 
     # Nonprompt scaling: fixed, single config value (no override)
     nonprompt_sf = float(getattr(config.training, "nonprompt_scale", 1.0))
 
-    imgs_seq  = batch["image"]  # [B,T,C,H,W]
-    masks_seq = batch["mask"]   # [B,T,1,H,W]
+    imgs_seq = batch["image"]  # [B,T,C,H,W]
+    masks_seq = batch["mask"]  # [B,T,1,H,W]
     B, T, C, H, W = imgs_seq.shape
 
-    raw_pt  = batch["pt_list"]
-    raw_lb  = batch["p_label"]
+    raw_pt = batch["pt_list"]
+    raw_lb = batch["p_label"]
     raw_box = batch["bbox"]
     raw_mpr = batch.get("m_prompt", None)
 
     student.train()
+
     if use_teacher:
         teacher.eval()
     if zero_grad:
         optimizer.zero_grad(set_to_none=True)
 
     def _zero_like_param():
-        """Return a graph-connected zero scalar."""
+        """
+        Return a graph-connected zero scalar.
+
+        Args:
+            None.
+
+        Returns:
+            torch.Tensor: Graph-connected zero scalar.
+        """
         try:
             return next(student.parameters()).sum() * 0.0
         except StopIteration:
             return imgs_seq.sum() * 0.0
 
     def _has_any_prompt(i, b):
-        """Return whether a frame has any prompt."""
+        """
+        Return whether a frame has any prompt.
+
+        Args:
+            i (int): Sequence frame index.
+            b (int): Batch sample index.
+
+        Returns:
+            bool: Whether point, box, or mask input is present.
+        """
         pts = raw_pt[i][b]
-        bx  = raw_box[i][b]
-        mp  = (raw_mpr[i][b] if raw_mpr is not None else None)
-        has_pts = (pts is not None and hasattr(pts, "numel") and pts.numel() > 0)
-        has_box = (bx  is not None and hasattr(bx,  "numel") and bx.numel() == 4)
-        has_msk = (mp  is not None and hasattr(mp,  "numel") and mp.numel() > 0)
+        bx = raw_box[i][b]
+        mp = raw_mpr[i][b] if raw_mpr is not None else None
+        has_pts = pts is not None and hasattr(pts, "numel") and pts.numel() > 0
+        has_box = bx is not None and hasattr(bx, "numel") and bx.numel() == 4
+        has_msk = mp is not None and hasattr(mp, "numel") and mp.numel() > 0
+
         return has_pts or has_box or has_msk
 
     seq_losses = []
@@ -104,20 +128,25 @@ def train_step_3d(
     seq_np_base = []
 
     for b in range(B):
-        imgs = imgs_seq[b].to(device=device, non_blocking=True)   # [T,C,H,W]
-        gts  = masks_seq[b].to(device=device, non_blocking=True)  # [T,1,H,W]
+        imgs = imgs_seq[b].to(device=device, non_blocking=True)  # [T,C,H,W]
+        gts = masks_seq[b].to(device=device, non_blocking=True)  # [T,1,H,W]
 
         if imgs.shape[1] == 1:
             imgs = imgs.repeat(1, 3, 1, 1)
 
         # Init states
-        train_state = student.init_state_from_tensor(imgs_tensor=imgs.contiguous(), mode="train")
+        train_state = student.init_state_from_tensor(
+            imgs_tensor=imgs.contiguous(), mode="train"
+        )
         train_state["storage_device"] = torch.device(device)
 
         teacher_state = None
+
         if use_teacher:
             with torch.no_grad():
-                teacher_state = teacher.init_state_from_tensor(imgs_tensor=imgs.contiguous(), mode="eval")
+                teacher_state = teacher.init_state_from_tensor(
+                    imgs_tensor=imgs.contiguous(), mode="eval"
+                )
                 teacher_state["storage_device"] = torch.device(device)
 
         # Base prompt frames from dataset ONLY
@@ -136,34 +165,67 @@ def train_step_3d(
         for t in prompt_idxs:
             pts = raw_pt[t][b]
             lbs = raw_lb[t][b]
-            bx  = raw_box[t][b]
-            mp  = (raw_mpr[t][b] if raw_mpr is not None else None)
+            bx = raw_box[t][b]
+            mp = raw_mpr[t][b] if raw_mpr is not None else None
 
-            has_pts = (pts is not None and hasattr(pts, "numel") and pts.numel() > 0)
-            has_box = (bx  is not None and hasattr(bx,  "numel") and bx.numel() == 4)
-            has_msk = (mp  is not None and hasattr(mp,  "numel") and mp.numel() > 0)
+            has_pts = pts is not None and hasattr(pts, "numel") and pts.numel() > 0
+            has_box = bx is not None and hasattr(bx, "numel") and bx.numel() == 4
+            has_msk = mp is not None and hasattr(mp, "numel") and mp.numel() > 0
 
             if has_pts:
                 p = pts.to(device).float()
                 l = lbs.to(device).long()
-                student.train_add_new_points_or_box(train_state, t, 0, points=p, labels=l, clear_old_points=False)
+                student.train_add_new_points_or_box(
+                    train_state, t, 0, points=p, labels=l, clear_old_points=False
+                )
+
                 if teacher_state is not None:
                     with torch.no_grad():
-                        teacher.add_new_points_or_box(teacher_state, t, 0, points=p, labels=l, clear_old_points=False)
+                        teacher.add_new_points_or_box(
+                            teacher_state,
+                            t,
+                            0,
+                            points=p,
+                            labels=l,
+                            clear_old_points=False,
+                        )
 
             elif has_box:
                 bb = bx.to(device).to(torch.int64).reshape(4)
                 ep = torch.empty((1, 0, 2), device=device, dtype=torch.float32)
-                el = torch.empty((1, 0),    device=device, dtype=torch.int64)
-                student.train_add_new_points_or_box(train_state, t, 0, points=ep, labels=el, box=bb, clear_old_points=True)
+                el = torch.empty((1, 0), device=device, dtype=torch.int64)
+                student.train_add_new_points_or_box(
+                    train_state,
+                    t,
+                    0,
+                    points=ep,
+                    labels=el,
+                    box=bb,
+                    clear_old_points=True,
+                )
+
                 if teacher_state is not None:
                     with torch.no_grad():
-                        teacher.add_new_points_or_box(teacher_state, t, 0, points=ep, labels=el, box=bb, clear_old_points=True)
+                        teacher.add_new_points_or_box(
+                            teacher_state,
+                            t,
+                            0,
+                            points=ep,
+                            labels=el,
+                            box=bb,
+                            clear_old_points=True,
+                        )
 
             elif has_msk:
                 mm = mp.to(device).float()
-                mm = F.interpolate(mm.unsqueeze(0), size=(H, W), mode="nearest").squeeze(0).squeeze(0).bool()
+                mm = (
+                    F.interpolate(mm.unsqueeze(0), size=(H, W), mode="nearest")
+                    .squeeze(0)
+                    .squeeze(0)
+                    .bool()
+                )
                 student.train_add_new_mask(train_state, t, 0, mm)
+
                 if teacher_state is not None:
                     with torch.no_grad():
                         teacher.add_new_mask(teacher_state, t, 0, mm)
@@ -172,13 +234,17 @@ def train_step_3d(
         s_preds = {}
         start = min(prompt_idxs)
 
-        for ti, _, mlog in student.train_propagate_in_video(train_state, start_frame_idx=start):
+        for ti, _, mlog in student.train_propagate_in_video(
+            train_state, start_frame_idx=start
+        ):
             s_preds[ti] = mlog[0]
 
         t_preds = {}
         if teacher_state is not None:
             with torch.no_grad():
-                for ti, _, mlog in teacher.propagate_in_video(teacher_state, start_frame_idx=start):
+                for ti, _, mlog in teacher.propagate_in_video(
+                    teacher_state, start_frame_idx=start
+                ):
                     t_preds[ti] = mlog[0]
 
         frames = sorted(s_preds.keys())
@@ -211,8 +277,10 @@ def train_step_3d(
 
             gt = gts[ti].float().unsqueeze(0)
 
-            stud_up = F.interpolate(slog, size=(out_size, out_size), mode="bilinear", align_corners=False)
-            gt_up   = F.interpolate(gt,   size=(out_size, out_size), mode="nearest")
+            stud_up = F.interpolate(
+                slog, size=(out_size, out_size), mode="bilinear", align_corners=False
+            )
+            gt_up = F.interpolate(gt, size=(out_size, out_size), mode="nearest")
 
             with torch.amp.autocast("cuda", enabled=False):
                 sp = stud_up.float()
@@ -227,8 +295,10 @@ def train_step_3d(
                 pixel_w = 1.0 + (dyn_pw.view(1, 1, 1, 1) - 1.0) * gm
                 bce = (bce_raw * pixel_w).mean()
 
-                tv  = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
-                foc = binary_focal_loss_with_logits(sp, gm, gamma=f_gamma, alpha=float(f_alpha))
+                tv = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
+                foc = binary_focal_loss_with_logits(
+                    sp, gm, gamma=f_gamma, alpha=float(f_alpha)
+                )
 
                 seg_loss = (bce_w * bce) + (dice_w * tv) + (focal_w * foc)
                 seg_loss = seg_loss.clamp_max(frame_clip)
@@ -242,11 +312,18 @@ def train_step_3d(
                     tlog = tlog.unsqueeze(0)
 
                 tlog = tlog.clamp(-logit_clip, logit_clip)
-                t_up = F.interpolate(tlog, size=(out_size, out_size), mode="bilinear", align_corners=False)
+                t_up = F.interpolate(
+                    tlog,
+                    size=(out_size, out_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
                 with torch.amp.autocast("cuda", enabled=False):
                     tp = torch.sigmoid(t_up.float() / tau).clamp(1e-4, 1.0 - 1e-4)
-                    dis_loss = F.binary_cross_entropy_with_logits(stud_up.float(), tp, reduction="mean")
+                    dis_loss = F.binary_cross_entropy_with_logits(
+                        stud_up.float(), tp, reduction="mean"
+                    )
                     dis_loss = dis_loss.clamp_max(frame_clip)
 
             total_frame = seg_loss + lam * dis_loss
@@ -266,9 +343,12 @@ def train_step_3d(
 
         prompt_bucket = torch.stack(p_losses).mean() if len(p_losses) > 0 else base_zero
         np_bucket_base = torch.stack(np_losses).mean() if len(np_losses) > 0 else None
-        np_bucket_scaled = (np_bucket_base * nonprompt_sf) if np_bucket_base is not None else None
+        np_bucket_scaled = (
+            (np_bucket_base * nonprompt_sf) if np_bucket_base is not None else None
+        )
 
         total = base_zero
+
         if np_bucket_scaled is None:
             total = prompt_bucket
         elif len(p_losses) == 0:
@@ -283,11 +363,24 @@ def train_step_3d(
 
     loss = torch.stack([x for x in seq_losses]).mean()
 
-    prompt_avg_t  = torch.stack([x for x in seq_prompt_bucket]).mean() if len(seq_prompt_bucket) else None
-    np_avg_t      = torch.stack([x for x in [x for x in seq_np_bucket if x is not None]]).mean() if any(x is not None for x in seq_np_bucket) else None
-    np_base_avg_t = torch.stack([x for x in [x for x in seq_np_base   if x is not None]]).mean() if any(x is not None for x in seq_np_base)   else None
+    prompt_avg_t = (
+        torch.stack([x for x in seq_prompt_bucket]).mean()
+        if len(seq_prompt_bucket)
+        else None
+    )
+    np_avg_t = (
+        torch.stack([x for x in [x for x in seq_np_bucket if x is not None]]).mean()
+        if any(x is not None for x in seq_np_bucket)
+        else None
+    )
+    np_base_avg_t = (
+        torch.stack([x for x in [x for x in seq_np_base if x is not None]]).mean()
+        if any(x is not None for x in seq_np_base)
+        else None
+    )
 
     bad = []
+
     if not torch.isfinite(loss.detach()).all():
         bad.append(("loss", safe_float(loss)))
     if prompt_avg_t is not None and not torch.isfinite(prompt_avg_t.detach()).all():
@@ -315,7 +408,9 @@ def train_step_3d(
 
     try:
         if clip_gradients:
-            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                student.parameters(), 1.0, error_if_nonfinite=True
+            )
         else:
             grad_norm = torch.zeros((), device=device)
     except RuntimeError as e:
@@ -324,18 +419,27 @@ def train_step_3d(
         for name, p in student.named_parameters():
             if p.grad is None:
                 continue
+
             g = p.grad.detach()
             if g.numel() == 0:
                 continue
             if not torch.isfinite(g).all():
                 finite = g[torch.isfinite(g)]
-                bad.append({
-                    "name": name,
-                    "shape": tuple(g.shape),
-                    "grad_absmax_finite": float(finite.abs().max().item()) if finite.numel() else None,
-                    "grad_min_finite": float(finite.min().item()) if finite.numel() else None,
-                    "grad_max_finite": float(finite.max().item()) if finite.numel() else None,
-                })
+                bad.append(
+                    {
+                        "name": name,
+                        "shape": tuple(g.shape),
+                        "grad_absmax_finite": (
+                            float(finite.abs().max().item()) if finite.numel() else None
+                        ),
+                        "grad_min_finite": (
+                            float(finite.min().item()) if finite.numel() else None
+                        ),
+                        "grad_max_finite": (
+                            float(finite.max().item()) if finite.numel() else None
+                        ),
+                    }
+                )
                 if len(bad) >= max_items:
                     break
 
@@ -356,13 +460,26 @@ def train_step_3d(
         optimizer.step()
 
     def _avg_or_none(xs):
-        """Average non-None tensors as a float."""
+        """
+        Average non-None tensors as a float.
+
+        Args:
+            xs (list[torch.Tensor]): Scalar loss tensors to average.
+
+        Returns:
+            float | None: Mean scalar value, or None for an empty list.
+        """
         xs = [x for x in xs if x is not None]
+
         return float(torch.stack(xs).mean().detach().item()) if xs else None
 
-    prompt_avg = float(torch.stack([x for x in seq_prompt_bucket]).mean().detach().item()) if len(seq_prompt_bucket) else 0.0
-    np_avg     = _avg_or_none(seq_np_bucket)
-    np_base_avg= _avg_or_none(seq_np_base)
+    prompt_avg = (
+        float(torch.stack([x for x in seq_prompt_bucket]).mean().detach().item())
+        if len(seq_prompt_bucket)
+        else 0.0
+    )
+    np_avg = _avg_or_none(seq_np_bucket)
+    np_base_avg = _avg_or_none(seq_np_base)
 
     return {
         "ok": True,
@@ -373,11 +490,21 @@ def train_step_3d(
         "non_prompt_loss_base": np_base_avg,
     }
 
+
 _FRAME_MAJOR_BATCH_KEYS = frozenset({"pt_list", "p_label", "bbox", "m_prompt"})
 
 
 def split_3d_batch_by_volume(batch: dict, sample: int) -> dict:
-    """Select one volume while preserving the frame-major prompt layout."""
+    """
+    Select one volume while preserving the frame-major prompt layout.
+
+    Args:
+        batch (dict): Collated images, masks, prompts, and sample metadata.
+        sample (int): Batch index of the volume to retain.
+
+    Returns:
+        dict: Single-volume batch with aligned tensor and prompt fields.
+    """
     batch_size = int(batch["image"].shape[0])
     if not 0 <= int(sample) < batch_size:
         raise IndexError(f"sample index {sample} is outside batch size {batch_size}")
@@ -396,22 +523,46 @@ def split_3d_batch_by_volume(batch: dict, sample: int) -> dict:
             result[key] = [value[sample]]
         else:
             result[key] = value
+
     return result
 
 
 def _average_output(outputs: list[dict], key: str):
+    """
+    Average the defined values of one output field across volumes.
+
+    Args:
+        outputs (list[dict]): Per-volume training outputs whose field values are averaged.
+        key (str): Output field whose defined values are averaged.
+
+    Returns:
+        float | None: Mean output value, or None when the field has no defined values.
+    """
     values = [output[key] for output in outputs if output.get(key) is not None]
+
     return float(sum(values) / len(values)) if values else None
 
 
 def _bad_gradient_parameters(student, max_items: int = 50) -> list[dict]:
+    """
+    Collect parameters with nonfinite gradients for failure diagnostics.
+
+    Args:
+        student (SAM2VideoPredictor): Student predictor being optimized.
+        max_items (int): Maximum number of problematic parameters included in diagnostics.
+
+    Returns:
+        list[dict]: Parameter names and gradient diagnostics, limited to max_items entries.
+    """
     bad = []
     for name, parameter in student.named_parameters():
         if parameter.grad is None or parameter.grad.numel() == 0:
             continue
+
         gradient = parameter.grad.detach()
         if torch.isfinite(gradient).all():
             continue
+
         finite = gradient[torch.isfinite(gradient)]
         bad.append(
             {
@@ -430,17 +581,31 @@ def _bad_gradient_parameters(student, max_items: int = 50) -> list[dict]:
         )
         if len(bad) >= max_items:
             break
+
     return bad
 
 
 def train_step_3d_per_volume(
     student, teacher, optimizer, batch, config, scaler
 ) -> dict:
-    """Run one logical batch while releasing each volume graph after backward.
+    """
+    Run one logical batch while releasing each volume graph after backward.
 
     Loss averaging, distributed synchronization, gradient clipping, and the
     optimizer step match :func:`train_step_3d`; only the execution schedule
     changes to reduce peak activation memory.
+
+    Args:
+        student (SAM2VideoPredictor): Student predictor being optimized.
+        teacher (SAM2VideoPredictor | None): Optional teacher predictor used for
+            distillation.
+        optimizer (torch.optim.Optimizer): Optimizer for the trainable parameters.
+        batch (dict): Collated images, masks, prompts, and sample metadata.
+        config (OmegaConf.DictConfig): Model, dataset, and training configuration.
+        scaler (object | None): Optional mixed-precision gradient scaler.
+
+    Returns:
+        dict: Aggregate losses, gradient norm, and success or failure diagnostics.
     """
     batch_size = int(batch["image"].shape[0])
     if batch_size < 1:
@@ -463,23 +628,24 @@ def train_step_3d_per_volume(
             optimizer_step=False,
         )
         del small_batch
+
         if not output.get("ok"):
             optimizer.zero_grad(set_to_none=True)
             return output
+
         outputs.append(output)
 
     for parameter in student.parameters():
         if parameter.grad is not None:
             parameter.grad.div_(batch_size)
+
     synchronize_gradients(student)
 
     loss_values = {
         "loss": _average_output(outputs, "loss"),
         "prompt_loss": _average_output(outputs, "prompt_loss"),
         "non_prompt_loss": _average_output(outputs, "non_prompt_loss"),
-        "non_prompt_loss_base": _average_output(
-            outputs, "non_prompt_loss_base"
-        ),
+        "non_prompt_loss_base": _average_output(outputs, "non_prompt_loss_base"),
     }
     try:
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -488,6 +654,7 @@ def train_step_3d_per_volume(
     except RuntimeError as error:
         bad = _bad_gradient_parameters(student)
         optimizer.zero_grad(set_to_none=True)
+
         return {
             "ok": False,
             "skip_reason": "nonfinite_3d_grad_norm",
@@ -527,11 +694,12 @@ def validate_step_3d(
         prompt_cache (dict): Dataset-produced prompt cache.
         prompt_mode (str): Prompt mode, one of point, box, or mask.
         normalize_coords (bool): Whether SAM2 should normalize point/box coordinates.
-        offload_video_to_cpu: Keep normalized input frames on CPU and transfer
+        offload_video_to_cpu (bool): Keep normalized input frames on CPU and transfer
             them to the image encoder on demand.
-        offload_state_to_cpu: Store compact mask-memory outputs on CPU between
+        offload_state_to_cpu (bool): Store compact mask-memory outputs on CPU between
             propagation steps.
-        output_device: Device on which to accumulate the returned full-volume
+        output_device (str | torch.device | None): Device on which to accumulate the
+            returned full-volume
             logits. ``None`` keeps the historical behavior and uses the model
             device; ``"cpu"`` avoids retaining one full-resolution GPU tensor
             per frame.
@@ -540,8 +708,12 @@ def validate_step_3d(
         dict | None: Logits and prompt metadata, or None if no prompt is available.
     """
     device = predictor.device
-    use_amp = (device.type == "cuda")
-    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.no_grad()
+    use_amp = device.type == "cuda"
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp
+        else torch.no_grad()
+    )
 
     if prompt_cache is None:
         return None
@@ -603,6 +775,7 @@ def validate_step_3d(
                     clear_old_points=False,
                     normalize_coords=bool(normalize_coords),
                 )
+
             pk_counts["point"] += int(pts.shape[0])
             prompts_added += 1
 
@@ -613,6 +786,7 @@ def validate_step_3d(
 
             if bb.ndim == 2:
                 bb = bb[0]
+
             bb = bb.to(device=device, dtype=torch.float32)
 
             empty_points = torch.empty((1, 0, 2), dtype=torch.float32, device=device)
@@ -629,6 +803,7 @@ def validate_step_3d(
                     clear_old_points=True,
                     normalize_coords=bool(normalize_coords),
                 )
+
             pk_counts["box"] += 1
             prompts_added += 1
 
@@ -639,6 +814,7 @@ def validate_step_3d(
 
             if mm.ndim == 3 and mm.shape[0] == 1:
                 mm = mm[0]
+
             mm = (mm > 0).to(device=device, dtype=torch.bool)
 
             with amp_ctx:
@@ -648,6 +824,7 @@ def validate_step_3d(
                     obj_id=1,
                     mask=mm,
                 )
+
             pk_counts["mask"] += 1
             prompts_added += 1
 
@@ -669,6 +846,7 @@ def validate_step_3d(
                 # non-blocking device-to-host copy could be read by the next
                 # CPU assignment before the transfer completes.
                 frame_logits = frame_logits.to(logits_device, non_blocking=False)
+
             logits[tt] = frame_logits
 
     if device.type == "cuda" and logits_device.type == "cpu":

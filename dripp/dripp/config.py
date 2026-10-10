@@ -1,10 +1,10 @@
 """
 Central configuration for the dataset indexing and preprocessing pipeline.
 
-User-facing defaults live in defaults.ini. This module loads the packaged
-defaults, optional user overrides, and exports typed constants for existing
-DRIPP code.
+User-facing defaults live in defaults.ini. This module loads the packaged defaults,
+optional user overrides, and exports typed constants for existing DRIPP code.
 """
+
 import configparser
 import logging
 import os
@@ -25,18 +25,13 @@ from .output_filenames import (
     validate_output_filenames,
 )
 
-
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "defaults.ini"
 LOCAL_CONFIG_FILENAME = "dripp.ini"
 ENV_CONFIG_VAR = "DRIPP_CONFIG"
 
-SUPPORTED_IMAGE_OUTPUT_EXTS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"
-}
-SUPPORTED_VOLUME_OUTPUT_EXTS = {
-    ".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"
-}
+SUPPORTED_IMAGE_OUTPUT_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+SUPPORTED_VOLUME_OUTPUT_EXTS = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"}
 SUPPORTED_2D_OUTPUT_EXTS = SUPPORTED_IMAGE_OUTPUT_EXTS | SUPPORTED_VOLUME_OUTPUT_EXTS
 
 
@@ -44,17 +39,31 @@ CONFIG_FILES_LOADED = []
 
 
 def _read_config():
+    """
+    Load packaged defaults, environment overrides, and local configuration.
+
+    Args:
+        None.
+
+    Returns:
+        configparser.ConfigParser: Merged configuration in precedence order.
+    """
     parser = configparser.ConfigParser()
     read_files = parser.read(DEFAULT_CONFIG_PATH)
+
     if not read_files:
         raise FileNotFoundError(f"Missing DRIPP default config: {DEFAULT_CONFIG_PATH}")
+
     CONFIG_FILES_LOADED.extend(read_files)
 
     env_path = os.environ.get(ENV_CONFIG_VAR)
     if env_path:
         read_files = parser.read(env_path)
         if not read_files:
-            raise FileNotFoundError(f"{ENV_CONFIG_VAR} points to a missing or unreadable file: {env_path}")
+            raise FileNotFoundError(
+                f"{ENV_CONFIG_VAR} points to a missing or unreadable file: {env_path}"
+            )
+
         CONFIG_FILES_LOADED.extend(read_files)
 
     local_path = Path.cwd() / LOCAL_CONFIG_FILENAME
@@ -62,55 +71,138 @@ def _read_config():
         read_files = parser.read(local_path)
         if not read_files:
             raise FileNotFoundError(f"Could not read local DRIPP config: {local_path}")
+
         CONFIG_FILES_LOADED.extend(read_files)
 
     return parser
 
 
 def _split_csv(value):
-    return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+    """
+    Split comma- or newline-separated settings into nonempty tokens.
+
+    Args:
+        value (str): Setting or cell value to normalize, validate, or format.
+
+    Returns:
+        list[str]: Stripped setting values in input order.
+    """
+    return [
+        item.strip() for item in value.replace("\n", ",").split(",") if item.strip()
+    ]
 
 
 def _normalize_ext(value):
+    """
+    Normalize a nonempty file extension to lowercase with a leading dot.
+
+    Args:
+        value (str): Setting or cell value to normalize, validate, or format.
+
+    Returns:
+        str: Normalized extension; raises ValueError for an empty value.
+    """
     value = value.strip().lower()
     if not value:
         raise ValueError("File extension values cannot be empty.")
+
     return value if value.startswith(".") else f".{value}"
 
 
 def _ext_set(parser, section, option):
+    """
+    Read and normalize a configured set of file extensions.
+
+    Args:
+        parser (configparser.ConfigParser): Loaded configuration from which the setting
+            is read.
+        section (str): INI section containing the requested setting.
+        option (str): Configuration or widget-style field to read.
+
+    Returns:
+        set[str]: Normalized extensions from the requested setting.
+    """
     return {_normalize_ext(item) for item in _split_csv(parser.get(section, option))}
 
 
 def _parse_target_size(value):
+    """
+    Parse the two integer dimensions of the configured resize target.
+
+    Args:
+        value (str): Setting or cell value to normalize, validate, or format.
+
+    Returns:
+        tuple[int, int]: Target width and height.
+    """
     parts = _split_csv(value)
     if len(parts) != 2:
-        raise ValueError("preprocessing.target_size must contain exactly two integers, e.g. 512,512")
+        raise ValueError(
+            "preprocessing.target_size must contain exactly two integers, e.g. 512,512"
+        )
     try:
         return tuple(int(part) for part in parts)
     except ValueError as exc:
-        raise ValueError("preprocessing.target_size must contain integers, e.g. 512,512") from exc
+        raise ValueError(
+            "preprocessing.target_size must contain integers, e.g. 512,512"
+        ) from exc
 
 
 def _parse_log_level(value):
+    """
+    Resolve a numeric or named Python logging level.
+
+    Args:
+        value (str): Setting or cell value to normalize, validate, or format.
+
+    Returns:
+        int: Logging level; raises ValueError for an unsupported name.
+    """
     value = value.strip()
     if value.isdigit():
         return int(value)
+
     level = getattr(logging, value.upper(), None)
     if not isinstance(level, int):
         raise ValueError(f"Unsupported logging.default_log_level: {value!r}")
+
     return level
 
 
 def _output_ext(parser, option, supported):
+    """
+    Read an output extension and ensure the format is supported.
+
+    Args:
+        parser (configparser.ConfigParser): Loaded configuration from which the setting
+            is read.
+        option (str): Configuration or widget-style field to read.
+        supported (set[str]): File extensions supported by the selected output format.
+
+    Returns:
+        str: Normalized, validated output extension.
+    """
     ext = _normalize_ext(parser.get("output_formats", option))
     if ext not in supported:
         allowed = ", ".join(sorted(supported))
-        raise ValueError(f"Unsupported output format for output_formats.{option}: {ext}. Allowed: {allowed}")
+        raise ValueError(
+            f"Unsupported output format for output_formats.{option}: {ext}. Allowed: {allowed}"
+        )
+
     return ext
 
 
 def _fmt_exts(values):
+    """
+    Format an extension collection as a stable comma-separated setting.
+
+    Args:
+        values (Iterable[str]): File extensions to sort and join into a configuration
+            setting.
+
+    Returns:
+        str: Sorted extension list suitable for configuration files.
+    """
     return ", ".join(sorted(values))
 
 
@@ -124,7 +216,9 @@ BASE_UNPROC = _CONFIG.get("paths", "base_unproc")
 BASE_PROC = _CONFIG.get("paths", "base_proc")
 GROUPS_DIR = _CONFIG.get("paths", "groups_dir")
 INDEX_DIR = _CONFIG.get("paths", "index_dir")
-CT_STATS_DIR = _CONFIG.get("paths", "ct_stats_dir", fallback=os.path.join(INDEX_DIR, "CTStats_v2"))
+CT_STATS_DIR = _CONFIG.get(
+    "paths", "ct_stats_dir", fallback=os.path.join(INDEX_DIR, "CTStats_v2")
+)
 CSV_FILENAME = _CONFIG.get("paths", "csv_filename")
 
 # -------------------------------------------------------------------------------
@@ -155,6 +249,7 @@ MIN_QUALIFIED_SLICES_3D = _CONFIG.getint(
 REQUIRE_CONTIGUOUS_QUALIFIED_SLICES_3D = _CONFIG.getboolean(
     "preprocessing", "require_contiguous_qualified_slices_3d", fallback=False
 )
+
 if MIN_COMPONENT_VOXELS_3D < 0:
     raise ValueError("preprocessing.min_component_voxels_3d must be zero or greater")
 if MASK_QC_DOWNSAMPLE_3D < 1:
@@ -182,8 +277,12 @@ OUTPUT_FORMATS = {
     "2d_mask": _output_ext(_CONFIG, "2d_mask_format", SUPPORTED_2D_OUTPUT_EXTS),
     "3d_image": _output_ext(_CONFIG, "3d_image_format", SUPPORTED_VOLUME_OUTPUT_EXTS),
     "3d_mask": _output_ext(_CONFIG, "3d_mask_format", SUPPORTED_VOLUME_OUTPUT_EXTS),
-    "video_frame": _output_ext(_CONFIG, "video_frame_format", SUPPORTED_IMAGE_OUTPUT_EXTS),
-    "video_mask": _output_ext(_CONFIG, "video_mask_format", SUPPORTED_IMAGE_OUTPUT_EXTS),
+    "video_frame": _output_ext(
+        _CONFIG, "video_frame_format", SUPPORTED_IMAGE_OUTPUT_EXTS
+    ),
+    "video_mask": _output_ext(
+        _CONFIG, "video_mask_format", SUPPORTED_IMAGE_OUTPUT_EXTS
+    ),
 }
 OUTPUT_EXTS = set(OUTPUT_FORMATS.values())
 IMAGE_OUTPUT_EXTS = {ext for ext in OUTPUT_EXTS if ext in SUPPORTED_IMAGE_OUTPUT_EXTS}
@@ -194,10 +293,16 @@ VOLUME_OUTPUT_EXTS = {ext for ext in OUTPUT_EXTS if ext in SUPPORTED_VOLUME_OUTP
 # -------------------------------------------------------------------------------
 OUTPUT_STRUCTURE = {
     "group_folder_template": validate_group_folder_template(
-        _CONFIG.get("output_structure", "group_folder_template", fallback=DEFAULT_GROUP_FOLDER_TEMPLATE)
+        _CONFIG.get(
+            "output_structure",
+            "group_folder_template",
+            fallback=DEFAULT_GROUP_FOLDER_TEMPLATE,
+        )
     ),
     "images_folder": validate_leaf_folder(
-        _CONFIG.get("output_structure", "images_folder", fallback=DEFAULT_IMAGES_FOLDER),
+        _CONFIG.get(
+            "output_structure", "images_folder", fallback=DEFAULT_IMAGES_FOLDER
+        ),
         "Images Folder",
     ),
     "masks_folder": validate_leaf_folder(
@@ -223,7 +328,7 @@ OUTPUT_FILENAMES = validate_output_filenames(
 # -------------------------------------------------------------------------------
 # Regexes
 # -------------------------------------------------------------------------------
-_CLASS_RE = re.compile(r'%([^%]+)%')
+_CLASS_RE = re.compile(r"%([^%]+)%")
 _RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
 _DIGIT_RE = re.compile(r"^\d+$")
 
@@ -241,6 +346,13 @@ DEFAULT_LOG_LEVEL = _parse_log_level(_CONFIG.get("logging", "default_log_level")
 def get_config_summary():
     """
     Return the active DRIPP configuration as a simple dictionary.
+
+    Args:
+        None.
+
+    Returns:
+        dict: Loaded config files and active path, preprocessing, output, runtime, and
+            logging settings.
     """
     return {
         "config_files_loaded": list(CONFIG_FILES_LOADED),
@@ -281,6 +393,15 @@ def get_config_summary():
 
 
 def _default_config_template():
+    """
+    Render a commented local configuration template from active settings.
+
+    Args:
+        None.
+
+    Returns:
+        str: Complete INI template with configuration guidance.
+    """
     return f"""# DRIPP local configuration
 # Save this file as dripp.ini in your project directory, or point DRIPP_CONFIG
 # at it. DRIPP loads packaged defaults first, then DRIPP_CONFIG, then local
@@ -357,7 +478,7 @@ def write_default_config(path, overwrite=False):
     Write a commented DRIPP config template to path.
 
     Args:
-        path (str or os.PathLike): Destination path.
+        path (str | os.PathLike): Destination path.
         overwrite (bool): Whether to replace an existing file.
 
     Returns:
@@ -366,6 +487,8 @@ def write_default_config(path, overwrite=False):
     target = Path(path)
     if target.exists() and not overwrite:
         raise FileExistsError(f"Config file already exists: {target}")
+
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(_default_config_template(), encoding="utf-8")
+
     return str(target)

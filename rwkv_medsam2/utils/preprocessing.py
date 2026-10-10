@@ -1,7 +1,7 @@
-# Dataset preprocessing, pairing, caching, and mask QC utilities.
-#
-# Builds train/validation/test sequence metadata, applies foreground quality
-# checks, and caches formatted RWKV-MedSAM2 datasets.
+"""
+Build paired dataset splits, cache sequence metadata, and check mask quality.
+"""
+
 import os
 import math
 import base64
@@ -28,7 +28,10 @@ import hashlib
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Any, Optional, List
-from rwkv_medsam2.dataset import SegmentationSequenceDataset, SequenceTransform  # noqa: E402
+from rwkv_medsam2.dataset import (
+    SegmentationSequenceDataset,
+    SequenceTransform,
+)  # noqa: E402
 
 DATASET_CACHE_VERSION = "v1.10"
 MASKSTATS_CACHE_VERSION = "v2"
@@ -48,7 +51,9 @@ def _pack_u32_zlib_b64(arr_u32: np.ndarray) -> str:
     arr_u32 = np.asarray(arr_u32, dtype=np.uint32, order="C")
     raw = arr_u32.tobytes()
     comp = zlib.compress(raw, level=6)
+
     return base64.b64encode(comp).decode("ascii")
+
 
 def _unpack_u32_zlib_b64(s: str) -> np.ndarray:
     """
@@ -62,7 +67,9 @@ def _unpack_u32_zlib_b64(s: str) -> np.ndarray:
     """
     comp = base64.b64decode(s.encode("ascii"))
     raw = zlib.decompress(comp)
+
     return np.frombuffer(raw, dtype=np.uint32)
+
 
 def _stats_cache_filename(ds_dir: str, split: str, downsample: int) -> str:
     """
@@ -77,9 +84,11 @@ def _stats_cache_filename(ds_dir: str, split: str, downsample: int) -> str:
         str: Cache file path.
     """
     ds = int(max(1, downsample))
+
     return os.path.join(
         ds_dir, f"maskstats_{MASKSTATS_CACHE_VERSION}_{split}_ds{ds}.jsonl"
     )
+
 
 def load_maskstats_cache(
     ds_dir: str,
@@ -97,7 +106,7 @@ def load_maskstats_cache(
         ds_dir (str): Dataset cache directory.
         split (str): Data split name.
         downsample (int): Downsample factor.
-        wanted_paths (set | None): Optional paths to load.
+        wanted_paths (Optional[set]): Optional paths to load.
 
     Returns:
         dict[str, dict[str, Any]]: Fresh cached stats keyed by mask path.
@@ -137,6 +146,7 @@ def load_maskstats_cache(
     except Exception:
         return {}
 
+
 def append_maskstats_cache(
     ds_dir: str,
     split: str,
@@ -152,7 +162,7 @@ def append_maskstats_cache(
         ds_dir (str): Dataset cache directory.
         split (str): Data split name.
         downsample (int): Downsample factor.
-        records (dict[str, dict[str, Any]]): Stats records keyed by mask path.
+        records (Dict[str, Dict[str, Any]]): Stats records keyed by mask path.
 
     Returns:
         None.
@@ -172,6 +182,7 @@ def append_maskstats_cache(
             }
             f.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
+
 def _normalize_modality(mod):
     """
     Normalize a modality label to lowercase text.
@@ -184,10 +195,22 @@ def _normalize_modality(mod):
     """
     if mod is None:
         return None
+
     return str(mod).strip().lower()
 
+
 def _dripp_policy_satisfies_quality(policy, quality_params):
-    """Return whether DRIPP already enforced the active RWKV 3D QC contract."""
+    """
+    Return whether DRIPP already enforced the active RWKV 3D QC contract.
+
+    Args:
+        policy (dict): Recorded DRIPP preprocessing and mask-quality policy.
+        quality_params (dict): Requested foreground and contiguous-window quality
+            thresholds.
+
+    Returns:
+        bool: Whether the recorded policy is sufficient to skip redundant mask checks.
+    """
     if not isinstance(policy, dict) or policy.get("applied") is not True:
         return False
 
@@ -198,11 +221,11 @@ def _dripp_policy_satisfies_quality(policy, quality_params):
         "min_qualified_slices_3d",
     )
     if any(
-        isinstance(policy.get(key), bool)
-        or not isinstance(policy.get(key), int)
+        isinstance(policy.get(key), bool) or not isinstance(policy.get(key), int)
         for key in integer_keys
     ):
         return False
+
     fraction = policy.get("min_slice_area_fraction_3d")
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
         return False
@@ -212,19 +235,18 @@ def _dripp_policy_satisfies_quality(policy, quality_params):
         return False
 
     return (
-        policy["min_component_voxels_3d"]
-        >= int(quality_params.get("min_voxels", 64))
-        and policy["mask_qc_downsample_3d"]
-        == int(quality_params.get("downsample", 2))
+        policy["min_component_voxels_3d"] >= int(quality_params.get("min_voxels", 64))
+        and policy["mask_qc_downsample_3d"] == int(quality_params.get("downsample", 2))
         and policy["min_slice_area_px_3d"]
         >= int(quality_params.get("min_slice_area_px", 32))
-        and float(fraction)
-        >= float(quality_params.get("min_frac_2d_area") or 0.0)
+        and float(fraction) >= float(quality_params.get("min_frac_2d_area") or 0.0)
         and policy["min_qualified_slices_3d"]
         >= int(quality_params.get("min_slices_any_axis", 2))
     )
 
+
 _MASK_FG2D_CACHE = {}
+
 
 def _mask_has_fg_2d(mask_path: str) -> bool:
     """
@@ -254,19 +276,21 @@ def _mask_has_fg_2d(mask_path: str) -> bool:
     _MASK_FG2D_CACHE[key] = has_fg
     return has_fg
 
+
 def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_params=None):
     """
     Loads the groupings.json files from each folder in the given output directory
     for the specified split.
 
     Each groupings.json file is expected to contain a list of entries, where each
+
     entry is a dictionary with the following keys:
     - "proc_images": A list of paths to the preprocessed images.
     - "proc_masks": A list of paths to the preprocessed masks.
 
     The function pairs each mask with its corresponding image by searching for
     the index in the image path. The index is assumed to be in the format
-    "(?:img|frame|slice)(\\d+)" and is used to match the mask with its
+    "(?:img|frame|slice)([0-9]+)" and is used to match the mask with its
     corresponding image.
 
     If 'tasks_map' is provided, the per-pair 'tasks' list is refined so that it
@@ -284,9 +308,20 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
         list: A list of dicts, one per (image, mask) pairing, each containing
               dataset, subdataset, tasks, class, pair, dim, and modality.
     """
+
     # Optional: refine tasks per-pair based on its class and the global tasks map
     def _filter_tasks_for_class(entry_tasks, cls_name):
-        """Filter task ids to those compatible with a class."""
+        """
+        Filter task ids to those compatible with a class.
+
+        Args:
+            entry_tasks (list[str]): Task identifiers assigned to the metadata entry.
+            cls_name (str): Target class name used for task compatibility checks.
+
+        Returns:
+            list[str]: Compatible tasks, falling back to the supplied tasks when no match is
+                found.
+        """
         if not tasks_map or not entry_tasks or cls_name is None:
             return entry_tasks
 
@@ -301,15 +336,17 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
         return filtered or entry_tasks
 
     # Find all image and mask pairs for each dataset and collect them
-    _idx_pattern      = re.compile(r"_(?:img|frame|slice)(\d+)")
-    _mask_idx_pattern = re.compile(r"_mask(\d+)")  # Prefer this for WSI tiles like PAIP2019
-    all_pairs         = []
+    _idx_pattern = re.compile(r"_(?:img|frame|slice)(\d+)")
+    _mask_idx_pattern = re.compile(
+        r"_mask(\d+)"
+    )  # Prefer this for WSI tiles like PAIP2019
+    all_pairs = []
     total_kept_global = 0  # Global count of kept pairs
 
     # Quality control config
     use_gpu_qc = True
-    qc_device  = "cuda" if torch.cuda.is_available() else "cpu"
-    qc_batch   = 16
+    qc_device = "cuda" if torch.cuda.is_available() else "cpu"
+    qc_batch = 16
 
     # Allow caller to override QC knobs; fall back to defaults if not provided.
     if quality_params is None:
@@ -326,8 +363,8 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
 
     for ds in datasets:
         # Check if dataset grouping json exists
-        ds_dir  = os.path.join(out_dir, ds)
-        grp_file = os.path.join(ds_dir, f'{ds}_groups.json')
+        ds_dir = os.path.join(out_dir, ds)
+        grp_file = os.path.join(ds_dir, f"{ds}_groups.json")
         if not os.path.isfile(grp_file):
             print(f"Could not find {ds}_groups.json in {ds_dir}")
             continue
@@ -335,20 +372,26 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
         # Parse the groups file
         with open(grp_file, "r", encoding="utf-8") as handle:
             data = json.load(handle)
+
         entries = []
         for sub in data.get("subdatasets", []):
-            sub_name     = sub.get("name", "default")
-            sub_modality = _normalize_modality(sub.get("modality", None))  # fallback if entry doesn't have it
-            sub_tasks    = sub.get("tasks", [])
-            sub_classes  = sub.get("classes", [])
+            sub_name = sub.get("name", "default")
+            sub_modality = _normalize_modality(
+                sub.get("modality", None)
+            )  # fallback if entry doesn't have it
+            sub_tasks = sub.get("tasks", [])
+            sub_classes = sub.get("classes", [])
 
             for entry in sub.get(split, []):
-                if entry.get("preprocessing", {}).get("status") in {"rejected", "failed"}:
+                if entry.get("preprocessing", {}).get("status") in {
+                    "rejected",
+                    "failed",
+                }:
                     continue
 
                 entry["subdataset_name"] = sub_name
-                entry["tasks"]           = sub_tasks
-                entry["mask_classes"]    = sub_classes
+                entry["tasks"] = sub_tasks
+                entry["mask_classes"] = sub_classes
 
                 # Prefer per-entry "subdataset_modality", fall back to sub-level "modality"
                 entry["subdataset_modality"] = _normalize_modality(
@@ -356,28 +399,38 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 )
 
                 entries.append(entry)
+
         print(f"Found {len(entries)} '{split}' entries in {grp_file}")
 
         # Initialize progress bar
         total_candidates = sum(len(e.get("proc_masks", [])) for e in entries)
-        pbar = tqdm(total=total_candidates, desc=f"[{ds}] masks→pairs", unit="mask", leave=False, file=sys.stdout)
+        pbar = tqdm(
+            total=total_candidates,
+            desc=f"[{ds}] masks→pairs",
+            unit="mask",
+            leave=False,
+            file=sys.stdout,
+        )
 
         # Iterate through the groupings and create image/mask pairs
-        ds_kept    = 0  # Per-dataset kept count
+        ds_kept = 0  # Per-dataset kept count
         ds_skipped = 0  # Per-dataset skipped count
 
         for entry in entries:
             # Tolerate missing 'split' field (default to current split)
-            if entry.get('split', split) != split:
+            if entry.get("split", split) != split:
                 continue
 
-            entry_modality = _normalize_modality(entry.get("subdataset_modality", "unknown"))
+            entry_modality = _normalize_modality(
+                entry.get("subdataset_modality", "unknown")
+            )
 
-            imgs = entry.get('proc_images', [])
-            msks = entry.get('proc_masks', [])
+            imgs = entry.get("proc_images", [])
+            msks = entry.get("proc_masks", [])
 
             # Create a map from index to image
             idx_map = {}
+
             for img_path in imgs:
                 base = os.path.basename(img_path)
                 m = _idx_pattern.search(base)
@@ -387,27 +440,34 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
             # Build a fallback image-key map by normalized basename
             img_by_key = {}
             for ip in imgs:
-                nm   = os.path.basename(ip).lower()
+                nm = os.path.basename(ip).lower()
                 stem = os.path.splitext(nm)[0]
-                stem = re.sub(r'(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)', '', stem)
-                stem = re.sub(r'[^a-z0-9]+', '_', stem).strip('_')
+                stem = re.sub(
+                    r"(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)",
+                    "",
+                    stem,
+                )
+                stem = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
                 img_by_key[stem] = ip
 
             # Pair each mask with its corresponding image and add to the list of pairs
             pairs = []
             for mask in msks:
                 pbar.update(1)  # Update progress bar
-                msk_path = mask['path']
-                cls_name = mask['class']
+                msk_path = mask["path"]
+                cls_name = mask["class"]
+
                 if cls_name is None:
                     continue
 
                 if "image_index" in mask:
                     image_index = mask.get("image_index")
                     dimension = mask.get("dimension")
-                    if (isinstance(image_index, bool)
-                            or not isinstance(image_index, int)
-                            or not 0 <= image_index < len(imgs)):
+                    if (
+                        isinstance(image_index, bool)
+                        or not isinstance(image_index, int)
+                        or not 0 <= image_index < len(imgs)
+                    ):
                         warnings.warn(
                             f"Skipping malformed explicit pairing for {msk_path}: "
                             f"image_index={image_index!r} does not reference proc_images",
@@ -421,10 +481,15 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                             RuntimeWarning,
                         )
                         continue
-                    pairs.append({
-                        "image": imgs[image_index], "mask": msk_path,
-                        "class": cls_name, "_dimension": dimension,
-                    })
+
+                    pairs.append(
+                        {
+                            "image": imgs[image_index],
+                            "mask": msk_path,
+                            "class": cls_name,
+                            "_dimension": dimension,
+                        }
+                    )
                     continue
 
                 base = os.path.basename(msk_path)
@@ -433,28 +498,33 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 m = _mask_idx_pattern.search(base)
                 if m:
                     idx = int(m.group(1))
-                    ip  = idx_map.get(idx)
+                    ip = idx_map.get(idx)
                     if ip:
-                        pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
+                        pairs.append({"image": ip, "mask": msk_path, "class": cls_name})
                         continue
 
                 # Fallback: use _(img|frame|slice)####
                 m = _idx_pattern.search(base)
                 if m:
                     idx = int(m.group(1))
-                    ip  = idx_map.get(idx)
+                    ip = idx_map.get(idx)
                     if ip:
-                        pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
+                        pairs.append({"image": ip, "mask": msk_path, "class": cls_name})
                         continue
 
                 # Last resort: normalized key match
-                nm   = base.lower()
+                nm = base.lower()
                 stem = os.path.splitext(nm)[0]
-                stem = re.sub(r'(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)', '', stem)
-                stem = re.sub(r'[^a-z0-9]+', '_', stem).strip('_')
-                ip   = img_by_key.get(stem)
+                stem = re.sub(
+                    r"(?:_mask|-mask|\.mask|_gt|_label|-label|_anno|_annotation)",
+                    "",
+                    stem,
+                )
+                stem = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+                ip = img_by_key.get(stem)
+
                 if ip:
-                    pairs.append({'image': ip, 'mask': msk_path, 'class': cls_name})
+                    pairs.append({"image": ip, "mask": msk_path, "class": cls_name})
 
             entry_policy_3d = (
                 entry.get("preprocessing", {}).get("quality_policy_3d") or {}
@@ -477,11 +547,12 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 Returns:
                     int: Parsed index, or 0 when absent.
                 """
-                b  = os.path.basename(pth).lower()
+                b = os.path.basename(pth).lower()
                 mm = _mask_idx_pattern.search(b) or _idx_pattern.search(b)
+
                 return int(mm.group(1)) if mm else 0
 
-            pairs.sort(key=lambda x: _sort_idx(x['image']))
+            pairs.sort(key=lambda x: _sort_idx(x["image"]))
 
             # Build dims once
             dims = [
@@ -492,12 +563,14 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
 
             # Drop 2D pairs whose masks have *no* foreground
             keep_idx = []
+
             for i, pair in enumerate(pairs):
                 if dims[i] == 2:
                     # Skip 2D masks with zero FG
-                    if not _mask_has_fg_2d(pair['mask']):
+                    if not _mask_has_fg_2d(pair["mask"]):
                         ds_skipped += 1
                         continue
+
                 keep_idx.append(i)
 
             if not keep_idx:
@@ -505,18 +578,17 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 continue
 
             pairs = [pairs[i] for i in keep_idx]
-            dims  = [dims[i]  for i in keep_idx]
+            dims = [dims[i] for i in keep_idx]
 
             # Trust sufficient DRIPP policies; retain disk QC for legacy/weaker data.
             idx_3d = [i for i, d in enumerate(dims) if d == 3]
             qc_ok = {}
             fallback_idx_3d = []
+
             for pair_index in idx_3d:
                 policy = pairs[pair_index].get("_quality_policy_3d")
                 if _dripp_policy_satisfies_quality(policy, quality_params):
-                    qc_ok[pair_index] = (
-                        True, {"reason": "quality_enforced_by_dripp"}
-                    )
+                    qc_ok[pair_index] = (True, {"reason": "quality_enforced_by_dripp"})
                 else:
                     fallback_idx_3d.append(pair_index)
 
@@ -524,9 +596,11 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 mask_paths_3d = [pairs[i]["mask"] for i in fallback_idx_3d]
 
                 # Centralized cache dir: /data/DatasetIndexes/QC_Cache/<dataset> (or QC_CACHE_ROOT override)
-                ds_dir_default   = os.path.join(out_dir, ds)
-                ds_dir_cache     = os.path.join(QC_CACHE_ROOT, ds)
-                cache_dir_to_use = ds_dir_cache if os.path.isdir(ds_dir_cache) else ds_dir_default
+                ds_dir_default = os.path.join(out_dir, ds)
+                ds_dir_cache = os.path.join(QC_CACHE_ROOT, ds)
+                cache_dir_to_use = (
+                    ds_dir_cache if os.path.isdir(ds_dir_cache) else ds_dir_default
+                )
 
                 ds_factor = int(quality_params.get("downsample", 2))
                 wanted = set(mask_paths_3d)
@@ -539,15 +613,15 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                 )
 
                 missing = [p for p in mask_paths_3d if p not in stats_map]
+
                 if missing:
                     new_records = {}
                     for p in missing:
-                        ok_s, stats = compute_mask_stats_3d(
-                            p, downsample=ds_factor
-                        )
+                        ok_s, stats = compute_mask_stats_3d(p, downsample=ds_factor)
                         if ok_s:
                             new_records[p] = stats
                             stats_map[p] = stats
+
                     append_maskstats_cache(
                         ds_dir=cache_dir_to_use,
                         split=split,
@@ -555,15 +629,12 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                         records=new_records,
                     )
 
-                for pair_index, mask_path in zip(
-                    fallback_idx_3d, mask_paths_3d
-                ):
+                for pair_index, mask_path in zip(fallback_idx_3d, mask_paths_3d):
                     stats = stats_map.get(mask_path)
                     if stats is None:
-                        qc_ok[pair_index] = (
-                            False, {"reason": "stats_missing"}
-                        )
+                        qc_ok[pair_index] = (False, {"reason": "stats_missing"})
                         continue
+
                     qc_ok[pair_index] = evaluate_quality_from_stats(
                         stats, quality_params
                     )
@@ -578,22 +649,24 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                             ds_skipped += 1
                             continue
 
-                    cls_name       = pair['class']
-                    tasks_for_pair = _filter_tasks_for_class(entry['tasks'], cls_name)
+                    cls_name = pair["class"]
+                    tasks_for_pair = _filter_tasks_for_class(entry["tasks"], cls_name)
 
-                    all_pairs.append({
-                        'dataset':    ds,
-                        'subdataset': entry['subdataset_name'],
-                        'tasks':      tasks_for_pair,
-                        'class':      cls_name,
-                        'pair':       (pair['image'], pair['mask']),
-                        'dim':        dim,
-                        'modality':   entry_modality,
-                        'identifier': entry.get('identifier'),
-                        'source_identifier': entry.get(
-                            'source_identifier', entry.get('identifier')
-                        ),
-                    })
+                    all_pairs.append(
+                        {
+                            "dataset": ds,
+                            "subdataset": entry["subdataset_name"],
+                            "tasks": tasks_for_pair,
+                            "class": cls_name,
+                            "pair": (pair["image"], pair["mask"]),
+                            "dim": dim,
+                            "modality": entry_modality,
+                            "identifier": entry.get("identifier"),
+                            "source_identifier": entry.get(
+                                "source_identifier", entry.get("identifier")
+                            ),
+                        }
+                    )
                     ds_kept += 1
                     total_kept_global += 1
             else:
@@ -603,52 +676,61 @@ def get_pairings(out_dir, datasets, split="train", tasks_map=None, quality_param
                     if not ok:
                         ds_skipped += 1
                     else:
-                        cls_name       = pairs[0]['class']
-                        tasks_for_pair = _filter_tasks_for_class(entry['tasks'], cls_name)
+                        cls_name = pairs[0]["class"]
+                        tasks_for_pair = _filter_tasks_for_class(
+                            entry["tasks"], cls_name
+                        )
 
-                        all_pairs.append({
-                            'dataset':      ds,
-                            'subdataset':   entry['subdataset_name'],
-                            'tasks':        tasks_for_pair,
-                            'class':        cls_name,
-                            'mask_classes': cls_name,  # keep for backward compatibility
-                            'pair':         (pairs[0]['image'], pairs[0]['mask']),
-                            'dim':          dim,
-                            'modality':     entry_modality,
-                            'identifier':   entry.get('identifier'),
-                            'source_identifier': entry.get(
-                                'source_identifier', entry.get('identifier')
-                            ),
-                        })
+                        all_pairs.append(
+                            {
+                                "dataset": ds,
+                                "subdataset": entry["subdataset_name"],
+                                "tasks": tasks_for_pair,
+                                "class": cls_name,
+                                "mask_classes": cls_name,  # keep for backward compatibility
+                                "pair": (pairs[0]["image"], pairs[0]["mask"]),
+                                "dim": dim,
+                                "modality": entry_modality,
+                                "identifier": entry.get("identifier"),
+                                "source_identifier": entry.get(
+                                    "source_identifier", entry.get("identifier")
+                                ),
+                            }
+                        )
                         ds_kept += 1
                         total_kept_global += 1
                 else:
-                    cls_name       = pairs[0]['class']
-                    tasks_for_pair = _filter_tasks_for_class(entry['tasks'], cls_name)
+                    cls_name = pairs[0]["class"]
+                    tasks_for_pair = _filter_tasks_for_class(entry["tasks"], cls_name)
 
-                    all_pairs.append({
-                        'dataset':      ds,
-                        'subdataset':   entry['subdataset_name'],
-                        'tasks':        tasks_for_pair,
-                        'class':        cls_name,
-                        'mask_classes': cls_name,  # keep for backward compatibility
-                        'pair':         (pairs[0]['image'], pairs[0]['mask']),
-                        'dim':          dim,
-                        'modality':     entry_modality,
-                        'identifier':   entry.get('identifier'),
-                        'source_identifier': entry.get(
-                            'source_identifier', entry.get('identifier')
-                        ),
-                    })
+                    all_pairs.append(
+                        {
+                            "dataset": ds,
+                            "subdataset": entry["subdataset_name"],
+                            "tasks": tasks_for_pair,
+                            "class": cls_name,
+                            "mask_classes": cls_name,  # keep for backward compatibility
+                            "pair": (pairs[0]["image"], pairs[0]["mask"]),
+                            "dim": dim,
+                            "modality": entry_modality,
+                            "identifier": entry.get("identifier"),
+                            "source_identifier": entry.get(
+                                "source_identifier", entry.get("identifier")
+                            ),
+                        }
+                    )
                     ds_kept += 1
                     total_kept_global += 1
 
         # Close the progress bar and print a summary
         pbar.close()
-        tqdm.write(f"[{ds}] kept {ds_kept}, skipped {ds_skipped}, total processed {ds_kept + ds_skipped} for '{split}'")
+        tqdm.write(
+            f"[{ds}] kept {ds_kept}, skipped {ds_skipped}, total processed {ds_kept + ds_skipped} for '{split}'"
+        )
 
     print(f"Total kept pairs for '{split}': {total_kept_global}")  # Global summary
     return all_pairs
+
 
 def get_sequences(
     out_dir,
@@ -682,6 +764,14 @@ def get_sequences(
          - For 'split=="train"': a tuple '(train_seqs, val_seqs)'.
          - For 'split=="test"': a list 'test_seqs'.
 
+    Each sequence dict contains:
+        - 'dataset' (str)
+        - 'subdataset' (str)
+        - 'tasks' (List[str])
+        - 'sequence' (List[Tuple[str, str]]): ordered image/mask path tuples
+        - 'dim' (int): 2 or 3
+        - 'modality' (str)
+
     Args:
         out_dir (str): Path to the directory containing dataset subfolders.
         split (str): One of '"train"' or '"test"'.
@@ -698,35 +788,46 @@ def get_sequences(
     Returns:
         - If 'split=="train"': '(train_seqs, val_seqs)', each a list of sequence dicts.
         - If 'split=="test"': 'test_seqs', a list of sequence dicts.
-
-    Each sequence dict contains:
-        - 'dataset' (str)
-        - 'subdataset' (str)
-        - 'tasks' (List[str])
-        - 'sequence' (List[Tuple[str, str]]): ordered image/mask path tuples
-        - 'dim' (int): 2 or 3
-        - 'modality' (str)
     """
     # 0a) Find dataset subfolders
     try:
         entries = sorted(os.listdir(out_dir))
     except Exception:
         raise RuntimeError(f"Could not find output directory {out_dir}")
+
     datasets = [d for d in entries if os.path.isdir(os.path.join(out_dir, d))]
 
     # 1) Load all (image, mask) pairs
     pairs = get_pairings(
         out_dir, datasets, split, tasks_map=tasks_map, quality_params=quality_params
     )
+
     def _source_key(pair_record):
-        """Return a stable source-level key shared by all masks of one case."""
+        """
+        Return a stable source-level key shared by all masks of one case.
+
+        Args:
+            pair_record (dict): Paired image/mask record retaining source and dataset metadata.
+
+        Returns:
+            str: Source identifier shared by targets from the same case.
+        """
         source = pair_record.get("source_identifier") or pair_record.get("identifier")
         if source is None:
             source = os.path.normcase(os.path.abspath(pair_record["pair"][0]))
+
         return str(source)
 
     def _as_sequence(pair_record):
-        """Convert one paired mask into the sequence metadata consumed by the dataset."""
+        """
+        Convert one paired mask into the sequence metadata consumed by the dataset.
+
+        Args:
+            pair_record (dict): Paired image/mask record retaining source and dataset metadata.
+
+        Returns:
+            dict: Sequence record retaining dataset, source, class, and task metadata.
+        """
         return {
             "dataset": pair_record["dataset"],
             "subdataset": pair_record["subdataset"],
@@ -760,32 +861,42 @@ def get_sequences(
         rng.shuffle(source_groups)
 
         n_val = int(len(source_groups) * val_frac)
+
         if val_frac > 0.0 and len(source_groups) > 1:
             # Source-level grouping can make small datasets much smaller than
             # their component-mask counts suggest. Keep one validation source
             # without ever consuming the only available training source.
             n_val = min(len(source_groups) - 1, max(1, n_val))
+
         val_source_keys = {key for key, _ in source_groups[:n_val]}
         for source_key, source_pairs in source_groups:
             destination = val_seqs if source_key in val_source_keys else train_seqs
-            destination.extend(_as_sequence(pair_record) for pair_record in source_pairs)
+            destination.extend(
+                _as_sequence(pair_record) for pair_record in source_pairs
+            )
 
     return train_seqs, val_seqs
 
+
 @dataclass
 class DatasetSignature:
-    """A minimal signature to verify cached datasets are compatible with current run settings."""
-    version: str                       # bump when dataset class/transform changes
+    """
+    A minimal signature to verify cached datasets are compatible with current run settings.
+    """
+
+    version: str  # bump when dataset class/transform changes
     out_dir: str
-    split: str                         # "train" or "test"
+    split: str  # "train" or "test"
     seq_len: int
     min_fg_frames_in_window: int
     truncate_val_test: bool
     val_frac: float
     seed: int
-    aug_probs: Tuple[float, float, float]   # (base_prob, lr_prob, flip_prob)
-    quality_params: Dict[str, Any]          # QC knobs used during pairing
-    tasks_file_fingerprint: Optional[str]   # if you want to include DRIPP tasks.json fingerprint
+    aug_probs: Tuple[float, float, float]  # (base_prob, lr_prob, flip_prob)
+    quality_params: Dict[str, Any]  # QC knobs used during pairing
+    tasks_file_fingerprint: Optional[
+        str
+    ]  # if you want to include DRIPP tasks.json fingerprint
     fg_min_pixels_frac: float
     dripp_manifests_fingerprint: Optional[str]
 
@@ -800,7 +911,9 @@ class DatasetSignature:
             str: MD5 hash for the signature.
         """
         s = json.dumps(asdict(self), sort_keys=True).encode("utf-8")
+
         return hashlib.md5(s).hexdigest()
+
 
 def _fingerprint_file(path: Optional[str]) -> Optional[str]:
     """
@@ -814,28 +927,42 @@ def _fingerprint_file(path: Optional[str]) -> Optional[str]:
     """
     if not path or not os.path.isfile(path):
         return None
+
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
+
     return h.hexdigest()
 
 
 def _fingerprint_dripp_manifests(out_dir: str) -> Optional[str]:
-    """Fingerprint manifest metadata without reading large JSON documents."""
+    """
+    Fingerprint manifest metadata without reading large JSON documents.
+
+    Args:
+        out_dir (str): Root directory containing processed DRIPP dataset manifests.
+
+    Returns:
+        str | None: Combined manifest fingerprint, or None when no manifests are available.
+    """
     if not os.path.isdir(out_dir):
         return None
+
     records = []
     for dataset in sorted(os.listdir(out_dir)):
         path = os.path.abspath(os.path.join(out_dir, dataset, f"{dataset}_groups.json"))
         if not os.path.isfile(path):
             continue
+
         stat = os.stat(path)
         records.append((path, stat.st_size, stat.st_mtime_ns))
     if not records:
         return None
+
     payload = json.dumps(records, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
 
 def _cache_paths(cache_root: str, sig: DatasetSignature) -> Dict[str, str]:
     """
@@ -851,6 +978,7 @@ def _cache_paths(cache_root: str, sig: DatasetSignature) -> Dict[str, str]:
     h = sig.to_hash()
     root = os.path.join(cache_root, "formatted_datasets", h)
     os.makedirs(root, exist_ok=True)
+
     return {
         "root": root,
         "meta": os.path.join(root, "meta.json"),
@@ -859,6 +987,7 @@ def _cache_paths(cache_root: str, sig: DatasetSignature) -> Dict[str, str]:
         "test": os.path.join(root, "test_ds.pt"),
     }
 
+
 def _save_meta(meta_path: str, sig: DatasetSignature, extra: Dict[str, Any]) -> None:
     """
     Save formatted dataset cache metadata.
@@ -866,7 +995,7 @@ def _save_meta(meta_path: str, sig: DatasetSignature, extra: Dict[str, Any]) -> 
     Args:
         meta_path (str): Metadata file path.
         sig (DatasetSignature): Dataset cache signature.
-        extra (dict): Additional metadata to include.
+        extra (Dict[str, Any]): Additional metadata to include.
 
     Returns:
         None.
@@ -875,13 +1004,16 @@ def _save_meta(meta_path: str, sig: DatasetSignature, extra: Dict[str, Any]) -> 
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
+
 def _load_cached_datasets(
-    cache_root: str,
-    sig: DatasetSignature,
-    need_train_val: bool
-) -> Optional[Tuple[Optional[SegmentationSequenceDataset],
-                    Optional[SegmentationSequenceDataset],
-                    Optional[SegmentationSequenceDataset]]]:
+    cache_root: str, sig: DatasetSignature, need_train_val: bool
+) -> Optional[
+    Tuple[
+        Optional[SegmentationSequenceDataset],
+        Optional[SegmentationSequenceDataset],
+        Optional[SegmentationSequenceDataset],
+    ]
+]:
     """
     Load cached formatted datasets when all split files are present.
 
@@ -901,28 +1033,42 @@ def _load_cached_datasets(
     try:
         with open(paths["meta"], "r", encoding="utf-8") as f:
             meta = json.load(f)
+
         sig_on_disk = DatasetSignature(**meta["signature"])
         if sig_on_disk.to_hash() != sig.to_hash():
             print("Cached datasets are incompatible with current run settings.")
             print("Proceeding to recompute datasets...")
+
             return None  # settings changed
 
         # IMPORTANT: weights_only=False because these are pickled class instances, not just tensors
         load = lambda p: torch.load(p, map_location="cpu", weights_only=False)
 
-        train_ds = load(paths["train"]) if (need_train_val and os.path.isfile(paths["train"])) else None
-        val_ds   = load(paths["val"])   if (need_train_val and os.path.isfile(paths["val"]))   else None
-        test_ds  = load(paths["test"])  if os.path.isfile(paths["test"]) else None
+        train_ds = (
+            load(paths["train"])
+            if (need_train_val and os.path.isfile(paths["train"]))
+            else None
+        )
+        val_ds = (
+            load(paths["val"])
+            if (need_train_val and os.path.isfile(paths["val"]))
+            else None
+        )
+        test_ds = load(paths["test"]) if os.path.isfile(paths["test"]) else None
 
         if need_train_val and (train_ds is None or val_ds is None):
             return None
+
         return (train_ds, val_ds, test_ds)
     except Exception:
         print("Failed to load cached datasets.")
         return None
 
+
 def _progress_scan(out_dir: str, split: str) -> List[Dict[str, Any]]:
     """
+    Scan processed dataset folders and collect pairing records with progress reporting.
+
     Wrapper that calls the existing pairing routine but renders TWO progress bars:
       1) datasets
       2) pairings within the current dataset
@@ -933,26 +1079,34 @@ def _progress_scan(out_dir: str, split: str) -> List[Dict[str, Any]]:
         split (str): Split to scan.
 
     Returns:
-        list[dict[str, Any]]: Pairing dictionaries from ``get_pairings``.
+        List[Dict[str, Any]]: Image/mask pair records collected from each discovered
+            dataset.
     """
     # Discover dataset folders once, then call get_pairings per dataset.
     entries = sorted(os.listdir(out_dir))
     datasets = [d for d in entries if os.path.isdir(os.path.join(out_dir, d))]
 
     all_pairs = []
+
     for ds in datasets:
         # get_pairings already supports a list of datasets; we pass [ds] and rely
         # on its internal per-mask tqdm. We temporarily suppress its prints by
         # letting tqdm handle the lines.
         pairs = get_pairings(out_dir, [ds], split=split)
         all_pairs.extend(pairs)
+
     return all_pairs
+
 
 def build_and_cache_formatted_splits(
     *,
     config,
     cache_root: str,
-) -> Tuple[SegmentationSequenceDataset, SegmentationSequenceDataset, SegmentationSequenceDataset]:
+) -> Tuple[
+    SegmentationSequenceDataset,
+    SegmentationSequenceDataset,
+    SegmentationSequenceDataset,
+]:
     """
     One-time materialization:
       - builds sequences (train/val from 'train', test from 'test'),
@@ -966,17 +1120,17 @@ def build_and_cache_formatted_splits(
         cache_root (str): Root directory for formatted dataset cache.
 
     Returns:
-        tuple[SegmentationSequenceDataset, SegmentationSequenceDataset, SegmentationSequenceDataset]:
-            Train, validation, and test datasets.
+        tuple[SegmentationSequenceDataset, ...]: Training, validation, and test
+            datasets, in that order.
     """
-    out_dir  = str(config.dripp.output_dir)
-    seq_len  = int(getattr(config.sampler, "seq_len", 8))
-    min_fg   = int(getattr(config.sampler, "min_fg_frames_in_window", 2))
+    out_dir = str(config.dripp.output_dir)
+    seq_len = int(getattr(config.sampler, "seq_len", 8))
+    min_fg = int(getattr(config.sampler, "min_fg_frames_in_window", 2))
     val_frac = float(getattr(config.training, "val_frac", 0.1))
-    seed     = int(getattr(config.training, "seed", 42))
+    seed = int(getattr(config.training, "seed", 42))
     # Train-time augs as in your current script
     base_prob = 0.15
-    lr_prob   = 0.25
+    lr_prob = 0.25
     flip_prob = 0.50
 
     # IMPORTANT: enforce at least `seq_len` foreground slices in one axis for 3D masks
@@ -988,8 +1142,12 @@ def build_and_cache_formatted_splits(
         "downsample": 2,
         "min_frac_2d_area": 0.00153,
     }
-    tasks_fp = _fingerprint_file(getattr(getattr(config, "dripp", object()), "tasks_file", None))
-    fg_min_frac = float(getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002))
+    tasks_fp = _fingerprint_file(
+        getattr(getattr(config, "dripp", object()), "tasks_file", None)
+    )
+    fg_min_frac = float(
+        getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002)
+    )
     manifests_fp = _fingerprint_dripp_manifests(out_dir)
 
     sig = DatasetSignature(
@@ -1010,6 +1168,7 @@ def build_and_cache_formatted_splits(
 
     # Load DRIPP tasks map so we can refine tasks per mask class when building sequences
     tasks_map_path = getattr(getattr(config, "dripp", object()), "tasks_file", None)
+
     if tasks_map_path is not None:
         with open(tasks_map_path, "r") as f:
             tasks_map = json.load(f)
@@ -1036,7 +1195,9 @@ def build_and_cache_formatted_splits(
 
     train_ds = SegmentationSequenceDataset(
         train_seqs,
-        transform=SequenceTransform(base_prob=base_prob, lr_prob=lr_prob, flip_prob=flip_prob),
+        transform=SequenceTransform(
+            base_prob=base_prob, lr_prob=lr_prob, flip_prob=flip_prob
+        ),
         max_frames_per_sequence=seq_len,
         min_fg_frames_in_window=min_fg,
         fg_min_pixels_frac=fg_min_frac,
@@ -1080,6 +1241,7 @@ def build_and_cache_formatted_splits(
 
     return train_ds, val_ds, test_ds
 
+
 def load_datasets(*, config, cache_root):
     """
     Loads three datasets from cache or builds them from scratch if they don't exist.
@@ -1089,14 +1251,14 @@ def load_datasets(*, config, cache_root):
         cache_root (str): Path to the cache directory.
 
     Returns:
-        Tuple[SegmentationSequenceDataset, SegmentationSequenceDataset, SegmentationSequenceDataset]:
-            Train, validation, and test datasets.
+        tuple[SegmentationSequenceDataset, ...]: Training, validation, and test
+            datasets, in that order.
     """
-    out_dir  = str(config.dripp.output_dir)
-    seq_len  = int(getattr(config.sampler, "seq_len", 8))
-    min_fg   = int(getattr(config.sampler, "min_fg_frames_in_window", 2))
+    out_dir = str(config.dripp.output_dir)
+    seq_len = int(getattr(config.sampler, "seq_len", 8))
+    min_fg = int(getattr(config.sampler, "min_fg_frames_in_window", 2))
     val_frac = float(getattr(config.training, "val_frac", 0.1))
-    seed     = int(getattr(config.training, "seed", 42))
+    seed = int(getattr(config.training, "seed", 42))
     base_prob, lr_prob, flip_prob = 0.15, 0.25, 0.50
 
     # Must match build_and_cache_formatted_splits so the signature/caching is consistent
@@ -1107,8 +1269,12 @@ def load_datasets(*, config, cache_root):
         "downsample": 2,
         "min_frac_2d_area": 0.00153,
     }
-    tasks_fp = _fingerprint_file(getattr(getattr(config, "dripp", object()), "tasks_file", None))
-    fg_min_frac = float(getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002))
+    tasks_fp = _fingerprint_file(
+        getattr(getattr(config, "dripp", object()), "tasks_file", None)
+    )
+    fg_min_frac = float(
+        getattr(getattr(config, "sampler", {}), "fg_min_pixels_frac", 0.0002)
+    )
     manifests_fp = _fingerprint_dripp_manifests(out_dir)
 
     # Build signature
@@ -1131,15 +1297,28 @@ def load_datasets(*, config, cache_root):
 
     # Try cached first
     cached = _load_cached_datasets(cache_root, sig, need_train_val=True)
+
     if cached is not None and all(cached):
         train_ds, val_ds, test_ds = cached
     else:
         print("No cached datasets found. Building new datasets...")
-        train_ds, val_ds, test_ds = build_and_cache_formatted_splits(config=config, cache_root=cache_root)
+        train_ds, val_ds, test_ds = build_and_cache_formatted_splits(
+            config=config, cache_root=cache_root
+        )
 
     # Rebuild datasets to keep constructor options aligned with the active configuration.
     def _rebuild_dataset(ds):
-        """Recreate a dataset with active constructor settings."""
+        """
+        Recreate a dataset with active constructor settings.
+
+        Args:
+            ds (SegmentationSequenceDataset): Cached dataset to rebuild with current sampling
+                settings.
+
+        Returns:
+            SegmentationSequenceDataset: Dataset retaining cached sequences and the current
+                constructor settings.
+        """
         return SegmentationSequenceDataset(
             ds.sequences,
             transform=ds.transform,
@@ -1150,20 +1329,20 @@ def load_datasets(*, config, cache_root):
         )
 
     train_ds = _rebuild_dataset(train_ds)
-    val_ds   = _rebuild_dataset(val_ds)
-    test_ds  = _rebuild_dataset(test_ds)
+    val_ds = _rebuild_dataset(val_ds)
+    test_ds = _rebuild_dataset(test_ds)
 
-    prompt_cfg   = getattr(config, "prompt", None)
-    max_per_seq  = 4
-    mask_prob    = 0.5
-    click_prob   = 0.0
+    prompt_cfg = getattr(config, "prompt", None)
+    max_per_seq = 4
+    mask_prob = 0.5
+    click_prob = 0.0
 
     if prompt_cfg is not None:
         max_per_seq = int(getattr(prompt_cfg, "max_per_seq", max_per_seq))
-        mask_prob   = float(getattr(prompt_cfg, "mask_prob", mask_prob))
-        click_prob  = float(getattr(prompt_cfg, "click_prob", click_prob))
+        mask_prob = float(getattr(prompt_cfg, "mask_prob", mask_prob))
+        click_prob = float(getattr(prompt_cfg, "click_prob", click_prob))
 
-    bbox_prob  = max(0.0, 1.0 - mask_prob - click_prob)
+    bbox_prob = max(0.0, 1.0 - mask_prob - click_prob)
     prompt_mix = {"mask": mask_prob, "click": click_prob, "bbox": bbox_prob}
 
     for ds in (train_ds, val_ds, test_ds):
@@ -1174,6 +1353,7 @@ def load_datasets(*, config, cache_root):
     val_ds.prompt_mix = {"mask": 0.0, "click": 0.0, "bbox": 1.0}
 
     return train_ds, val_ds, test_ds
+
 
 def _normalize_quality_params(params: dict) -> dict:
     """
@@ -1193,6 +1373,7 @@ def _normalize_quality_params(params: dict) -> dict:
         "min_frac_2d_area": float(params.get("min_frac_2d_area", 0.0)),
     }
 
+
 def _qc_cache_filename(ds_dir: str, split: str, quality_params: dict) -> str:
     """
     Build a quality-control cache filename from effective QC parameters.
@@ -1206,6 +1387,7 @@ def _qc_cache_filename(ds_dir: str, split: str, quality_params: dict) -> str:
         str: QC cache file path.
     """
     qp = _normalize_quality_params(quality_params)
+
     return os.path.join(
         ds_dir,
         f"qc_{split}"
@@ -1213,10 +1395,13 @@ def _qc_cache_filename(ds_dir: str, split: str, quality_params: dict) -> str:
         f"_sl{qp['min_slices_any_axis']}"
         f"_area{qp['min_slice_area_px']}"
         f"_frac{qp['min_frac_2d_area']}"
-        f"_ds{qp['downsample']}.json"
+        f"_ds{qp['downsample']}.json",
     )
 
-def load_qc_cache(ds_dir: str, split: str, quality_params: dict) -> Optional[Dict[str, Tuple[bool, dict]]]:
+
+def load_qc_cache(
+    ds_dir: str, split: str, quality_params: dict
+) -> Optional[Dict[str, Tuple[bool, dict]]]:
     """
     Load QC results if they exist AND match quality settings AND file states haven't changed.
     Returns a dict: mask_path -> (ok, info) or None if not usable.
@@ -1251,12 +1436,17 @@ def load_qc_cache(ds_dir: str, split: str, quality_params: dict) -> Optional[Dic
         # Validate staleness using cached key vs. current file stats
         cached = tuple(rec.get("file_key", (p, 0, 0)))
         current = _mask_qc_cache_key(p)
+
         if cached == current:
             out[p] = (ok, info)
+
         # else: file changed; force recompute for this path (don’t include)
     return out
 
-def save_qc_cache(ds_dir: str, split: str, quality_params: dict, results: Dict[str, Tuple[bool, dict]]):
+
+def save_qc_cache(
+    ds_dir: str, split: str, quality_params: dict, results: Dict[str, Tuple[bool, dict]]
+):
     """
     Overwrites cache file with the provided results (path -> (ok, info)).
 
@@ -1264,7 +1454,7 @@ def save_qc_cache(ds_dir: str, split: str, quality_params: dict, results: Dict[s
         ds_dir (str): Dataset directory.
         split (str): Data split name.
         quality_params (dict): Mask QC parameter dictionary.
-        results (dict[str, tuple[bool, dict]]): QC results keyed by mask path.
+        results (Dict[str, Tuple[bool, dict]]): QC results keyed by mask path.
 
     Returns:
         None.
@@ -1284,11 +1474,17 @@ def save_qc_cache(ds_dir: str, split: str, quality_params: dict, results: Dict[s
             for p, (ok, info) in results.items()
         ],
     }
+
     with open(path, "w") as f:
         json.dump(payload, f)
 
-def merge_qc_cache_results(ds_dir: str, split: str, quality_params: dict,
-                           new_results: Dict[str, Tuple[bool, dict]]):
+
+def merge_qc_cache_results(
+    ds_dir: str,
+    split: str,
+    quality_params: dict,
+    new_results: Dict[str, Tuple[bool, dict]],
+):
     """
     Merge new per-mask results into the existing cache (if any) and save.
 
@@ -1296,7 +1492,7 @@ def merge_qc_cache_results(ds_dir: str, split: str, quality_params: dict,
         ds_dir (str): Dataset directory.
         split (str): Data split name.
         quality_params (dict): Mask QC parameter dictionary.
-        new_results (dict[str, tuple[bool, dict]]): Results to merge.
+        new_results (Dict[str, Tuple[bool, dict]]): Results to merge.
 
     Returns:
         None.
@@ -1305,6 +1501,7 @@ def merge_qc_cache_results(ds_dir: str, split: str, quality_params: dict,
     # Replace or add entries from new_results
     existing.update(new_results)
     save_qc_cache(ds_dir, split, quality_params, existing)
+
 
 def _mask_qc_cache_key(p):
     """
@@ -1324,15 +1521,16 @@ def _mask_qc_cache_key(p):
     except OSError:
         return (p, 0, 0)
 
+
 def check_mask_quality(
     mask_path,
     min_voxels=128,
-    min_slices_any_axis=2,       # now interpreted as: required contiguous window length on highest-res axis
+    min_slices_any_axis=2,  # now interpreted as: required contiguous window length on highest-res axis
     min_slice_area_px=64,
     *,
-    downsample=2,                 # Downsample factor: 1 (exact, slower), 2 (fast), 4 (very fast)
+    downsample=2,  # Downsample factor: 1 (exact, slower), 2 (fast), 4 (very fast)
     use_full_if_borderline=True,  # Refine borderline fails at full-res
-    borderline_ratio=0.8,         # How close to thresholds counts as "borderline"
+    borderline_ratio=0.8,  # How close to thresholds counts as "borderline"
     min_frac_2d_area=None,
 ):
     """
@@ -1357,7 +1555,7 @@ def check_mask_quality(
             for per-slice FG (e.g. 0.00153 = 0.153%).
 
     Returns:
-        tuple: (ok: bool, info: dict)
+        tuple: (ok: bool, info: dict).
     """
     # Check cache first
     key = _mask_qc_cache_key(mask_path)
@@ -1371,15 +1569,17 @@ def check_mask_quality(
     except Exception as e:
         res = (False, {"reason": "read_error", "error": str(e)})
         _MASK_QC_CACHE[key] = res
+
         return res
 
     # Binary 3D mask
-    m_bin = (np.asarray(m) > 0)
+    m_bin = np.asarray(m) > 0
 
     # Only enforce checks for 3D
     if m_bin.ndim != 3:
         res = (True, {"reason": "not_3d"})
         _MASK_QC_CACHE[key] = res
+
         return res
 
     # Full-res dims
@@ -1392,13 +1592,18 @@ def check_mask_quality(
 
     # Scale thresholds to downsampled grid
     # Voxels ~ ds^3, areas ~ ds^2
-    min_vox_ds = max(1, ceil(min_voxels / (ds ** 3)))
-    win_len    = int(max(1, min_slices_any_axis))
+    min_vox_ds = max(1, ceil(min_voxels / (ds**3)))
+    win_len = int(max(1, min_slices_any_axis))
 
     # --- 1) Total FG voxels (quick fail) ---
     vox_ds = int(m_ds.sum())
+
     if vox_ds < min_vox_ds:
-        if use_full_if_borderline and vox_ds >= int(borderline_ratio * min_vox_ds) and ds > 1:
+        if (
+            use_full_if_borderline
+            and vox_ds >= int(borderline_ratio * min_vox_ds)
+            and ds > 1
+        ):
             return check_mask_quality(
                 mask_path,
                 min_voxels,
@@ -1409,13 +1614,18 @@ def check_mask_quality(
                 borderline_ratio=borderline_ratio,
                 min_frac_2d_area=min_frac_2d_area,
             )
-        res = (False, {
-            "voxels": vox_ds * (ds ** 3),
-            "slices_by_axis": [0, 0, 0],
-            "max_area": 0,
-            "reason": "too_few_voxels",
-        })
+
+        res = (
+            False,
+            {
+                "voxels": vox_ds * (ds**3),
+                "slices_by_axis": [0, 0, 0],
+                "max_area": 0,
+                "reason": "too_few_voxels",
+            },
+        )
         _MASK_QC_CACHE[key] = res
+
         return res
 
     # For info only (not gating anymore)
@@ -1424,19 +1634,24 @@ def check_mask_quality(
     sX = int(np.count_nonzero(m_ds.any(axis=(0, 1))))
     slices_by_axis_ds = [sZ, sY, sX]
 
-    max_area_ds = int(max(
-        m_ds.sum(axis=(1, 2)).max(initial=0),
-        m_ds.sum(axis=(0, 2)).max(initial=0),
-        m_ds.sum(axis=(0, 1)).max(initial=0),
-    ))
+    max_area_ds = int(
+        max(
+            m_ds.sum(axis=(1, 2)).max(initial=0),
+            m_ds.sum(axis=(0, 2)).max(initial=0),
+            m_ds.sum(axis=(0, 1)).max(initial=0),
+        )
+    )
 
     # --- 2) Choose highest-resolution axis (same heuristic as _load_3d) ---
     # In-plane pixel counts per viewing axis (full-res proxy)
-    inplane_area = np.array([
-        Y_full * X_full,  # axis 0: Z-slices are YxX
-        Z_full * X_full,  # axis 1: Y-slices are ZxX
-        Z_full * Y_full,  # axis 2: X-slices are ZxY
-    ], dtype=np.int64)
+    inplane_area = np.array(
+        [
+            Y_full * X_full,  # axis 0: Z-slices are YxX
+            Z_full * X_full,  # axis 1: Y-slices are ZxX
+            Z_full * Y_full,  # axis 2: X-slices are ZxY
+        ],
+        dtype=np.int64,
+    )
     hi_axis = int(inplane_area.argmax())
 
     # Full-res slice area for that axis
@@ -1471,26 +1686,31 @@ def check_mask_quality(
                 borderline_ratio=borderline_ratio,
                 min_frac_2d_area=min_frac_2d_area,
             )
-        res = (False, {
-            "voxels": vox_ds * (ds ** 3),
-            "slices_by_axis": slices_by_axis_ds,
-            "max_area": max_area_ds * (ds ** 2),
-            "reason": "axis_too_short_for_contig_window",
-        })
+
+        res = (
+            False,
+            {
+                "voxels": vox_ds * (ds**3),
+                "slices_by_axis": slices_by_axis_ds,
+                "max_area": max_area_ds * (ds**2),
+                "reason": "axis_too_short_for_contig_window",
+            },
+        )
         _MASK_QC_CACHE[key] = res
+
         return res
 
     # --- 3) Per-slice FG area threshold on that axis (full-res then scaled to DS) ---
     if min_frac_2d_area is not None:
         thr_full_frac = ceil(min_frac_2d_area * full_slice_area)
-        thr_full_px   = max(min_slice_area_px, thr_full_frac)
+        thr_full_px = max(min_slice_area_px, thr_full_frac)
     else:
         thr_full_px = int(min_slice_area_px)
 
-    thr_area_ds = max(1, ceil(thr_full_px / (ds ** 2)))  # convert to DS grid
+    thr_area_ds = max(1, ceil(thr_full_px / (ds**2)))  # convert to DS grid
 
     # Boolean "good" slices on highest-res axis
-    good = (per_slice_area_ds >= thr_area_ds)
+    good = per_slice_area_ds >= thr_area_ds
 
     if win_len <= 0:
         contig_ok = bool(good.any())
@@ -1498,14 +1718,17 @@ def check_mask_quality(
     else:
         x = good.astype(np.int32)
         cs = np.concatenate([[0], np.cumsum(x)])  # [L+1]
-        win_sums = cs[win_len:] - cs[:-win_len]   # [L-win_len+1]
+        win_sums = cs[win_len:] - cs[:-win_len]  # [L-win_len+1]
         max_win = int(win_sums.max(initial=0) if win_sums.size > 0 else 0)
         contig_ok = bool((win_sums == win_len).any()) if win_sums.size > 0 else False
 
     if not contig_ok:
         # Optional full-res retry for borderline cases (e.g. 7 of 8 slices)
-        if (use_full_if_borderline and ds > 1 and
-            max_win >= int(borderline_ratio * win_len)):
+        if (
+            use_full_if_borderline
+            and ds > 1
+            and max_win >= int(borderline_ratio * win_len)
+        ):
             return check_mask_quality(
                 mask_path,
                 min_voxels,
@@ -1517,27 +1740,36 @@ def check_mask_quality(
                 min_frac_2d_area=min_frac_2d_area,
             )
 
-        res = (False, {
-            "voxels": vox_ds * (ds ** 3),
-            "slices_by_axis": slices_by_axis_ds,
-            "max_area": max_area_ds * (ds ** 2),
-            "reason": "no_contiguous_fg_window",
-            "hi_axis": hi_axis,
-            "max_contig_fg_slices": max_win,
-        })
+        res = (
+            False,
+            {
+                "voxels": vox_ds * (ds**3),
+                "slices_by_axis": slices_by_axis_ds,
+                "max_area": max_area_ds * (ds**2),
+                "reason": "no_contiguous_fg_window",
+                "hi_axis": hi_axis,
+                "max_contig_fg_slices": max_win,
+            },
+        )
         _MASK_QC_CACHE[key] = res
+
         return res
 
     # Success
-    res = (True, {
-        "voxels": vox_ds * (ds ** 3),
-        "slices_by_axis": slices_by_axis_ds,
-        "max_area": max_area_ds * (ds ** 2),
-        "hi_axis": hi_axis,
-        "contig_window_len": win_len,
-    })
+    res = (
+        True,
+        {
+            "voxels": vox_ds * (ds**3),
+            "slices_by_axis": slices_by_axis_ds,
+            "max_area": max_area_ds * (ds**2),
+            "hi_axis": hi_axis,
+            "contig_window_len": win_len,
+        },
+    )
     _MASK_QC_CACHE[key] = res
+
     return res
+
 
 def load_mask_bool_3d(path):
     """
@@ -1556,14 +1788,16 @@ def load_mask_bool_3d(path):
         arr = sitk.GetArrayFromImage(itk)  # [Z,Y,X]
         if arr.ndim != 3:
             return None, {"reason": "not_3d"}
+
         return torch.from_numpy((arr > 0)), None  # CPU bool tensor
     except Exception as e:
         return None, {"reason": "read_error", "error": str(e)}
 
+
 def check_masks_quality_gpu(
     mask_paths,
     min_voxels=128,
-    min_slices_any_axis=2,   # interpreted as contiguous window length on highest-res axis
+    min_slices_any_axis=2,  # interpreted as contiguous window length on highest-res axis
     min_slice_area_px=64,
     downsample=2,
     batch_size=16,
@@ -1573,13 +1807,11 @@ def check_masks_quality_gpu(
 ):
     """
     Vectorized GPU check for a list of 3D mask paths.
+
     New semantics:
       - For each 3D mask, require that on the highest-resolution axis there exists
         a contiguous window of length N = min_slices_any_axis where each slice has
         foreground area >= max(min_slice_area_px, min_frac_2d_area * slice_area).
-
-    Returns:
-        list: List of (ok: bool, info: dict) aligned to mask_paths.
 
     Args:
         mask_paths (list[str]): 3D mask paths to evaluate.
@@ -1591,28 +1823,33 @@ def check_masks_quality_gpu(
         device (str | None): Torch device string, or None to auto-select.
         parallel_reads (int): Number of parallel CPU image readers.
         min_frac_2d_area (float | None): Optional per-slice fractional area threshold.
+
+    Returns:
+        list: List of (ok: bool, info: dict) aligned to mask_paths.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     results = [None] * len(mask_paths)
-    scale_vox  = max(1, downsample ** 3)
-    scale_area = max(1, downsample ** 2)
-    win_len    = int(max(1, min_slices_any_axis))
+    scale_vox = max(1, downsample**3)
+    scale_area = max(1, downsample**2)
+    win_len = int(max(1, min_slices_any_axis))
     ds = max(1, int(downsample))
 
     for start in range(0, len(mask_paths), batch_size):
-        chunk_paths = mask_paths[start:start + batch_size]
+        chunk_paths = mask_paths[start : start + batch_size]
 
         # Parallel CPU reads
-        with ThreadPoolExecutor(max_workers=min(parallel_reads, len(chunk_paths))) as ex:
+        with ThreadPoolExecutor(
+            max_workers=min(parallel_reads, len(chunk_paths))
+        ) as ex:
             loaded = list(ex.map(load_mask_bool_3d, chunk_paths))
 
         # Prepare per-chunk outputs, build tensors list for real 3D
         to_stack = []
-        idx_map = []      # Map stacked index -> results index in full list
+        idx_map = []  # Map stacked index -> results index in full list
         orig_shapes = []  # full-res shapes [(Z,Y,X),...]
-        ds_shapes = []    # downsampled shapes [(Z',Y',X'),...]
+        ds_shapes = []  # downsampled shapes [(Z',Y',X'),...]
 
         for j, (t_cpu, info) in enumerate(loaded):
             out_idx = start + j
@@ -1622,6 +1859,7 @@ def check_masks_quality_gpu(
                     results[out_idx] = (True, info)
                 else:
                     results[out_idx] = (False, info)
+
                 continue
 
             # Downsample by stride on CPU, then send to GPU
@@ -1639,10 +1877,14 @@ def check_masks_quality_gpu(
         H = max(t.shape[1] for t in to_stack)
         W = max(t.shape[2] for t in to_stack)
         padded = []
+
         for t in to_stack:
             pad = (0, W - t.shape[2], 0, H - t.shape[1], 0, D - t.shape[0])  # W, H, D
             padded.append(torch.nn.functional.pad(t, pad))  # Pad with False
-        batch = torch.stack(padded, 0).to(device=device, dtype=torch.bool, non_blocking=True)  # [B,D,H,W]
+
+        batch = torch.stack(padded, 0).to(
+            device=device, dtype=torch.bool, non_blocking=True
+        )  # [B,D,H,W]
 
         # Vectorized metrics on GPU
         vox_ds = batch.sum(dim=(1, 2, 3))  # [B]
@@ -1657,20 +1899,21 @@ def check_masks_quality_gpu(
         sY = (batch.any(dim=(1, 3))).sum(dim=1)
         sX = (batch.any(dim=(1, 2))).sum(dim=1)
 
-        max_area_ds = torch.stack([
-            areaZ.max(dim=1).values,
-            areaY.max(dim=1).values,
-            areaX.max(dim=1).values
-        ], dim=1).amax(dim=1)  # [B]
+        max_area_ds = torch.stack(
+            [areaZ.max(dim=1).values, areaY.max(dim=1).values, areaX.max(dim=1).values],
+            dim=1,
+        ).amax(
+            dim=1
+        )  # [B]
 
         # Scale voxel threshold
         thr_vox_ds = math.ceil(min_voxels / scale_vox)
 
         # Now decide per-sample in Python (B is small)
-        vox_out  = (vox_ds * scale_vox).to(torch.int64).tolist()
-        sZ_out   = sZ.to(torch.int64).tolist()
-        sY_out   = sY.to(torch.int64).tolist()
-        sX_out   = sX.to(torch.int64).tolist()
+        vox_out = (vox_ds * scale_vox).to(torch.int64).tolist()
+        sZ_out = sZ.to(torch.int64).tolist()
+        sY_out = sY.to(torch.int64).tolist()
+        sX_out = sX.to(torch.int64).tolist()
         area_out = (max_area_ds * scale_area).to(torch.int64).tolist()
 
         for bi, out_idx in enumerate(idx_map):
@@ -1680,7 +1923,11 @@ def check_masks_quality_gpu(
                     False,
                     {
                         "voxels": int(vox_out[bi]),
-                        "slices_by_axis": [int(sZ_out[bi]), int(sY_out[bi]), int(sX_out[bi])],
+                        "slices_by_axis": [
+                            int(sZ_out[bi]),
+                            int(sY_out[bi]),
+                            int(sX_out[bi]),
+                        ],
                         "max_area": int(area_out[bi]),
                         "reason": "too_few_voxels",
                     },
@@ -1688,14 +1935,17 @@ def check_masks_quality_gpu(
                 continue
 
             Z_full, Y_full, X_full = orig_shapes[bi]
-            Z_ds_,  Y_ds_,  X_ds_  = ds_shapes[bi]
+            Z_ds_, Y_ds_, X_ds_ = ds_shapes[bi]
 
             # Highest-resolution axis using same proxy as CPU
-            inplane_area = np.array([
-                Y_full * X_full,  # axis 0
-                Z_full * X_full,  # axis 1
-                Z_full * Y_full,  # axis 2
-            ], dtype=np.int64)
+            inplane_area = np.array(
+                [
+                    Y_full * X_full,  # axis 0
+                    Z_full * X_full,  # axis 1
+                    Z_full * Y_full,  # axis 2
+                ],
+                dtype=np.int64,
+            )
             hi_axis = int(inplane_area.argmax())
 
             # Full-res slice area for that axis
@@ -1718,7 +1968,11 @@ def check_masks_quality_gpu(
                     False,
                     {
                         "voxels": int(vox_out[bi]),
-                        "slices_by_axis": [int(sZ_out[bi]), int(sY_out[bi]), int(sX_out[bi])],
+                        "slices_by_axis": [
+                            int(sZ_out[bi]),
+                            int(sY_out[bi]),
+                            int(sX_out[bi]),
+                        ],
                         "max_area": int(area_out[bi]),
                         "reason": "axis_too_short_for_contig_window",
                         "hi_axis": hi_axis,
@@ -1729,7 +1983,7 @@ def check_masks_quality_gpu(
             # Per-slice FG area threshold on that axis (full-res -> DS)
             if min_frac_2d_area is not None:
                 thr_full_frac = math.ceil(min_frac_2d_area * full_slice_area)
-                thr_full_px   = max(min_slice_area_px, thr_full_frac)
+                thr_full_px = max(min_slice_area_px, thr_full_frac)
             else:
                 thr_full_px = int(min_slice_area_px)
 
@@ -1745,16 +1999,22 @@ def check_masks_quality_gpu(
             else:
                 x = good.astype(np.int32)
                 cs = np.concatenate([[0], np.cumsum(x)])
-                win_sums = cs[win_len:] - cs[:-win_len]   # [L-win_len+1]
+                win_sums = cs[win_len:] - cs[:-win_len]  # [L-win_len+1]
                 max_win = int(win_sums.max(initial=0) if win_sums.size > 0 else 0)
-                contig_ok = bool((win_sums == win_len).any()) if win_sums.size > 0 else False
+                contig_ok = (
+                    bool((win_sums == win_len).any()) if win_sums.size > 0 else False
+                )
 
             if not contig_ok:
                 results[out_idx] = (
                     False,
                     {
                         "voxels": int(vox_out[bi]),
-                        "slices_by_axis": [int(sZ_out[bi]), int(sY_out[bi]), int(sX_out[bi])],
+                        "slices_by_axis": [
+                            int(sZ_out[bi]),
+                            int(sY_out[bi]),
+                            int(sX_out[bi]),
+                        ],
                         "max_area": int(area_out[bi]),
                         "reason": "no_contiguous_fg_window",
                         "hi_axis": hi_axis,
@@ -1766,7 +2026,11 @@ def check_masks_quality_gpu(
                     True,
                     {
                         "voxels": int(vox_out[bi]),
-                        "slices_by_axis": [int(sZ_out[bi]), int(sY_out[bi]), int(sX_out[bi])],
+                        "slices_by_axis": [
+                            int(sZ_out[bi]),
+                            int(sY_out[bi]),
+                            int(sX_out[bi]),
+                        ],
                         "max_area": int(area_out[bi]),
                         "hi_axis": hi_axis,
                         "contig_window_len": win_len,
@@ -1780,7 +2044,10 @@ def check_masks_quality_gpu(
 
     return results
 
-def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Dict[str, Any]]:
+
+def compute_mask_stats_3d(
+    mask_path: str, downsample: int = 2
+) -> Tuple[bool, Dict[str, Any]]:
     """
     Compute compact, reusable 3D mask stats.
 
@@ -1808,7 +2075,7 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
     except Exception as e:
         return False, {"reason": "read_error", "error": str(e)}
 
-    m_bin = (np.asarray(m) > 0)
+    m_bin = np.asarray(m) > 0
     if m_bin.ndim != 3:
         return False, {"reason": "not_3d"}
 
@@ -1816,11 +2083,14 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
 
     # Choose the viewing/sequence axis before sampling. Keep that axis at
     # full resolution and sample only the two in-plane axes.
-    inplane_area = np.array([
-        Y_full * X_full,  # axis 0: Z slices are YxX
-        Z_full * X_full,  # axis 1: Y slices are ZxX
-        Z_full * Y_full,  # axis 2: X slices are ZxY
-    ], dtype=np.int64)
+    inplane_area = np.array(
+        [
+            Y_full * X_full,  # axis 0: Z slices are YxX
+            Z_full * X_full,  # axis 1: Y slices are ZxX
+            Z_full * Y_full,  # axis 2: X slices are ZxY
+        ],
+        dtype=np.int64,
+    )
     hi_axis = int(inplane_area.argmax())
 
     ds = int(max(1, downsample))
@@ -1838,13 +2108,14 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
     sX = int(np.count_nonzero(m_ds.any(axis=(0, 1))))
 
     # Max per-slice area across axes (ds grid), scaled to full-res estimate
-    max_area_ds = int(max(
-        m_ds.sum(axis=(1, 2)).max(initial=0),
-        m_ds.sum(axis=(0, 2)).max(initial=0),
-        m_ds.sum(axis=(0, 1)).max(initial=0),
-    ))
-    max_area_est = int(max_area_ds * (ds ** 2))
-
+    max_area_ds = int(
+        max(
+            m_ds.sum(axis=(1, 2)).max(initial=0),
+            m_ds.sum(axis=(0, 2)).max(initial=0),
+            m_ds.sum(axis=(0, 1)).max(initial=0),
+        )
+    )
+    max_area_est = int(max_area_ds * (ds**2))
 
     # Per-slice FG area on the chosen axis (ds grid)
     if hi_axis == 0:
@@ -1869,7 +2140,10 @@ def compute_mask_stats_3d(mask_path: str, downsample: int = 2) -> Tuple[bool, Di
     }
     return True, stats
 
-def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+
+def evaluate_quality_from_stats(
+    stats: Dict[str, Any], quality_params: Dict[str, Any]
+) -> Tuple[bool, Dict[str, Any]]:
     """
     Decide pass/fail using cached stats and the current quality_params.
 
@@ -1879,8 +2153,8 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
         where each slice has FG area >= max(min_slice_area_px, min_frac_2d_area * full_slice_area)
 
     Args:
-        stats (dict[str, Any]): Cached mask stats from ``compute_mask_stats_3d``.
-        quality_params (dict[str, Any]): Current mask QC thresholds.
+        stats (Dict[str, Any]): Cached mask stats from ``compute_mask_stats_3d``.
+        quality_params (Dict[str, Any]): Current mask QC thresholds.
 
     Returns:
         tuple[bool, dict[str, Any]]: Pass/fail flag and diagnostic info.
@@ -1895,6 +2169,7 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
     min_frac_2d_area = quality_params.get("min_frac_2d_area", None)
 
     voxels = int(stats.get("voxels_exact", stats.get("voxels_est", 0)))
+
     if voxels < min_voxels:
         return False, {"reason": "too_few_voxels", "voxels": voxels}
 
@@ -1913,7 +2188,7 @@ def evaluate_quality_from_stats(stats: Dict[str, Any], quality_params: Dict[str,
         thr_full_px = min_slice_area_px
 
     # Convert full-res threshold to ds-grid threshold
-    thr_area_ds = int(max(1, math.ceil(thr_full_px / (ds ** 2))))
+    thr_area_ds = int(max(1, math.ceil(thr_full_px / (ds**2))))
 
     # Decode per-slice areas on ds grid
     per_slice_area_ds = _unpack_u32_zlib_b64(stats["per_slice_area_b64"])

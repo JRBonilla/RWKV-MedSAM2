@@ -1,7 +1,7 @@
-# Dataset and sampling utilities for RWKV-MedSAM2.
-#
-# Provides sequence loading for 2D images and 3D volumes, prompt generation,
-# per-sequence augmentation, and balanced task/dimension batch sampling.
+"""
+Load segmentation sequences, generate prompts, augment frames, and balance task batches.
+"""
+
 import random
 import math
 from collections import Counter, defaultdict
@@ -15,36 +15,31 @@ import torchvision.transforms.functional as TF
 
 from dripp.helpers import normalize_path, get_extension
 
+
 class SegmentationSequenceDataset(Dataset):
     """
     Load preformatted 2D and 3D segmentation sequences for SAM2-style training.
-
-    Args:
-        Dataset (type): PyTorch dataset base class.
-
-    Returns:
-        None.
     """
 
     def __init__(
-            self,
-            sequences,
-            transform,
-            truncate=True,
-            max_frames_per_sequence=8,
-            min_fg_frames_in_window=2,
-            prompt_mix=None,
-            max_prompt_frames=4,
-            always_prompt_first=True,
-            enable_negative_clicks=False,
-            num_pos_clicks=1,
-            num_neg_clicks=0,
-            neg_margin_frac=0.1,
-            reverse_prob=0.5,
-            fg_min_pixels_frac=0.0002,
-            window_select="weighted",
-            window_area_power=1.0,
-            prompt_bias_area=True,
+        self,
+        sequences,
+        transform,
+        truncate=True,
+        max_frames_per_sequence=8,
+        min_fg_frames_in_window=2,
+        prompt_mix=None,
+        max_prompt_frames=4,
+        always_prompt_first=True,
+        enable_negative_clicks=False,
+        num_pos_clicks=1,
+        num_neg_clicks=0,
+        neg_margin_frac=0.1,
+        reverse_prob=0.5,
+        fg_min_pixels_frac=0.0002,
+        window_select="weighted",
+        window_area_power=1.0,
+        prompt_bias_area=True,
     ):
         """
         Initializes a SegmentationSequenceDataset.
@@ -56,29 +51,42 @@ class SegmentationSequenceDataset(Dataset):
                     - dataset (str): Name of the dataset.
                     - subdataset (str, optional): Name of the subdataset, if applicable.
                     - dim (int): Dimension of the image (2 or 3).
-            transform (callable): An optional transformation to be applied to every image and mask pair.
-            truncate (bool, optional): Whether to truncate sequences to max_frames_per_sequence. Default is True.
-            max_frames_per_sequence (int, optional): Maximum number of frames per sequence. Default is 8.
-            min_fg_frames_in_window (int, optional): Minimum number of foreground frames per window. Default is 2.
-            prompt_mix (list[float], optional): List of probabilities for each prompt type. Default is None.
-            max_prompt_frames (int, optional):
-            always_prompt_first (bool, optional): Whether to always prompt the first frame. Default is True.
-            enable_negative_clicks (bool, optional): Whether to enable negative clicks. Default is True.
+            transform (callable): An optional transformation to be applied to every image and
+                mask pair.
+            truncate (bool, optional): Whether to truncate sequences to max_frames_per_sequence.
+                Default is True.
+            max_frames_per_sequence (int, optional): Maximum number of frames per sequence.
+                Default is 8.
+            min_fg_frames_in_window (int, optional): Minimum number of foreground frames per
+                window. Default is 2.
+            prompt_mix (dict[str, float] | None): Weights for mask, click, and bbox prompts, or
+                None to use the default mixture.
+            max_prompt_frames (int): Maximum number of sequence frames that receive prompts.
+            always_prompt_first (bool, optional): Whether to always prompt the first frame.
+                Default is True.
+            enable_negative_clicks (bool): Whether to sample background clicks. Defaults to
+                False.
             num_pos_clicks (int, optional): Number of positive clicks per frame. Default is 1.
-            num_neg_clicks (int, optional): Number of negative clicks per frame. Default is 1.
-            neg_margin_frac (float, optional): Fraction of negative click margin. Default is 0.1.
-            reverse_prob (float, optional): Probability of sampling reverse axis. Default is 0.5.
-            fg_min_pixels_frac (float, optional): Fraction of minimum foreground pixels. Default is 0.0002.
-            window_select (str, optional): Window selection strategy ("weighted", "argmax", "uniform"). Default is "weighted".
-            window_area_power (float, optional): Raise window area to this power before softmax. Default is 1.0.
-            prompt_bias_area (bool, optional): Whether to bias extra prompt towards areas with more foreground. Default is True.
+            num_neg_clicks (int): Number of background clicks per prompted frame. Defaults to 0.
+            neg_margin_frac (float, optional): Fraction of negative click margin. Default is
+                0.1.
+            reverse_prob (float, optional): Probability of sampling reverse axis. Default is
+                0.5.
+            fg_min_pixels_frac (float, optional): Fraction of minimum foreground pixels. Default
+                is 0.0002.
+            window_select (str, optional): Window selection strategy ("weighted", "argmax",
+                "uniform"). Default is "weighted".
+            window_area_power (float, optional): Raise window area to this power before softmax.
+                Default is 1.0.
+            prompt_bias_area (bool, optional): Whether to bias extra prompt towards areas with
+                more foreground. Default is True.
 
         Returns:
             None.
         """
         self.sequences = sequences
         self.transform = transform
-        self.entry_dims = [entry['dim'] for entry in sequences]
+        self.entry_dims = [entry["dim"] for entry in sequences]
         self.truncate = truncate
 
         self.max_frames_per_sequence = int(max_frames_per_sequence)
@@ -88,15 +96,15 @@ class SegmentationSequenceDataset(Dataset):
 
         # Normalize prompt mix
         s = sum(self.prompt_mix.values())
-        self.prompt_mix = {k: v/(s + 1e-8) for k,v in self.prompt_mix.items()}
+        self.prompt_mix = {k: v / (s + 1e-8) for k, v in self.prompt_mix.items()}
 
         # Prompt config
-        self.max_prompt_frames      = max_prompt_frames
-        self.always_prompt_first    = always_prompt_first
+        self.max_prompt_frames = max_prompt_frames
+        self.always_prompt_first = always_prompt_first
         self.enable_negative_clicks = enable_negative_clicks
-        self.num_pos_clicks         = num_pos_clicks
-        self.num_neg_clicks         = num_neg_clicks
-        self.neg_margin_frac        = neg_margin_frac
+        self.num_pos_clicks = num_pos_clicks
+        self.num_neg_clicks = num_neg_clicks
+        self.neg_margin_frac = neg_margin_frac
 
         # Probability of sampling reverse
         self.reverse_prob = reverse_prob
@@ -134,7 +142,8 @@ class SegmentationSequenceDataset(Dataset):
                 provided, it is expected to be (index, task_id) coming from a balanced sampler.
 
         Returns:
-            dict[str, Any]
+            dict[str, Any]: Image and mask sequences, training prompts, validation prompt cache,
+                and sample metadata.
         """
         # Unwrap batch-sampler-provided (index, task_id) if present
         chosen_task = None
@@ -142,16 +151,16 @@ class SegmentationSequenceDataset(Dataset):
             idx, chosen_task = idx
 
         # Get entry and associated data
-        entry       = self.sequences[idx]
-        ds_name     = entry['dataset']
-        sub_name    = entry.get('subdataset', '')
-        seq         = entry['sequence']
-        data_dim    = self.entry_dims[idx]
-        modality    = entry.get('modality', entry.get('subdataset_modality', 'unknown'))
+        entry = self.sequences[idx]
+        ds_name = entry["dataset"]
+        sub_name = entry.get("subdataset", "")
+        seq = entry["sequence"]
+        data_dim = self.entry_dims[idx]
+        modality = entry.get("modality", entry.get("subdataset_modality", "unknown"))
 
         # Get task info from entry (will be overridden by chosen_task if provided)
-        task_id     = entry.get('task_id', entry.get('task', None))
-        task_label  = entry.get('task_label', entry.get('task_name', None))
+        task_id = entry.get("task_id", entry.get("task", None))
+        task_label = entry.get("task_label", entry.get("task_name", None))
 
         # Reset transformations
         if self.transform is not None:
@@ -179,45 +188,58 @@ class SegmentationSequenceDataset(Dataset):
         )
 
         # Validation prompts: probability-driven frame selection, materialized for all modes
-        val_prompt_cache = self._generate_validation_prompt_cache(masks, data_dim=data_dim)
+        val_prompt_cache = self._generate_validation_prompt_cache(
+            masks, data_dim=data_dim
+        )
 
         # Only unsqueeze if needed
         mask_seq = masks
+
         if mask_seq.ndim == 3:  # [T,H,W]
             mask_seq = mask_seq.unsqueeze(1)
 
         # Convert only if axis_lengths is not None and we are not truncating
-        axis_lengths_i = tuple(map(int, axis_lengths)) if axis_lengths and not self.truncate else None
+        axis_lengths_i = (
+            tuple(map(int, axis_lengths))
+            if axis_lengths and not self.truncate
+            else None
+        )
 
         # Build output
         output = {
-            'image':            imgs,
-            'mask':             mask_seq,
-            'pt_list':          pt_list,
-            'p_label':          label_list,
-            'bbox':             bbox_list,
-            'm_prompt':         m_prompt_list,
-            'val_prompt_cache': val_prompt_cache,
-            'dataset':          ds_name,
-            'subdataset':       sub_name,
-            'seq_idx':          idx,
-            'dim':              data_dim,
-            'modality':         modality,
+            "image": imgs,
+            "mask": mask_seq,
+            "pt_list": pt_list,
+            "p_label": label_list,
+            "bbox": bbox_list,
+            "m_prompt": m_prompt_list,
+            "val_prompt_cache": val_prompt_cache,
+            "dataset": ds_name,
+            "subdataset": sub_name,
+            "seq_idx": idx,
+            "dim": data_dim,
+            "modality": modality,
         }
 
         # Keep axis_lengths only when we did not truncate and lengths match the 6-orientation build
-        if (axis_lengths is not None) and (not self.truncate) and (imgs.shape[0] == 2 * sum(axis_lengths)):
-            output['axis_lengths'] = axis_lengths_i
+        if (
+            (axis_lengths is not None)
+            and (not self.truncate)
+            and (imgs.shape[0] == 2 * sum(axis_lengths))
+        ):
+            output["axis_lengths"] = axis_lengths_i
 
         # Prefer the sampler's chosen task if provided; otherwise fall back to entry values
         if chosen_task is not None:
-            output['task_id'] = str(chosen_task)
-            output['task_label'] = str(chosen_task)
+            output["task_id"] = str(chosen_task)
+            output["task_label"] = str(chosen_task)
         else:
             if task_id is not None:
-                output['task_id'] = int(task_id) if isinstance(task_id, int) else task_id
+                output["task_id"] = (
+                    int(task_id) if isinstance(task_id, int) else task_id
+                )
             if task_label is not None:
-                output['task_label'] = str(task_label)
+                output["task_label"] = str(task_label)
 
         return output
 
@@ -230,8 +252,8 @@ class SegmentationSequenceDataset(Dataset):
         non-zero area of FG, and as a last resort, any non-empty window.
 
         Args:
-            imgs (Tensor[L,C,H,W]): Image sequence.
-            masks (Tensor[L,1,H,W]): Mask sequence.
+            imgs (torch.Tensor): Image sequence with shape [L, C, H, W].
+            masks (torch.Tensor): Mask sequence with shape [L, 1, H, W].
             axis_lengths (tuple): Lengths of the 3D volume along each axis.
             idx (int): Index of the sequence (for debugging).
 
@@ -243,48 +265,54 @@ class SegmentationSequenceDataset(Dataset):
         if (axis_lengths is None) or (not self.truncate):
             return imgs, masks
 
-        N = int(self.max_frames_per_sequence)       # window size
-        L = imgs.shape[0] // 2                      # length for each direction
+        N = int(self.max_frames_per_sequence)  # window size
+        L = imgs.shape[0] // 2  # length for each direction
         if L < N:
             raise ValueError(f"Axis too short: need {N}, have {L}")
 
         # Randomly sample direction
-        use_reverse = (random.random() < self.reverse_prob)
+        use_reverse = random.random() < self.reverse_prob
         s0 = L if use_reverse else 0
 
         # Check if there is any foreground
-        seg_masks = masks[s0:s0 + L]
+        seg_masks = masks[s0 : s0 + L]
         fg = seg_masks.reshape(L, -1).any(dim=1)
 
         # If no foreground, try other direction
         if int(fg.sum().item()) == 0:
             s0 = 0 if use_reverse else L
-            seg_masks = masks[s0:s0 + L]
+            seg_masks = masks[s0 : s0 + L]
             fg = seg_masks.reshape(L, -1).any(dim=1)
 
         if int(fg.sum().item()) == 0:
-            raise ValueError(f'No FG in either direction for idx={idx}')
+            raise ValueError(f"No FG in either direction for idx={idx}")
 
         desired_min_fg = int(self.min_fg_frames_in_window)
         H_, W_ = int(seg_masks.shape[-2]), int(seg_masks.shape[-1])
 
         # Per-slice FG area and robust FG indicator (avoid 1–2 px slivers)
-        area = seg_masks.reshape(L, -1).sum(dim=1).to(torch.float32)         # [L]
-        fg_min_frac = float(getattr(self, "fg_min_pixels_frac", 0.0002))      # ~0.2% of pixels
-        min_pix     = max(2, int(fg_min_frac * H_ * W_))
-        fg_big      = (area >= min_pix)                                      # "real" FG
-        fg_any      = (area > 0)                                             # fallback
+        area = seg_masks.reshape(L, -1).sum(dim=1).to(torch.float32)  # [L]
+        fg_min_frac = float(
+            getattr(self, "fg_min_pixels_frac", 0.0002)
+        )  # ~0.2% of pixels
+        min_pix = max(2, int(fg_min_frac * H_ * W_))
+        fg_big = area >= min_pix  # "real" FG
+        fg_any = area > 0  # fallback
         fg_for_count = fg_big if int(fg_big.sum()) > 0 else fg_any
 
         # Rolling counts of FG slices per N-window
-        cs_cnt   = torch.cat(
-            [torch.tensor([0], device=fg_for_count.device),
-             torch.cumsum(fg_for_count.int(), dim=0)]
+        cs_cnt = torch.cat(
+            [
+                torch.tensor([0], device=fg_for_count.device),
+                torch.cumsum(fg_for_count.int(), dim=0),
+            ]
         )
         win_sums = cs_cnt[N:] - cs_cnt[:-N]  # [L-N+1]
 
         # --- New: Prefer windows where *all* N slices have FG ---
-        full_fg_valid = torch.nonzero(win_sums == N).squeeze(1)  # starts of windows with FG on every slice
+        full_fg_valid = torch.nonzero(win_sums == N).squeeze(
+            1
+        )  # starts of windows with FG on every slice
 
         if full_fg_valid.numel() > 0:
             # Ideal case: at least one all-FG window exists
@@ -298,8 +326,10 @@ class SegmentationSequenceDataset(Dataset):
             # Absolute last resort: any non-empty window by area
             if valid.numel() == 0:
                 cs_any = torch.cat(
-                    [torch.tensor([0], device=area.device),
-                     torch.cumsum((area > 0).int(), dim=0)]
+                    [
+                        torch.tensor([0], device=area.device),
+                        torch.cumsum((area > 0).int(), dim=0),
+                    ]
                 )
                 valid = torch.nonzero((cs_any[N:] - cs_any[:-N]) > 0).squeeze(1)
 
@@ -308,21 +338,28 @@ class SegmentationSequenceDataset(Dataset):
             i0 = 0
         else:
             # Rolling total FG area per window
-            cs_area  = torch.cat([torch.tensor([0.0], device=area.device), torch.cumsum(area, dim=0)])
-            win_area = cs_area[N:] - cs_area[:-N]                              # [L-N+1]
-            policy = str(getattr(self, "window_select", "weighted"))          # "weighted"|"argmax"|"uniform"
+            cs_area = torch.cat(
+                [torch.tensor([0.0], device=area.device), torch.cumsum(area, dim=0)]
+            )
+            win_area = cs_area[N:] - cs_area[:-N]  # [L-N+1]
+            policy = str(
+                getattr(self, "window_select", "weighted")
+            )  # "weighted"|"argmax"|"uniform"
+
             if policy == "argmax":
                 j = torch.argmax(win_area[valid]).item()
                 i0 = int(valid[j].item())
             elif policy == "weighted":
                 temp = float(getattr(self, "window_temp", 0.25))
-                pwr  = float(getattr(self, "window_area_power", 1.0))
+                pwr = float(getattr(self, "window_area_power", 1.0))
                 scores = win_area[valid].clamp_min(0)
+
                 if pwr != 1.0:
                     scores = scores.pow(pwr)
+
                 m = float(scores.max().item()) if scores.numel() > 0 else 0.0
                 logits = scores / max(m, 1e-8) / max(temp, 1e-6)
-                probs  = torch.softmax(logits, dim=0)
+                probs = torch.softmax(logits, dim=0)
                 j = int(torch.multinomial(probs, 1).item())
                 i0 = int(valid[j].item())
             else:
@@ -349,41 +386,53 @@ class SegmentationSequenceDataset(Dataset):
             - for each selected frame, materialize prompts for all three modes
             (point, bbox, mask) so validation can choose among them later
 
-        Returns:
-            For strategy="train":
-                (pt_list, label_list, bbox_list, m_prompt_list)
-
-            For strategy="prob_eval":
-                {
-                    "chosen_frames": List[int],
-                    "forced_first": bool,
-                    "point": {"pt_list": ..., "p_label": ..., "bbox": ..., "m_prompt": ...},
-                    "box":   {"pt_list": ..., "p_label": ..., "bbox": ..., "m_prompt": ...},
-                    "mask":  {"pt_list": ..., "p_label": ..., "bbox": ..., "m_prompt": ...},
-                }
-
         Args:
             masks (torch.Tensor): Sequence masks with shape ``[T, H, W]`` or ``[T, 1, H, W]``.
             data_dim (int): Source data dimension, either 2 or 3.
             strategy (str): Prompt strategy, either ``"train"`` or ``"prob_eval"``.
+
+        Returns:
+            tuple | dict: Training returns frame-aligned point, label, box, and mask lists.
+                With strategy="prob_eval", returns a cache containing chosen_frames,
+                forced_first, and point/box/mask entries with pt_list, p_label, bbox,
+                and m_prompt fields.
         """
         T = int(masks.shape[0])
         H = int(masks.shape[-2])
         W = int(masks.shape[-1])
 
         def _empty_lists():
-            """Return empty prompt containers for each frame."""
+            """
+            Return empty prompt containers for each frame.
+
+            Args:
+                None.
+
+            Returns:
+                tuple[list, list, list, list]: Frame-aligned point, label, box, and mask prompt
+                    containers.
+            """
             pts = [torch.empty((0, 2), dtype=torch.int64) for _ in range(T)]
             lbs = [torch.empty((0,), dtype=torch.int64) for _ in range(T)]
             box = [torch.empty((0, 4), dtype=torch.int64) for _ in range(T)]
             msk = [torch.empty((0, H, W), dtype=torch.uint8) for _ in range(T)]
+
             return pts, lbs, box, msk
 
         def _mask_at(t):
-            """Return a 2D mask slice."""
+            """
+            Return a 2D mask slice.
+
+            Args:
+                t (int): Stored frame index.
+
+            Returns:
+                torch.Tensor: Boolean mask for the requested frame.
+            """
             m = masks[t]
             if m.ndim == 3 and m.size(0) == 1:
                 m = m.squeeze(0)
+
             return m
 
         if strategy == "train":
@@ -412,32 +461,36 @@ class SegmentationSequenceDataset(Dataset):
                 if t in prompt_frames:
                     want_type = sample_type_for_frame()
 
-                    pts_t   = torch.empty((0, 2), dtype=torch.int64)
-                    lbls_t  = torch.empty((0,), dtype=torch.int64)
-                    bbox_t  = torch.empty((0, 4), dtype=torch.int64)
-                    mask_t  = torch.empty((0, H, W), dtype=torch.uint8)
+                    pts_t = torch.empty((0, 2), dtype=torch.int64)
+                    lbls_t = torch.empty((0,), dtype=torch.int64)
+                    bbox_t = torch.empty((0, 4), dtype=torch.int64)
+                    mask_t = torch.empty((0, H, W), dtype=torch.uint8)
 
                     if want_type == "click":
                         p_click = generate_prompt(
                             mask_slice,
                             prompt_type="click",
                             num_pos=self.num_pos_clicks,
-                            num_neg=(self.num_neg_clicks if self.enable_negative_clicks else 0),
+                            num_neg=(
+                                self.num_neg_clicks
+                                if self.enable_negative_clicks
+                                else 0
+                            ),
                             neg_margin_frac=self.neg_margin_frac,
                         )
-                        if 'points' in p_click:
-                            pts_t = p_click['points'].to(torch.int64)
-                            lbls_t = p_click['labels'].to(torch.int64)
+                        if "points" in p_click:
+                            pts_t = p_click["points"].to(torch.int64)
+                            lbls_t = p_click["labels"].to(torch.int64)
 
                     elif want_type == "bbox":
                         p_box = generate_prompt(mask_slice, prompt_type="bbox")
-                        if 'bbox' in p_box:
-                            bbox_t = p_box['bbox'].to(torch.int64).view(1, 4)
+                        if "bbox" in p_box:
+                            bbox_t = p_box["bbox"].to(torch.int64).view(1, 4)
 
                     elif want_type == "mask":
                         p_mask = generate_prompt(mask_slice, prompt_type="mask")
-                        if 'mask' in p_mask:
-                            mask_t = p_mask['mask'].to(torch.uint8).unsqueeze(0)
+                        if "mask" in p_mask:
+                            mask_t = p_mask["mask"].to(torch.uint8).unsqueeze(0)
 
                     pt_list.append(pts_t)
                     label_list.append(lbls_t)
@@ -459,7 +512,10 @@ class SegmentationSequenceDataset(Dataset):
 
         flat = masks.reshape(T, -1)
         gt_nonempty = flat.any(dim=1)
-        eligible = [int(i) for i in torch.nonzero(gt_nonempty, as_tuple=False).squeeze(1).tolist()]
+        eligible = [
+            int(i)
+            for i in torch.nonzero(gt_nonempty, as_tuple=False).squeeze(1).tolist()
+        ]
 
         point_pts, point_lbls, point_box, point_msk = _empty_lists()
         box_pts, box_lbls, box_box, box_msk = _empty_lists()
@@ -501,6 +557,7 @@ class SegmentationSequenceDataset(Dataset):
         rng = np.random.RandomState(base_seed)
         chosen = [t for t in eligible if rng.rand() < prompt_prob]
         forced_first = False
+
         if len(chosen) == 0:
             chosen = [eligible[0]]
             forced_first = True
@@ -517,17 +574,17 @@ class SegmentationSequenceDataset(Dataset):
                 num_neg=(self.num_neg_clicks if self.enable_negative_clicks else 0),
                 neg_margin_frac=self.neg_margin_frac,
             )
-            if 'points' in p_click:
-                point_pts[t] = p_click['points'].to(torch.int64)
-                point_lbls[t] = p_click['labels'].to(torch.int64)
+            if "points" in p_click:
+                point_pts[t] = p_click["points"].to(torch.int64)
+                point_lbls[t] = p_click["labels"].to(torch.int64)
 
             p_box = generate_prompt(mask_slice, prompt_type="bbox")
-            if 'bbox' in p_box:
-                box_box[t] = p_box['bbox'].to(torch.int64).view(1, 4)
+            if "bbox" in p_box:
+                box_box[t] = p_box["bbox"].to(torch.int64).view(1, 4)
 
             p_mask = generate_prompt(mask_slice, prompt_type="mask")
-            if 'mask' in p_mask:
-                mask_msk[t] = p_mask['mask'].to(torch.uint8).unsqueeze(0)
+            if "mask" in p_mask:
+                mask_msk[t] = p_mask["mask"].to(torch.uint8).unsqueeze(0)
 
         return {
             "chosen_frames": chosen,
@@ -547,7 +604,9 @@ class SegmentationSequenceDataset(Dataset):
             "mask": {
                 "pt_list": mask_pts,
                 "p_label": mask_lbls,
-                "bbox": box_box.__class__([torch.empty((0, 4), dtype=torch.int64) for _ in range(T)]),
+                "bbox": box_box.__class__(
+                    [torch.empty((0, 4), dtype=torch.int64) for _ in range(T)]
+                ),
                 "m_prompt": mask_msk,
             },
         }
@@ -572,18 +631,34 @@ class SegmentationSequenceDataset(Dataset):
         W = int(masks.shape[-1])
 
         if "mask" in cache:
-            cache["mask"]["bbox"] = [torch.empty((0, 4), dtype=torch.int64) for _ in range(T)]
-            cache["mask"]["pt_list"] = [torch.empty((0, 2), dtype=torch.int64) for _ in range(T)]
-            cache["mask"]["p_label"] = [torch.empty((0,), dtype=torch.int64) for _ in range(T)]
+            cache["mask"]["bbox"] = [
+                torch.empty((0, 4), dtype=torch.int64) for _ in range(T)
+            ]
+            cache["mask"]["pt_list"] = [
+                torch.empty((0, 2), dtype=torch.int64) for _ in range(T)
+            ]
+            cache["mask"]["p_label"] = [
+                torch.empty((0,), dtype=torch.int64) for _ in range(T)
+            ]
 
         if "box" in cache:
-            cache["box"]["pt_list"] = [torch.empty((0, 2), dtype=torch.int64) for _ in range(T)]
-            cache["box"]["p_label"] = [torch.empty((0,), dtype=torch.int64) for _ in range(T)]
-            cache["box"]["m_prompt"] = [torch.empty((0, H, W), dtype=torch.uint8) for _ in range(T)]
+            cache["box"]["pt_list"] = [
+                torch.empty((0, 2), dtype=torch.int64) for _ in range(T)
+            ]
+            cache["box"]["p_label"] = [
+                torch.empty((0,), dtype=torch.int64) for _ in range(T)
+            ]
+            cache["box"]["m_prompt"] = [
+                torch.empty((0, H, W), dtype=torch.uint8) for _ in range(T)
+            ]
 
         if "point" in cache:
-            cache["point"]["bbox"] = [torch.empty((0, 4), dtype=torch.int64) for _ in range(T)]
-            cache["point"]["m_prompt"] = [torch.empty((0, H, W), dtype=torch.uint8) for _ in range(T)]
+            cache["point"]["bbox"] = [
+                torch.empty((0, 4), dtype=torch.int64) for _ in range(T)
+            ]
+            cache["point"]["m_prompt"] = [
+                torch.empty((0, H, W), dtype=torch.uint8) for _ in range(T)
+            ]
 
         return cache
 
@@ -600,52 +675,59 @@ class SegmentationSequenceDataset(Dataset):
         Truncates to max_prompt_frames, keeping earliest indices for determinism.
 
         Args:
-            masks (Tensor): [T,H,W] sequence of masks
-            data_dim (int): Dimensionality of the data (2 or 3)
+            masks (torch.Tensor): [T,H,W] sequence of masks.
+            data_dim (int): Dimensionality of the data (2 or 3).
 
         Returns:
-            List[int]: Selected frame indices
+            List[int]: Selected frame indices.
         """
         T = int(masks.shape[0])
         if T <= 0:
             return []
 
         # Flatten mask to per-frame FG stats
-        flat = masks.reshape(T,-1)
-        fg_per_frame = flat.any(dim=1)                      # [T] bool
+        flat = masks.reshape(T, -1)
+        fg_per_frame = flat.any(dim=1)  # [T] bool
         area_per_frame = flat.sum(dim=1).to(torch.float32)  # [T] float
 
         prompt_frames = set()
 
         # 1) Seed earliest FG (or 0)
-        if getattr(self, 'always_prompt_first', True) and T > 0:
-            nz   = torch.nonzero(fg_per_frame, as_tuple=False).squeeze(1)
+        if getattr(self, "always_prompt_first", True) and T > 0:
+            nz = torch.nonzero(fg_per_frame, as_tuple=False).squeeze(1)
             seed = int(nz[0].item()) if nz.numel() > 0 else 0
             prompt_frames.add(seed)
 
         # 2) Fill remaining by area-biased sampling
-        remaining = max(0, int(getattr(self, "max_prompt_frames", 2)) - len(prompt_frames))
+        remaining = max(
+            0, int(getattr(self, "max_prompt_frames", 2)) - len(prompt_frames)
+        )
         if remaining > 0 and T > 1:
             bias_area = bool(getattr(self, "prompt_bias_area", True))
             pool = [i for i in range(T) if i not in prompt_frames]
             if len(pool) > 0:
                 if bias_area:
-                    idx = torch.tensor(pool, dtype=torch.long, device=area_per_frame.device)
+                    idx = torch.tensor(
+                        pool, dtype=torch.long, device=area_per_frame.device
+                    )
                     scores = area_per_frame[idx].clamp_min(0)
                     if float(scores.sum().item()) > 0.0:
                         # mild temperature to keep variety
                         logits = scores / max(float(scores.max().item()), 1e-8) / 0.5
-                        probs  = torch.softmax(logits, dim=0).cpu().numpy()
+                        probs = torch.softmax(logits, dim=0).cpu().numpy()
                         import numpy as _np
+
                         k = min(remaining, len(pool))
                         picked = _np.random.choice(pool, size=k, replace=False, p=probs)
                         prompt_frames.update(int(i) for i in picked.tolist())
                     else:
                         import random as _rnd
+
                         pick = _rnd.sample(pool, k=min(remaining, len(pool)))
                         prompt_frames.update(pick)
                 else:
                     import random as _rnd
+
                     pick = _rnd.sample(pool, k=min(remaining, len(pool)))
                     prompt_frames.update(pick)
 
@@ -653,7 +735,11 @@ class SegmentationSequenceDataset(Dataset):
         if int(data_dim) == 3:
             # a) Include frame 0 if it has FG and capacity remains
             promptable = [i for i in range(T) if bool(fg_per_frame[i].item())]
-            if 0 in promptable and 0 not in prompt_frames and len(prompt_frames) < int(getattr(self, "max_prompt_frames", 2)):
+            if (
+                0 in promptable
+                and 0 not in prompt_frames
+                and len(prompt_frames) < int(getattr(self, "max_prompt_frames", 2))
+            ):
                 prompt_frames.add(0)
 
             # b) Add one more: the promptable frame with largest FG among the *others*
@@ -664,12 +750,14 @@ class SegmentationSequenceDataset(Dataset):
                     with torch.no_grad():
                         areas = area_per_frame[torch.tensor(others, dtype=torch.long)]
                         best_j = int(torch.argmax(areas).item())
+
                     prompt_frames.add(int(others[best_j]))
 
             # c) If still empty but we have any FG, force the max-FG frame
             if len(prompt_frames) == 0 and len(promptable) > 0:
                 with torch.no_grad():
                     areas = area_per_frame[torch.tensor(promptable, dtype=torch.long)]
+
                 best_j = int(torch.argmax(areas).item())
                 prompt_frames.add(int(promptable[best_j]))
 
@@ -699,23 +787,28 @@ class SegmentationSequenceDataset(Dataset):
 
                 bias_area = bool(getattr(self, "prompt_bias_area", True))
                 if bias_area:
-                    idx = torch.tensor(pool, dtype=torch.long, device=area_per_frame.device)
+                    idx = torch.tensor(
+                        pool, dtype=torch.long, device=area_per_frame.device
+                    )
                     scores = area_per_frame[idx].clamp_min(0)
 
                     if float(scores.sum().item()) > 0.0:
                         # mild temperature to keep variety
                         logits = scores / max(float(scores.max().item()), 1e-8) / 0.5
-                        probs  = torch.softmax(logits, dim=0).cpu().numpy()
+                        probs = torch.softmax(logits, dim=0).cpu().numpy()
                         import numpy as _np
+
                         k = min(missing, len(pool))
                         extra = _np.random.choice(pool, size=k, replace=False, p=probs)
                         prompt_frames.update(int(i) for i in extra.tolist())
                     else:
                         import random as _rnd
+
                         extra = _rnd.sample(pool, k=min(missing, len(pool)))
                         prompt_frames.update(extra)
                 else:
                     import random as _rnd
+
                     extra = _rnd.sample(pool, k=min(missing, len(pool)))
                     prompt_frames.update(extra)
 
@@ -735,14 +828,18 @@ class SegmentationSequenceDataset(Dataset):
             tuple[torch.Tensor, torch.Tensor]: Image and mask tensors with a sequence dimension.
         """
         if len(seq) != 1:
-            raise ValueError(f"2D samples must contain exactly one image-mask pair, got {len(seq)}")
+            raise ValueError(
+                f"2D samples must contain exactly one image-mask pair, got {len(seq)}"
+            )
 
         imp_p, msk_p = seq[0]
         i_arr = sitk.GetArrayFromImage(sitk.ReadImage(imp_p))
         m_arr = sitk.GetArrayFromImage(sitk.ReadImage(msk_p))
         im_t, ms_t = self._to_tensor(i_arr, m_arr)
+
         if self.transform:
             im_t, ms_t = self.transform(im_t, ms_t)
+
         return im_t.unsqueeze(0), ms_t.unsqueeze(0)
 
     def _load_3d(self, img_path, mask_path):
@@ -764,8 +861,8 @@ class SegmentationSequenceDataset(Dataset):
         # Read volumes
         itk_img = sitk.ReadImage(img_path)
         itk_msk = sitk.ReadImage(mask_path)
-        img_vol = sitk.GetArrayFromImage(itk_img)   # [D,H,W]
-        msk_vol = sitk.GetArrayFromImage(itk_msk)   # [D,H,W]
+        img_vol = sitk.GetArrayFromImage(itk_img)  # [D,H,W]
+        msk_vol = sitk.GetArrayFromImage(itk_msk)  # [D,H,W]
 
         # Reference output size (old behavior used the first axial slice)
         _, H0, W0 = self._to_tensor(img_vol[0], msk_vol[0])[0].shape
@@ -785,6 +882,7 @@ class SegmentationSequenceDataset(Dataset):
             other = tuple(i for i in (0, 1, 2) if i != chosen_axis)
             per_slice_area = msk_np.sum(axis=other).astype(np.int64)  # [L]
             L = int(per_slice_area.shape[0])
+
             if L < N:
                 raise ValueError(f"Axis too short: need {N}, have {L}")
 
@@ -801,21 +899,23 @@ class SegmentationSequenceDataset(Dataset):
                 H_, W_ = D, H
 
             fg_min_frac = float(getattr(self, "fg_min_pixels_frac", 0.0002))
-            min_pix     = max(2, int(fg_min_frac * H_ * W_))
-            fg_big      = (per_slice_area >= min_pix)
-            fg_any      = (per_slice_area > 0)
+            min_pix = max(2, int(fg_min_frac * H_ * W_))
+            fg_big = per_slice_area >= min_pix
+            fg_any = per_slice_area > 0
             fg_for_count = fg_big if fg_big.any() else fg_any
 
             # Rolling FG count over windows of size N
-            cs_cnt   = np.concatenate([[0], np.cumsum(fg_for_count.astype(np.int32))])
+            cs_cnt = np.concatenate([[0], np.cumsum(fg_for_count.astype(np.int32))])
             win_sums = cs_cnt[N:] - cs_cnt[:-N]  # [L-N+1]
 
             # rolling area per window (for fallback tiebreaks)
-            cs_area = np.concatenate([[0], np.cumsum(per_slice_area.astype(np.float64))])
+            cs_area = np.concatenate(
+                [[0], np.cumsum(per_slice_area.astype(np.float64))]
+            )
             win_area = cs_area[N:] - cs_area[:-N]  # [L-N+1]
 
             # Index of largest-FG slice
-            k_star    = int(per_slice_area.argmax())
+            k_star = int(per_slice_area.argmax())
             i0_center = max(0, min(L - N, k_star - (N // 2)))
 
             # --- New: prefer windows where *all* N slices have FG ---
@@ -831,8 +931,10 @@ class SegmentationSequenceDataset(Dataset):
                 else:
                     # Otherwise pick the valid window closest to center, breaking ties by area
                     dists = np.abs(valid - i0_center)
-                    best  = np.lexsort((-win_area[valid], dists))  # sort by dist asc, area desc
-                    i0    = int(valid[best[0]])
+                    best = np.lexsort(
+                        (-win_area[valid], dists)
+                    )  # sort by dist asc, area desc
+                    i0 = int(valid[best[0]])
 
             else:
                 # Fallback: original behavior using min_fg_frames_in_window
@@ -844,17 +946,21 @@ class SegmentationSequenceDataset(Dataset):
 
                 # last resort: any window with any FG present
                 if valid.size == 0:
-                    cs_any = np.concatenate([[0], np.cumsum((per_slice_area > 0).astype(np.int32))])
-                    valid  = np.flatnonzero((cs_any[N:] - cs_any[:-N]) > 0)
+                    cs_any = np.concatenate(
+                        [[0], np.cumsum((per_slice_area > 0).astype(np.int32))]
+                    )
+                    valid = np.flatnonzero((cs_any[N:] - cs_any[:-N]) > 0)
 
-                if (0 <= i0_center < win_sums.shape[0]) and (win_sums[i0_center] >= eff_min_fg):
+                if (0 <= i0_center < win_sums.shape[0]) and (
+                    win_sums[i0_center] >= eff_min_fg
+                ):
                     i0 = i0_center
                 elif valid.size > 0:
                     # choose the valid start closest to the centered start,
                     # breaking ties by larger window area
                     dists = np.abs(valid - i0_center)
-                    best  = np.lexsort((-win_area[valid], dists))  # dist asc, area desc
-                    i0    = int(valid[best[0]])
+                    best = np.lexsort((-win_area[valid], dists))  # dist asc, area desc
+                    i0 = int(valid[best[0]])
                 else:
                     i0 = 0  # absolute last resort
 
@@ -867,15 +973,24 @@ class SegmentationSequenceDataset(Dataset):
                 slice_img = self._slice(img_vol, chosen_axis, k)
                 slice_msk = self._slice(msk_vol, chosen_axis, k)
                 im_t, ms_t = self._to_tensor(slice_img, slice_msk)
+
                 if self.transform:
                     im_t, ms_t = self.transform(im_t, ms_t)
                 # enforce (H0, W0) to keep shapes consistent with old pipeline
                 if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
-                    im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
-                    ms_t = TF.resize(
-                        ms_t.unsqueeze(0).float(), [H0, W0],
-                        interpolation=TF.InterpolationMode.NEAREST
-                    ).squeeze(0).to(torch.uint8)
+                    im_t = TF.resize(
+                        im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR
+                    )
+                    ms_t = (
+                        TF.resize(
+                            ms_t.unsqueeze(0).float(),
+                            [H0, W0],
+                            interpolation=TF.InterpolationMode.NEAREST,
+                        )
+                        .squeeze(0)
+                        .to(torch.uint8)
+                    )
+
                 seq_imgs.append(im_t)
                 seq_masks.append(ms_t)
 
@@ -892,6 +1007,7 @@ class SegmentationSequenceDataset(Dataset):
                 has_fg = np.any(msk_np, axis=(0, 2))
             else:
                 has_fg = np.any(msk_np, axis=(0, 1))
+
             has_fg = has_fg.astype(bool)
 
             if has_fg.any():
@@ -899,6 +1015,7 @@ class SegmentationSequenceDataset(Dataset):
                 start_k, end_k = int(fg[0]), int(fg[-1] + 1)
             else:
                 start_k, end_k = 0, msk_np.shape[chosen_axis]
+
             idxs_fwd = list(range(start_k, end_k))
             idxs_rev = list(reversed(idxs_fwd))
         else:
@@ -911,14 +1028,23 @@ class SegmentationSequenceDataset(Dataset):
             slice_img = self._slice(img_vol, chosen_axis, i)
             slice_msk = self._slice(msk_vol, chosen_axis, i)
             im_t, ms_t = self._to_tensor(slice_img, slice_msk)
+
             if self.transform:
                 im_t, ms_t = self.transform(im_t, ms_t)
                 if (im_t.shape[1], im_t.shape[2]) != (H0, W0):
-                    im_t = TF.resize(im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR)
-                    ms_t = TF.resize(
-                        ms_t.unsqueeze(0).float(), [H0, W0],
-                        interpolation=TF.InterpolationMode.NEAREST
-                    ).squeeze(0).long()
+                    im_t = TF.resize(
+                        im_t, [H0, W0], interpolation=TF.InterpolationMode.BILINEAR
+                    )
+                    ms_t = (
+                        TF.resize(
+                            ms_t.unsqueeze(0).float(),
+                            [H0, W0],
+                            interpolation=TF.InterpolationMode.NEAREST,
+                        )
+                        .squeeze(0)
+                        .long()
+                    )
+
             seq_imgs.append(im_t)
             seq_masks.append(ms_t)
 
@@ -929,12 +1055,12 @@ class SegmentationSequenceDataset(Dataset):
         Helper function to slice a 3D volume along a given axis.
 
         Args:
-            vol (numpy.ndarray): The 3D volume to slice.
+            vol (np.ndarray): The 3D volume to slice.
             axis (int): The axis along which to slice the volume.
             idx (int): The index of the slice to extract.
 
         Returns:
-            numpy.ndarray: The sliced 2D image.
+            np.ndarray: The sliced 2D image.
         """
         if axis == 0:
             return vol[idx, :, :]
@@ -948,31 +1074,27 @@ class SegmentationSequenceDataset(Dataset):
         Convert NumPy arrays to PyTorch tensors.
 
         Args:
-            img_arr (numpy.ndarray): The image array.
-            msk_arr (numpy.ndarray): The mask array.
+            img_arr (np.ndarray): The image array.
+            msk_arr (np.ndarray): The mask array.
 
         Returns:
             tuple: A tuple containing the image tensor and the mask tensor.
         """
         img = torch.from_numpy(img_arr).float()
         # img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-        if img.ndim == 2:               # Single channel
+        if img.ndim == 2:  # Single channel
             img = img.unsqueeze(0)
         elif img.ndim == 3 and img.shape[0] not in (1, 3):
             img = img.permute(2, 0, 1)  # HxWxC -> CxHxW
+
         # Convert mask to PyTorch long tensor after binarization
         mask = torch.from_numpy((msk_arr > 0).astype(np.uint8))
         return img, mask
 
+
 class BalancedTaskBatchSampler(BatchSampler):
     """
     Build homogeneous batches balanced by dimension and task membership.
-
-    Args:
-        BatchSampler (type): PyTorch batch sampler base class.
-
-    Returns:
-        None.
     """
 
     def __init__(
@@ -1011,7 +1133,9 @@ class BalancedTaskBatchSampler(BatchSampler):
         self.seed = int(seed) if seed is not None else None
         self.rng = random.Random(self.seed)
         self.min_per_bucket = int(max(0, min_per_bucket))
-        self.num_samples = int(num_samples) if num_samples is not None else len(sequences)
+        self.num_samples = (
+            int(num_samples) if num_samples is not None else len(sequences)
+        )
         self.target_dim_ratio = target_dim_ratio
         self.undersample_bias_power = float(max(0.0, undersample_bias_power))
 
@@ -1019,8 +1143,12 @@ class BalancedTaskBatchSampler(BatchSampler):
             r2 = float(self.target_dim_ratio.get(2, 0.0))
             r3 = float(self.target_dim_ratio.get(3, 0.0))
             s = r2 + r3
+
             if s <= 0:
-                raise ValueError("target_dim_ratio must assign positive mass to dim 2 and/or 3")
+                raise ValueError(
+                    "target_dim_ratio must assign positive mass to dim 2 and/or 3"
+                )
+
             self.target_dim_ratio = {2: r2 / s, 3: r3 / s}
 
         # memberships[idx] = [(dim, task_id), ...]
@@ -1035,6 +1163,7 @@ class BalancedTaskBatchSampler(BatchSampler):
             dim = int(seq.get("dim", -1))
 
             keys = []
+
             for task_id in seq.get("tasks", []):
                 info = tasks_map.get(task_id, {})
                 ds_map = info.get("datasets", {})
@@ -1103,6 +1232,7 @@ class BalancedTaskBatchSampler(BatchSampler):
             return 0
         if self.drop_last:
             return target // self.batch_size
+
         return (target + self.batch_size - 1) // self.batch_size
 
     def set_epoch(self, epoch):
@@ -1141,9 +1271,11 @@ class BalancedTaskBatchSampler(BatchSampler):
             for k, _ in sorted(quotas.items(), key=lambda kv: kv[1], reverse=True):
                 if over == 0:
                     break
+
                 take = min(over, quotas[k])
                 quotas[k] -= take
                 over -= take
+
             return quotas
 
         remaining = target_units - used
@@ -1165,7 +1297,11 @@ class BalancedTaskBatchSampler(BatchSampler):
         if leftover > 0:
             order = sorted(
                 capacities,
-                key=lambda k: (raw[k] - int(raw[k]), residual_cap[k], self.rng.random()),
+                key=lambda k: (
+                    raw[k] - int(raw[k]),
+                    residual_cap[k],
+                    self.rng.random(),
+                ),
                 reverse=True,
             )
             for k in order:
@@ -1208,6 +1344,7 @@ class BalancedTaskBatchSampler(BatchSampler):
                     tuple: Sortable score where lower is preferred.
                 """
                 raw = max(1, self.raw_bucket_sizes.get(key, 1))
+
                 return (
                     assigned_counts[key] / raw,
                     assigned_counts[key],
@@ -1248,6 +1385,7 @@ class BalancedTaskBatchSampler(BatchSampler):
             u = self.rng.random()
             while u <= 0.0:
                 u = self.rng.random()
+
             key = u ** (1.0 / w)
             keys.append((key, item))
 
@@ -1269,6 +1407,7 @@ class BalancedTaskBatchSampler(BatchSampler):
         task_id = str(task_id)
 
         count = self.dim_task_dataset_counts.get((dim, task_id), 0)
+
         if count <= 0:
             return 1.0
 
@@ -1334,10 +1473,11 @@ class BalancedTaskBatchSampler(BatchSampler):
                 continue
 
             weights = [
-                self._dim_task_keep_weight(dim, task)
-                for dim, task, idx in items
+                self._dim_task_keep_weight(dim, task) for dim, task, idx in items
             ]
-            kept_items = self._weighted_sample_without_replacement(items, weights, target_dim)
+            kept_items = self._weighted_sample_without_replacement(
+                items, weights, target_dim
+            )
             keep.update(kept_items)
 
         new_pools = defaultdict(list)
@@ -1373,19 +1513,25 @@ class BalancedTaskBatchSampler(BatchSampler):
                 if len(v) >= self.batch_size
             }
             target_batches = target // self.batch_size
-            floor_batches = math.ceil(self.min_per_bucket / self.batch_size) if self.min_per_bucket > 0 else 0
+            floor_batches = (
+                math.ceil(self.min_per_bucket / self.batch_size)
+                if self.min_per_bucket > 0
+                else 0
+            )
             batch_quotas = self._allocate_largest_remainder(
                 capacities, target_batches, floor_batches
             )
 
             out = {}
             total_batches = 0
+
             for key, n_batches in batch_quotas.items():
                 if n_batches <= 0:
                     continue
+
                 idxs = pools[key][: n_batches * self.batch_size]
                 batches = [
-                    [(idx, key[1]) for idx in idxs[i:i + self.batch_size]]
+                    [(idx, key[1]) for idx in idxs[i : i + self.batch_size]]
                     for i in range(0, len(idxs), self.batch_size)
                 ]
                 if batches:
@@ -1401,12 +1547,14 @@ class BalancedTaskBatchSampler(BatchSampler):
 
         out = {}
         total_batches = 0
+
         for key, n_items in item_quotas.items():
             if n_items <= 0:
                 continue
+
             idxs = pools[key][:n_items]
             batches = [
-                [(idx, key[1]) for idx in idxs[i:i + self.batch_size]]
+                [(idx, key[1]) for idx in idxs[i : i + self.batch_size]]
                 for i in range(0, len(idxs), self.batch_size)
             ]
             if batches:
@@ -1458,6 +1606,7 @@ class BalancedTaskBatchSampler(BatchSampler):
 
         # 3) Allocate quotas and chunk into batches
         batches_by_bucket, total_batches = self._make_batches(pools)
+
         if total_batches == 0:
             return
             yield  # pragma: no cover
@@ -1486,10 +1635,12 @@ class BalancedTaskBatchSampler(BatchSampler):
             if emitted >= target:
                 break
 
+
 class SequenceTransform:
     """
     Apply the same random augmentations to every frame in a sequence.
     """
+
     def __init__(self, base_prob=0.15, lr_prob=0.25, flip_prob=0.5):
         """
         Initializes the SequenceTransform with specified probabilities for
@@ -1547,7 +1698,7 @@ class SequenceTransform:
 
         # 3) Noise
         self.do_noise = random.random() < p
-        self.noise_std = random.uniform(0, 0.1)**0.5 if self.do_noise else 0
+        self.noise_std = random.uniform(0, 0.1) ** 0.5 if self.do_noise else 0
 
         # 4) Blur
         self.do_blur = random.random() < p
@@ -1555,6 +1706,7 @@ class SequenceTransform:
 
         # 5) Intensity
         self.do_intensity = random.random() < p
+
         if self.do_intensity:
             if random.random() < 0.5:
                 self.int_factor = random.uniform(0.65, 1.2)
@@ -1588,8 +1740,7 @@ class SequenceTransform:
             mask (torch.Tensor): Mask to transform.
 
         Returns:
-            torch.Tensor: Transformed image.
-            torch.Tensor: Transformed mask.
+            tuple[torch.Tensor, torch.Tensor]: Augmented image and mask tensors.
         """
         # Ensure mask has a channel dim so torchvision transforms work
         if mask.ndim == 2:
@@ -1600,37 +1751,70 @@ class SequenceTransform:
         had_fg = (mask > 0).any()  # True if there is at least one foreground pixel
 
         _, h, w = image.shape
+
         if self.do_rotate:
-            image = TF.rotate(image, self.angle, interpolation=TF.InterpolationMode.BILINEAR)
-            mask  = TF.rotate(mask,  self.angle, interpolation=TF.InterpolationMode.NEAREST)
+            image = TF.rotate(
+                image, self.angle, interpolation=TF.InterpolationMode.BILINEAR
+            )
+            mask = TF.rotate(
+                mask, self.angle, interpolation=TF.InterpolationMode.NEAREST
+            )
         if self.do_scale:
-            image = TF.affine(image, angle=0, translate=(0,0), scale=self.scale, shear=[0,0], interpolation=TF.InterpolationMode.BILINEAR)
-            mask  = TF.affine(mask,  angle=0, translate=(0,0), scale=self.scale, shear=[0,0], interpolation=TF.InterpolationMode.NEAREST)
+            image = TF.affine(
+                image,
+                angle=0,
+                translate=(0, 0),
+                scale=self.scale,
+                shear=[0, 0],
+                interpolation=TF.InterpolationMode.BILINEAR,
+            )
+            mask = TF.affine(
+                mask,
+                angle=0,
+                translate=(0, 0),
+                scale=self.scale,
+                shear=[0, 0],
+                interpolation=TF.InterpolationMode.NEAREST,
+            )
         if self.do_noise:
             image = image + torch.randn_like(image) * self.noise_std
         if self.do_blur:
             k = max(3, int(2 * round(self.blur_sigma * 2) + 1))
-            image = TF.gaussian_blur(image, kernel_size=k, sigma=[self.blur_sigma, self.blur_sigma])
+            image = TF.gaussian_blur(
+                image, kernel_size=k, sigma=[self.blur_sigma, self.blur_sigma]
+            )
         if self.do_intensity:
             if self.int_invert:
-                cmin = image.amin(dim=(1,2), keepdim=True)
-                cmax = image.amax(dim=(1,2), keepdim=True)
-                image = (cmin + cmax) - image                       # Invert within native window
+                cmin = image.amin(dim=(1, 2), keepdim=True)
+                cmax = image.amax(dim=(1, 2), keepdim=True)
+                image = (cmin + cmax) - image  # Invert within native window
             else:
-                image = image * self.int_factor                     # Linear intensity scale
+                image = image * self.int_factor  # Linear intensity scale
         if self.do_contrast:
-            center = image.mean(dim=(1,2), keepdim=True)
+            center = image.mean(dim=(1, 2), keepdim=True)
             image = (image - center) * self.contrast_factor + center  # native contrast
         if self.do_lowres:
-            small_h, small_w = max(1,int(h/self.down)), max(1,int(w/self.down))
-            image = TF.resize(image, [small_h, small_w], interpolation=TF.InterpolationMode.NEAREST)
-            image = TF.resize(image, [h, w], interpolation=TF.InterpolationMode.BILINEAR)
-            mask  = TF.resize(mask.unsqueeze(0).float(), [small_h, small_w], interpolation=TF.InterpolationMode.NEAREST)
-            mask  = TF.resize(mask, [h, w], interpolation=TF.InterpolationMode.NEAREST).squeeze(0).to(torch.uint8)
+            small_h, small_w = max(1, int(h / self.down)), max(1, int(w / self.down))
+            image = TF.resize(
+                image, [small_h, small_w], interpolation=TF.InterpolationMode.NEAREST
+            )
+            image = TF.resize(
+                image, [h, w], interpolation=TF.InterpolationMode.BILINEAR
+            )
+            mask = TF.resize(
+                mask.unsqueeze(0).float(),
+                [small_h, small_w],
+                interpolation=TF.InterpolationMode.NEAREST,
+            )
+            mask = (
+                TF.resize(mask, [h, w], interpolation=TF.InterpolationMode.NEAREST)
+                .squeeze(0)
+                .to(torch.uint8)
+            )
         if self.do_gamma:
             # Window per channel, gamma in unit window, then restore native range
-            cmin = image.amin(dim=(1,2), keepdim=True)
-            cmax = image.amax(dim=(1,2), keepdim=True)
+            cmin = image.amin(dim=(1, 2), keepdim=True)
+            cmax = image.amax(dim=(1, 2), keepdim=True)
             span = (cmax - cmin).clamp_min(1e-6)
             u = (image - cmin) / span
             image = u.pow(self.gamma) * span + cmin
@@ -1643,25 +1827,28 @@ class SequenceTransform:
         lost_fg = not (mask > 0).any()
         if had_fg and lost_fg:
             return orig_image, orig_mask
+
         return image, mask
 
-def generate_prompt(mask_2d, prompt_type='click', num_pos=1, num_neg=0, neg_margin_frac=0.1):
+
+def generate_prompt(
+    mask_2d, prompt_type="click", num_pos=1, num_neg=0, neg_margin_frac=0.1
+):
     """
     Create a prompt from a binary mask.
 
     Args:
-        mask_2d (Tensor[H,W] or np.ndarray): binary mask
-        prompt_type (str): "click", "bbox", or "mask"
-        num_pos (int): number of positive clicks (for "click")
-        num_neg (int): number of negative clicks (for "click")
-        neg_margin_frac (float): margin to expand bbox when sampling negatives
+        mask_2d (torch.Tensor | np.ndarray): Binary target mask with shape [H, W].
+        prompt_type (str): "click", "bbox", or "mask".
+        num_pos (int): Number of positive clicks (for "click").
+        num_neg (int): Number of negative clicks (for "click").
+        neg_margin_frac (float): Margin to expand bbox when sampling negatives.
 
     Returns:
-        dict with one of:
-          - {"points": Tensor[n,2], "labels": Tensor[n]}   # n = num_pos + num_neg
-          - {"bbox":   Tensor[4]}                          # [x0,y0,x1,y1]
-          - {"mask":   Tensor[H,W]}                        # binary mask
-        If mask is empty and prompt cannot be formed, returns {}.
+        dict: Prompt payload containing points and labels, bbox, or mask.
+            Point coordinates have shape [N, 2], labels have shape [N], boxes have
+            shape [4] as [x0, y0, x1, y1], and masks have shape [H, W]. Returns an
+            empty dict when the mask is empty and no prompt can be formed.
     """
     if isinstance(mask_2d, torch.Tensor):
         m = mask_2d.detach().cpu()
@@ -1682,13 +1869,16 @@ def generate_prompt(mask_2d, prompt_type='click', num_pos=1, num_neg=0, neg_marg
     if prompt_type == "mask":
         if ys.numel() == 0:
             return {}
+
         return {"mask": m}
 
     if prompt_type == "bbox":
         if ys.numel() == 0:
             return {}
+
         y0, y1 = int(ys.min()), int(ys.max())
         x0, x1 = int(xs.min()), int(xs.max())
+
         return {"bbox": torch.tensor([x0, y0, x1, y1], dtype=torch.int64)}
 
     if prompt_type == "click":
@@ -1720,11 +1910,16 @@ def generate_prompt(mask_2d, prompt_type='click', num_pos=1, num_neg=0, neg_marg
                 x1n = min(W - 1, x1 + dx)
 
                 # Select candidate negatives inside expanded window but outside mask
-                YY, XX = torch.meshgrid(torch.arange(y0n, y1n + 1), torch.arange(x0n, x1n + 1), indexing='ij')
-                cand = (m[YY, XX] == 0)
+                YY, XX = torch.meshgrid(
+                    torch.arange(y0n, y1n + 1),
+                    torch.arange(x0n, x1n + 1),
+                    indexing="ij",
+                )
+                cand = m[YY, XX] == 0
                 cy, cx = YY[cand], XX[cand]
+
                 if cy.numel() == 0:
-                    cy, cx = torch.where(m == 0) # Fallback anywhere off-mask
+                    cy, cx = torch.where(m == 0)  # Fallback anywhere off-mask
             else:
                 cy, cx = torch.where(m == 0)
 
@@ -1735,8 +1930,9 @@ def generate_prompt(mask_2d, prompt_type='click', num_pos=1, num_neg=0, neg_marg
                 labels.append(torch.zeros(neg_xy.size(0), dtype=torch.int64))
 
         if points:
-            pts  = torch.cat(points, dim=0)
+            pts = torch.cat(points, dim=0)
             lbls = torch.cat(labels, dim=0)
+
             return {"points": pts, "labels": lbls}
 
         # No positives or negatives found, return empty prompt

@@ -1,3 +1,7 @@
+"""
+Test output folder templates, identifier segments, and safe leaf folder names.
+"""
+
 import unittest
 from pathlib import Path
 import sys
@@ -14,7 +18,20 @@ from dripp.output_structure import (
 
 
 class OutputStructureTests(unittest.TestCase):
+    """
+    Check safe rendering of configurable group output folders.
+    """
+
     def test_default_template_matches_existing_subdataset_layout(self):
+        """
+        Verify the default output template's established subdataset folder layout.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         dirs = render_output_dirs(
             "F:/Preprocessed",
             "ExampleCT",
@@ -34,6 +51,15 @@ class OutputStructureTests(unittest.TestCase):
         )
 
     def test_default_template_omits_missing_subdataset_segment(self):
+        """
+        Verify omission of an absent subdataset from the output folder path.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         dirs = render_output_dirs(
             "F:/Preprocessed",
             "ExampleCT",
@@ -49,6 +75,15 @@ class OutputStructureTests(unittest.TestCase):
         )
 
     def test_id_parts_strips_split_prefix(self):
+        """
+        Verify removal of a leading split name from identifier path segments.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         dirs = render_output_dirs(
             "F:/Preprocessed",
             "ExampleCT",
@@ -62,6 +97,15 @@ class OutputStructureTests(unittest.TestCase):
         self.assertNotIn("/train/train/", dirs["img_out_dir"])
 
     def test_custom_template_and_leaf_folders(self):
+        """
+        Verify custom group templates and image/mask leaf folder names.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         dirs = render_output_dirs(
             "F:/Preprocessed",
             "ExampleCT",
@@ -84,6 +128,15 @@ class OutputStructureTests(unittest.TestCase):
         )
 
     def test_template_validation_rejects_unsafe_values(self):
+        """
+        Verify rejection of unsafe or unsupported folder template values.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         invalid_templates = [
             "{dataset}/{unknown}",
             "../{dataset}",
@@ -96,6 +149,15 @@ class OutputStructureTests(unittest.TestCase):
                     validate_group_folder_template(template)
 
     def test_leaf_folder_validation_rejects_unsafe_values(self):
+        """
+        Verify rejection of empty, absolute, or traversing leaf folder names.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         invalid_leaf_folders = ["", "../labels", "nested/labels", "{split}", "/labels"]
         for folder in invalid_leaf_folders:
             with self.subTest(folder=folder):
@@ -103,6 +165,15 @@ class OutputStructureTests(unittest.TestCase):
                     validate_leaf_folder(folder, "Masks Folder")
 
     def test_default_template_is_valid(self):
+        """
+        Verify that the packaged group folder template passes validation.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.assertEqual(
             validate_group_folder_template(DEFAULT_GROUP_FOLDER_TEMPLATE),
             DEFAULT_GROUP_FOLDER_TEMPLATE,

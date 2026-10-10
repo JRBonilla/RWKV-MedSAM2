@@ -1,3 +1,10 @@
+"""
+Process indexed segmentation groups and manage dataset metadata and manifests.
+
+Build nested status records and legacy accepted-output manifests, collect quality
+reports, and publish dataset artifacts with atomic JSON replacement.
+"""
+
 import os
 import sys
 import argparse
@@ -23,107 +30,164 @@ from .config import (
     GROUPS_DIR,
     CT_STATS_DIR,
     GPU_ENABLED,
-    CSV_FILENAME
+    CSV_FILENAME,
 )
 from .preprocessor import Preprocessor
 from .ct_profiles import load_ct_profiles
 from .helpers import *
 from .output_structure import render_output_dirs
 
-
 REPORT_SCHEMA_VERSION = 3
 
 
 def atomic_write_json(path, value, *, indent=None):
-    """Atomically replace a JSON document, preserving an older valid file on error."""
+    """
+    Atomically replace a JSON document, preserving an older valid file on error.
+
+    Args:
+        path (str | pathlib.Path): Destination JSON path to create or replace
+            atomically.
+        value (object): JSON-serializable document to publish at the destination path.
+        indent (int | None): JSON indentation width, or None for compact serialization.
+
+    Returns:
+        None.
+    """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
+    # Keep the temporary file on the same filesystem so replacement is atomic.
     descriptor, temporary_path = tempfile.mkstemp(
         dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
     )
+
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(
-                value, handle, indent=indent,
+                value,
+                handle,
+                indent=indent,
                 separators=None if indent is not None else (",", ":"),
             )
+
         os.replace(temporary_path, path)
     except Exception:
         try:
             os.unlink(temporary_path)
         except FileNotFoundError:
             pass
+
         raise
+
 
 class SegmentationDataset:
     """
     A class to create a Segmentation Dataset based on pre-built groups JSON files.
-    
-    This class loads the lean groups JSON file that contains nested subdataset structure,
-    flattens it into individual groups, and then copies the images and masks into the
-    structured output directory.
+
+    This class loads the lean groups JSON file that contains nested subdataset
+    structure, flattens it into individual groups, and then copies the images and masks
+    into the structured output directory.
     """
+
     def __init__(self, dataset_name, metadata):
         """
         Initialize the dataset with its name and metadata.
 
         Args:
             dataset_name (str): The name of the dataset.
-            metadata (dict): The metadata describing the dataset (including grouping settings,
-                             folder structure, file types, etc.).
+            metadata (dict): The metadata describing the dataset (including grouping
+                settings, folder structure, file types, etc.).
+
+        Returns:
+            None.
         """
         self.dataset_name = dataset_name
         self.metadata = metadata
         root_dir = self.metadata.get("root_directory")
+
         if root_dir:
-            self.dataset_dir = normalize_path(os.path.join(BASE_UNPROC, dataset_name, root_dir))
+            self.dataset_dir = normalize_path(
+                os.path.join(BASE_UNPROC, dataset_name, root_dir)
+            )
         else:
             self.dataset_dir = normalize_path(os.path.join(BASE_UNPROC, dataset_name))
+
         self.output_dir = normalize_path(os.path.join(BASE_PROC, dataset_name))
         modalities = self.metadata.get("modalities") or ["default"]
         for mod in modalities:
-            os.makedirs(normalize_path(os.path.join(self.output_dir, mod)), exist_ok=True)
-        os.makedirs(normalize_path(os.path.join(self.output_dir, ".preprocessing_logs")), exist_ok=True)
+            os.makedirs(
+                normalize_path(os.path.join(self.output_dir, mod)), exist_ok=True
+            )
+
+        os.makedirs(
+            normalize_path(os.path.join(self.output_dir, ".preprocessing_logs")),
+            exist_ok=True,
+        )
         self.processed_pairs = {"train": 0, "test": 0}
         self.mask_classes = parse_mask_classes(self.metadata.get("mask_classes"))
 
-    def _process_legacy(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
+    def _process_legacy(
+        self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None
+    ):
         """
-        Process the dataset by reorganizing files according to the pre-built groups JSON file.
+        Process the dataset by reorganizing files according to the pre-built groups JSON
+        file.
 
-        Loads the groups file (which contains nested subdataset groupings), flattens the nested structure,
-        and then calls _process_grouping_and_copy() to copy the image and mask files to the structured output.
-        Groups are filtered based on the max_groups parameter separately for training and test splits.
+        Loads the groups file (which contains nested subdataset groupings), flattens the
+        nested structure, and then calls _process_grouping_and_copy() to copy the image
+        and mask files to the structured output. Groups are filtered based on the
+        max_groups parameter separately for training and test splits.
 
         Args:
             preprocessor (Preprocessor): An instance for preprocessing (if needed).
-            max_groups (int): Maximum number of groups to process per split (train/test).
+            max_groups (int): Maximum number of groups to process per split
+                (train/test).
+            workers (int): Number of worker threads; one processes the groups serially.
+            modalities (str | Iterable[str] | None): Optional case-insensitive modality
+                selection; None or an all token disables filtering.
+
+        Returns:
+            None.
         """
         self.preprocessor = preprocessor
         modality_filter = normalize_modality_filter(modalities)
 
-        self.preprocessor.dataset_logger.info(f"Processing dataset '{self.dataset_name}'...")
-        self.preprocessor.main_logger.info(f"\nProcessing dataset '{self.dataset_name}'...")
+        self.preprocessor.dataset_logger.info(
+            f"Processing dataset '{self.dataset_name}'..."
+        )
+        self.preprocessor.main_logger.info(
+            f"\nProcessing dataset '{self.dataset_name}'..."
+        )
 
         grouping_regex = self.metadata.get("grouping_regex")
-        subdataset_configs = get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
+        subdataset_configs = (
+            get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
+        )
 
         # Load the groups JSON file instead of the full index file.
         groups_file = os.path.join(GROUPS_DIR, f"{self.dataset_name}_groups.json")
+
         try:
             with open(groups_file, "r") as f:
                 groups_data = json.load(f)
-            self.preprocessor.dataset_logger.info(f"Using groups file {groups_file} for dataset '{self.dataset_name}'.")
+
+            self.preprocessor.dataset_logger.info(
+                f"Using groups file {groups_file} for dataset '{self.dataset_name}'."
+            )
 
             # Expect the groups file to contain a nested structure under the key "subdatasets".
             subdatasets = groups_data.get("subdatasets", [])
-            self.preprocessor.dataset_logger.info(f"Found {len(subdatasets)} subdataset(s).")
-            
+            self.preprocessor.dataset_logger.info(
+                f"Found {len(subdatasets)} subdataset(s)."
+            )
+
             # Flatten the nested subdataset structure: add subdataset information to each group.
             flat_groups = []
+
             for sub in subdatasets:
                 sub_name = sub.get("name", "default")
-                sub_modality = sub.get("modality", (self.metadata.get("modalities") or ["default"])[0])
+                sub_modality = sub.get(
+                    "modality", (self.metadata.get("modalities") or ["default"])[0]
+                )
                 if not modality_is_selected(sub_modality, modality_filter):
                     continue
                 for split in ["train", "test"]:
@@ -145,6 +209,7 @@ class SegmentationDataset:
                         sampled.extend(random.sample(grp_list, max_groups))
                     else:
                         sampled.extend(grp_list)
+
                 flat_groups = sampled
 
             # Build the identifiers dictionary for further processing.
@@ -156,7 +221,8 @@ class SegmentationDataset:
             if modality_filter is not None:
                 self.preprocessor.dataset_logger.info(
                     "Modality filter %s selected %d group(s)",
-                    ", ".join(sorted(modality_filter)), len(identifiers),
+                    ", ".join(sorted(modality_filter)),
+                    len(identifiers),
                 )
 
             started = time.perf_counter()
@@ -168,44 +234,71 @@ class SegmentationDataset:
             )
             self.preprocessor.dataset_logger.info(
                 "Processed %d groups with %d worker(s) in %.2f seconds",
-                len(identifiers), workers, time.perf_counter() - started,
+                len(identifiers),
+                workers,
+                time.perf_counter() - started,
             )
         except Exception as e:
-            self.preprocessor.dataset_logger.error(f"Error loading groups file {groups_file}: {e}.")
+            self.preprocessor.dataset_logger.error(
+                f"Error loading groups file {groups_file}: {e}."
+            )
             return
 
         total_groups = len(grouping_metadata)
-        self.preprocessor.main_logger.info(f"Processing of dataset '{self.dataset_name}' complete. {total_groups} identifier group(s) processed. Outputs at: {self.output_dir}")
+        self.preprocessor.main_logger.info(
+            f"Processing of dataset '{self.dataset_name}' complete. {total_groups} identifier group(s) processed. Outputs at: {self.output_dir}"
+        )
         # self.metadata["Num Images"] = sum(len(entry["images"]) for entry in grouping_metadata)
         # self.metadata["Num Masks"] = sum(len(entry["masks"]) for entry in grouping_metadata)
         self.metadata["Preprocessed?"] = "yes"
 
-        grouping_meta_path = normalize_path(os.path.join(self.output_dir, "groupings.json"))
+        grouping_meta_path = normalize_path(
+            os.path.join(self.output_dir, "groupings.json")
+        )
+
         with open(grouping_meta_path, "w") as f:
             json.dump(grouping_metadata, f, indent=2)
 
-    def _process_grouping_and_copy_legacy(self, identifiers, subdataset_configs, logger, workers=1):
+    def _process_grouping_and_copy_legacy(
+        self, identifiers, subdataset_configs, logger, workers=1
+    ):
         """
-        Process each group in the identifiers dictionary by copying and preprocessing the corresponding image and mask files.
+        Process each group in the identifiers dictionary by copying and preprocessing
+        the corresponding image and mask files.
 
-        For each group, the function extracts and sorts file paths, builds output directories, and calls the preprocess_group method
-        of the preprocessor with the pipeline as the first argument. It then collects all configured processed image and mask
-        output files. If preprocess_group returned multiple modality volumes, this function splits the group into separate entries
-        with distinct identifiers.
+        For each group, the function extracts and sorts file paths, builds output
+        directories, and calls the preprocess_group method of the preprocessor with the
+        pipeline as the first argument. It then collects all configured processed image
+        and mask output files. If preprocess_group returned multiple modality volumes,
+        this function splits the group into separate entries with distinct identifiers.
 
         Args:
-            identifiers (dict): A dictionary with group identifiers as keys and group metadata as values.
+            identifiers (dict): A dictionary with group identifiers as keys and group
+                metadata as values.
             subdataset_configs (list): A list of subdataset configuration dictionaries.
             logger (logging.Logger): The logger to use for logging.
+            workers (int): Number of worker threads; one processes the groups serially.
 
         Returns:
-            list: A list of dictionaries, each containing the group identifier, original and processed image and mask file lists,
-                  and preprocessing metadata.
+            list[dict]: Group identifiers, original and processed image/mask paths,
+                and preprocessing metadata for the legacy output manifest.
         """
         if workers > 1 and len(identifiers) > 1:
+            # Each worker needs its own preprocessor because output and QC tracking
+            # are mutable and are reset at the start of every group.
             thread_state = threading.local()
 
             def process_one(item):
+                """
+                Process one legacy group using a thread-local dataset and preprocessor.
+
+                Args:
+                    item (tuple): Group key and metadata assigned to the processing
+                        worker.
+
+                Returns:
+                    list[dict]: Legacy grouping metadata for the assigned group.
+                """
                 if not hasattr(thread_state, "dataset"):
                     base = self.preprocessor
                     worker_preprocessor = Preprocessor(
@@ -216,7 +309,9 @@ class SegmentationDataset:
                         dataset_name=base.dataset_name,
                         background_value=base.background_value,
                     )
-                    worker_dataset = SegmentationDataset(self.dataset_name, self.metadata)
+                    worker_dataset = SegmentationDataset(
+                        self.dataset_name, self.metadata
+                    )
                     worker_dataset.preprocessor = worker_preprocessor
                     thread_state.dataset = worker_dataset
 
@@ -225,13 +320,21 @@ class SegmentationDataset:
                 result = thread_state.dataset._process_grouping_and_copy(
                     {key: entry}, subdataset_configs, logger, workers=1
                 )
-                logger.info("Processed group %s in %.2f seconds", key, time.perf_counter() - started)
+                logger.info(
+                    "Processed group %s in %.2f seconds",
+                    key,
+                    time.perf_counter() - started,
+                )
+
                 return result
 
             grouping_metadata = []
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dripp-group") as executor:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="dripp-group"
+            ) as executor:
                 for result in executor.map(process_one, identifiers.items()):
                     grouping_metadata.extend(result)
+
             return grouping_metadata
 
         grouping_metadata = []
@@ -256,7 +359,9 @@ class SegmentationDataset:
 
             # Build output directories
             sub_name = entry.get("subdataset_name") or entry.get("name")
-            sub_modality = entry.get("subdataset_modality") or ((self.metadata.get("modalities") or ["default"])[0])
+            sub_modality = entry.get("subdataset_modality") or (
+                (self.metadata.get("modalities") or ["default"])[0]
+            )
             sub_pipeline = entry.get("subdataset_pipeline")
 
             output_dirs = render_output_dirs(
@@ -279,7 +384,10 @@ class SegmentationDataset:
             try:
                 group_options = entry.get("preprocessing_options")
                 if group_options is None:
-                    group_options = get_preprocessing_options(self.metadata, sub_name, include_defaults=False)
+                    group_options = get_preprocessing_options(
+                        self.metadata, sub_name, include_defaults=False
+                    )
+
                 preprocessing_metadata = self.preprocessor.preprocess_group(
                     sub_name,
                     sub_pipeline,
@@ -290,7 +398,7 @@ class SegmentationDataset:
                     mask_out_dir,
                     composite_id,
                     self.mask_classes,
-                    group_options
+                    group_options,
                 )
             except Exception as e:
                 logger.error(f"Error preprocessing group {key}: {e}", exc_info=True)
@@ -309,74 +417,102 @@ class SegmentationDataset:
             )
             # Pair each mask path with its corresponding class
             proc_masks = [
-                {"path": p, "class": extract_mask_class(p)}
-                for p in mask_files
+                {"path": p, "class": extract_mask_class(p)} for p in mask_files
             ]
 
             # Drop this group if no masks were produced
             if not proc_masks:
-                logger.warning(f"Group {key} produced no processed masks. Skipping group.")
+                logger.warning(
+                    f"Group {key} produced no processed masks. Skipping group."
+                )
                 continue
 
             # If preprocess_group returned multiple modality NIfTIs, split into separate entries
-            if (isinstance(preprocessing_metadata, dict)
-                    and "image_niftis" in preprocessing_metadata
-                    and len(preprocessing_metadata["image_niftis"]) > 1):
+            if (
+                isinstance(preprocessing_metadata, dict)
+                and "image_niftis" in preprocessing_metadata
+                and len(preprocessing_metadata["image_niftis"]) > 1
+            ):
                 for idx, img_nif in enumerate(preprocessing_metadata["image_niftis"]):
                     new_id = f"{composite_id}_modality{idx}"
                     mask_nifti_paths = preprocessing_metadata.get("mask_niftis", [])
-                    proc_masks = [{"path": p, "class": extract_mask_class(p)} for p in mask_nifti_paths]
+                    proc_masks = [
+                        {"path": p, "class": extract_mask_class(p)}
+                        for p in mask_nifti_paths
+                    ]
                     split_entry = {
-                        "identifier":       new_id,
-                        "short_id":         self.preprocessor._short_id(new_id),
-                        "images":           entry["images"],
-                        "masks":            entry["masks"],  # Original raw-mask paths
-                        "proc_images":      [img_nif],       # Processed NIfTIs
-                        "proc_masks":       proc_masks,
+                        "identifier": new_id,
+                        "short_id": self.preprocessor._short_id(new_id),
+                        "images": entry["images"],
+                        "masks": entry["masks"],  # Original raw-mask paths
+                        "proc_images": [img_nif],  # Processed NIfTIs
+                        "proc_masks": proc_masks,
                         "preprocessing_metadata": {
                             "resize_shape": preprocessing_metadata.get("resize_shape"),
-                            "volume_shape": preprocessing_metadata.get("volume_shape")
-                        }
+                            "volume_shape": preprocessing_metadata.get("volume_shape"),
+                        },
                     }
                     grouping_metadata.append(split_entry)
             elif group_options.get("split_processed_images_by_modality"):
                 for idx, img in enumerate(proc_imgs):
                     new_id = f"{composite_id}_modality{idx}"
                     entry_dict = {
-                        "identifier":       new_id,
-                        "short_id":         self.preprocessor._short_id(new_id),
-                        "images":           entry["images"],
-                        "masks":            entry["masks"],  # Original raw-mask paths
-                        "proc_images":      [img],       # Processed image
-                        "proc_masks":       proc_masks,
-                        "preprocessing_metadata": {}
+                        "identifier": new_id,
+                        "short_id": self.preprocessor._short_id(new_id),
+                        "images": entry["images"],
+                        "masks": entry["masks"],  # Original raw-mask paths
+                        "proc_images": [img],  # Processed image
+                        "proc_masks": proc_masks,
+                        "preprocessing_metadata": {},
                     }
                     grouping_metadata.append(entry_dict)
             else:
                 entry_dict = {
-                    "identifier":             composite_id,
-                    "short_id":               self.preprocessor._short_id(composite_id),
-                    "images":                 entry["images"],
-                    "masks":                  entry["masks"],
-                    "proc_images":            proc_imgs,
-                    "proc_masks":             proc_masks,
-                    "preprocessing_metadata": {}
+                    "identifier": composite_id,
+                    "short_id": self.preprocessor._short_id(composite_id),
+                    "images": entry["images"],
+                    "masks": entry["masks"],
+                    "proc_images": proc_imgs,
+                    "proc_masks": proc_masks,
+                    "preprocessing_metadata": {},
                 }
 
                 # Always include resize_shape if present
-                if isinstance(preprocessing_metadata, dict) and "resize_shape" in preprocessing_metadata:
-                    entry_dict["preprocessing_metadata"]["resize_shape"] = preprocessing_metadata["resize_shape"]
+                if (
+                    isinstance(preprocessing_metadata, dict)
+                    and "resize_shape" in preprocessing_metadata
+                ):
+                    entry_dict["preprocessing_metadata"]["resize_shape"] = (
+                        preprocessing_metadata["resize_shape"]
+                    )
 
                 # If video metadata is present, include fps & num_frames
-                if isinstance(preprocessing_metadata, dict) and "fps" in preprocessing_metadata and "num_frames" in preprocessing_metadata:
-                    entry_dict["preprocessing_metadata"]["fps"] = preprocessing_metadata["fps"]
-                    entry_dict["preprocessing_metadata"]["num_frames"] = preprocessing_metadata["num_frames"]
+                if (
+                    isinstance(preprocessing_metadata, dict)
+                    and "fps" in preprocessing_metadata
+                    and "num_frames" in preprocessing_metadata
+                ):
+                    entry_dict["preprocessing_metadata"]["fps"] = (
+                        preprocessing_metadata["fps"]
+                    )
+                    entry_dict["preprocessing_metadata"]["num_frames"] = (
+                        preprocessing_metadata["num_frames"]
+                    )
 
                 # If 3D metadata is present, include volume_shape and NIfTI paths
-                if isinstance(preprocessing_metadata, dict) and "volume_shape" in preprocessing_metadata:
-                    entry_dict["preprocessing_metadata"]["volume_shape"] = preprocessing_metadata["volume_shape"]
-                    entry_dict["preprocessing_metadata"]["image_niftis"] = preprocessing_metadata.get("image_niftis", [])
-                    entry_dict["preprocessing_metadata"]["mask_niftis"] = preprocessing_metadata.get("mask_niftis", [])
+                if (
+                    isinstance(preprocessing_metadata, dict)
+                    and "volume_shape" in preprocessing_metadata
+                ):
+                    entry_dict["preprocessing_metadata"]["volume_shape"] = (
+                        preprocessing_metadata["volume_shape"]
+                    )
+                    entry_dict["preprocessing_metadata"]["image_niftis"] = (
+                        preprocessing_metadata.get("image_niftis", [])
+                    )
+                    entry_dict["preprocessing_metadata"]["mask_niftis"] = (
+                        preprocessing_metadata.get("mask_niftis", [])
+                    )
 
                 grouping_metadata.append(entry_dict)
 
@@ -384,11 +520,49 @@ class SegmentationDataset:
 
     @staticmethod
     def _primary_reason(reasons, fallback="no_processed_masks"):
+        """
+        Select the last recorded rejection reason or the supplied fallback.
+
+        Args:
+            reasons (list[str]): Recorded group rejection reasons in occurrence order.
+            fallback (str): Reason or setting value used when the requested value is
+                unavailable.
+
+        Returns:
+            str: Primary reason reported for an unsuccessful group.
+        """
         return reasons[-1] if reasons else fallback
 
     def _preprocessing_result(
-        self, entry, tracking, status, reason=None, stage=None, error=None,
+        self,
+        entry,
+        tracking,
+        status,
+        reason=None,
+        stage=None,
+        error=None,
     ):
+        """
+        Build a JSON-safe status block from input counts, outputs, QC, and errors.
+
+        Args:
+            entry (dict): Original grouped image/mask metadata retained in the output
+                manifest.
+            tracking (dict): Recorded output paths, explicit mask pairings, and quality
+                counters.
+            status (str): Processing result category: accepted, rejected, failed, or
+                partial.
+            reason (str | None): Rejection or failure reason to record, if one is
+                available.
+            stage (str | None): Processing stage associated with the current operation
+                or failure.
+            error (Exception | None): Optional processing exception to summarize in the
+                manifest.
+
+        Returns:
+            dict: Group status, processing stage, quality policy, counts, and optional
+                error details.
+        """
         result = {
             "status": status,
             "reason": reason,
@@ -401,100 +575,185 @@ class SegmentationDataset:
                 "images": len(tracking.get("proc_images") or []),
                 "masks": len(tracking.get("proc_masks") or []),
             },
-            "qc": dict(tracking.get("qc") or {
-                "empty_masks": 0,
-                "components_2d_found": 0,
-                "components_2d_rejected": 0,
-                "components_3d_found": 0,
-                "components_3d_rejected": 0,
-                "components_3d_rejected_by_reason": {},
-            }),
-            "quality_policy_3d": copy.deepcopy(
-                tracking.get("quality_policy_3d") or {}
+            "qc": dict(
+                tracking.get("qc")
+                or {
+                    "empty_masks": 0,
+                    "components_2d_found": 0,
+                    "components_2d_rejected": 0,
+                    "components_3d_found": 0,
+                    "components_3d_rejected": 0,
+                    "components_3d_rejected_by_reason": {},
+                }
             ),
+            "quality_policy_3d": copy.deepcopy(tracking.get("quality_policy_3d") or {}),
         }
         if error is not None:
             result["error"] = {
                 "type": type(error).__name__,
                 "message": str(error).replace("\n", " ")[:500],
             }
+
         return result
 
     @staticmethod
     def _failure_reason(stage):
+        """
+        Map a failed processing stage to a stable manifest reason code.
+
+        Args:
+            stage (str | None): Processing stage associated with the current operation
+                or failure.
+
+        Returns:
+            str: Load, resample, write, or generic processing error code.
+        """
         if stage == "load":
             return "load_error"
         if stage == "resample":
             return "resample_error"
         if stage == "write":
             return "write_error"
+
         return "processing_error"
 
     def _base_output_entry(self, entry, composite_id):
+        """
+        Copy a source group and ensure its stable short identifier is present.
+
+        Args:
+            entry (dict): Original grouped image/mask metadata retained in the output
+                manifest.
+            composite_id (str): Stable composite group identifier used for pairing and
+                output naming.
+
+        Returns:
+            dict: Independent manifest entry retaining source metadata.
+        """
         result = copy.deepcopy(entry)
         result.setdefault("short_id", self.preprocessor._short_id(composite_id))
+
         return result
 
     @staticmethod
     def _clean_pipeline_metadata(metadata):
+        """
+        Remove output tracking and QC fields from pipeline-specific metadata.
+
+        Args:
+            metadata (dict): Pipeline result containing output tracking and other
+                processing fields.
+
+        Returns:
+            dict: Remaining pipeline metadata, suitable for the manifest metadata field.
+        """
         ignored = {
-            "proc_images", "proc_masks", "qc", "reasons", "stage",
-            "image_niftis", "mask_niftis", "quality_policy_3d",
+            "proc_images",
+            "proc_masks",
+            "qc",
+            "reasons",
+            "stage",
+            "image_niftis",
+            "mask_niftis",
+            "quality_policy_3d",
         }
+
         return {
-            key: value for key, value in (metadata or {}).items()
-            if key not in ignored
+            key: value for key, value in (metadata or {}).items() if key not in ignored
         }
 
     def _successful_entries(self, entry, composite_id, metadata, status_block, options):
+        """
+        Build accepted output entries, optionally separating image modalities.
+
+        Args:
+            entry (dict): Original grouped image/mask metadata retained in the output
+                manifest.
+            composite_id (str): Stable composite group identifier used for pairing and
+                output naming.
+            metadata (dict): Completed pipeline result from which output metadata is
+                retained.
+            status_block (dict): Accepted group's processing status, counters, and
+                quality policy.
+            options (dict): Effective dataset or subdataset preprocessing settings.
+
+        Returns:
+            list[dict]: Manifest entries with explicit image/mask relationships and
+                shared source identity.
+        """
         proc_images = list(metadata.get("proc_images") or [])
         proc_masks = [dict(mask) for mask in metadata.get("proc_masks") or []]
         pipeline_metadata = self._clean_pipeline_metadata(metadata)
         source_identifier = entry.get("identifier", composite_id)
 
-        split_outputs = (
-            len(metadata.get("image_niftis") or []) > 1
-            or options.get("split_processed_images_by_modality")
+        split_outputs = len(metadata.get("image_niftis") or []) > 1 or options.get(
+            "split_processed_images_by_modality"
         )
+
         if split_outputs and len(proc_images) > 1:
             outputs = []
-            shared_masks = (
-                bool(metadata.get("image_niftis"))
-                or bool(options.get("share_masks_across_processed_images"))
+            shared_masks = bool(metadata.get("image_niftis")) or bool(
+                options.get("share_masks_across_processed_images")
             )
             for image_index, image_path in enumerate(proc_images):
                 if shared_masks:
                     selected_masks = [dict(mask, image_index=0) for mask in proc_masks]
                 else:
                     selected_masks = [
-                        dict(mask, image_index=0) for mask in proc_masks
+                        dict(mask, image_index=0)
+                        for mask in proc_masks
                         if mask.get("image_index") == image_index
                     ]
+
                 result = self._base_output_entry(entry, composite_id)
-                result.update({
-                    "identifier": f"{composite_id}_modality{image_index}",
-                    "source_identifier": source_identifier,
-                    "proc_images": [image_path],
-                    "proc_masks": selected_masks,
-                    "preprocessing_metadata": pipeline_metadata,
-                    "preprocessing": copy.deepcopy(status_block),
-                })
+                result.update(
+                    {
+                        "identifier": f"{composite_id}_modality{image_index}",
+                        "source_identifier": source_identifier,
+                        "proc_images": [image_path],
+                        "proc_masks": selected_masks,
+                        "preprocessing_metadata": pipeline_metadata,
+                        "preprocessing": copy.deepcopy(status_block),
+                    }
+                )
                 result["preprocessing"]["output_counts"] = {
-                    "images": 1, "masks": len(selected_masks),
+                    "images": 1,
+                    "masks": len(selected_masks),
                 }
                 outputs.append(result)
+
             return outputs
 
         result = self._base_output_entry(entry, composite_id)
-        result.update({
-            "proc_images": proc_images,
-            "proc_masks": proc_masks,
-            "preprocessing_metadata": pipeline_metadata,
-            "preprocessing": status_block,
-        })
+        result.update(
+            {
+                "proc_images": proc_images,
+                "proc_masks": proc_masks,
+                "preprocessing_metadata": pipeline_metadata,
+                "preprocessing": status_block,
+            }
+        )
+
         return [result]
 
     def _process_one_group(self, key, entry, subdataset_configs, logger):
+        """
+        Process a group and retain accepted, rejected, failed, or partial results.
+
+        Args:
+            key (tuple): Composite key locating one grouped input in the processing
+                dictionary.
+            entry (dict): Original grouped image/mask metadata retained in the output
+                manifest.
+            subdataset_configs (list[SubdatasetConfig] | None): Resolved subdataset
+                matching configurations, when available.
+            logger (logging.Logger): Logger receiving group processing and failure
+                diagnostics.
+
+        Returns:
+            list[dict]: Group manifest entries containing outputs and processing
+                diagnostics.
+        """
         composite_id = get_composite_identifier(entry)
         base = self._base_output_entry(entry, composite_id)
         base["proc_images"] = []
@@ -503,9 +762,15 @@ class SegmentationDataset:
         if not entry.get("images"):
             error = ValueError("group has no input images")
             base["preprocessing"] = self._preprocessing_result(
-                entry, {}, "failed", "load_error", "load", error,
+                entry,
+                {},
+                "failed",
+                "load_error",
+                "load",
+                error,
             )
             logger.error("Group %s has no input images", key)
+
             return [base]
 
         image_paths = sorted(
@@ -521,16 +786,25 @@ class SegmentationDataset:
             (self.metadata.get("modalities") or ["default"])[0]
         )
         output_dirs = render_output_dirs(
-            config.BASE_PROC, self.dataset_name, entry, sub_modality, sub_name,
-            composite_id, config.OUTPUT_STRUCTURE["group_folder_template"],
+            config.BASE_PROC,
+            self.dataset_name,
+            entry,
+            sub_modality,
+            sub_name,
+            composite_id,
+            config.OUTPUT_STRUCTURE["group_folder_template"],
             config.OUTPUT_STRUCTURE["images_folder"],
             config.OUTPUT_STRUCTURE["masks_folder"],
         )
         options = entry.get("preprocessing_options")
+
         if options is None:
             options = get_preprocessing_options(
-                self.metadata, sub_name, include_defaults=False,
+                self.metadata,
+                sub_name,
+                include_defaults=False,
             )
+
         options = options or {}
 
         reset_tracking = getattr(self.preprocessor, "_reset_group_tracking", None)
@@ -540,23 +814,44 @@ class SegmentationDataset:
             os.makedirs(output_dirs["img_out_dir"], exist_ok=True)
             os.makedirs(output_dirs["mask_out_dir"], exist_ok=True)
             metadata = self.preprocessor.preprocess_group(
-                sub_name, entry.get("subdataset_pipeline"), image_paths, mask_paths,
-                sub_modality, output_dirs["img_out_dir"], output_dirs["mask_out_dir"],
-                composite_id, self.mask_classes, options,
+                sub_name,
+                entry.get("subdataset_pipeline"),
+                image_paths,
+                mask_paths,
+                sub_modality,
+                output_dirs["img_out_dir"],
+                output_dirs["mask_out_dir"],
+                composite_id,
+                self.mask_classes,
+                options,
             )
         except Exception as error:
             logger.error("Error preprocessing group %s: %s", key, error, exc_info=True)
             tracking = self.preprocessor.get_group_tracking_metadata()
             usable = bool(tracking.get("proc_images") and tracking.get("proc_masks"))
             status = "partial" if usable else "failed"
-            reason = "partial_output" if usable else self._failure_reason(tracking.get("stage"))
+            reason = (
+                "partial_output"
+                if usable
+                else self._failure_reason(tracking.get("stage"))
+            )
             result = self._base_output_entry(entry, composite_id)
-            result["proc_images"] = list(tracking.get("proc_images") or []) if usable else []
-            result["proc_masks"] = list(tracking.get("proc_masks") or []) if usable else []
+            result["proc_images"] = (
+                list(tracking.get("proc_images") or []) if usable else []
+            )
+            result["proc_masks"] = (
+                list(tracking.get("proc_masks") or []) if usable else []
+            )
             result["preprocessing_metadata"] = {}
             result["preprocessing"] = self._preprocessing_result(
-                entry, tracking, status, reason, tracking.get("stage"), error,
+                entry,
+                tracking,
+                status,
+                reason,
+                tracking.get("stage"),
+                error,
             )
+
             return [result]
 
         proc_images = metadata.get("proc_images") or []
@@ -565,25 +860,60 @@ class SegmentationDataset:
             reason = self._primary_reason(metadata.get("reasons") or [])
             base["preprocessing_metadata"] = self._clean_pipeline_metadata(metadata)
             base["preprocessing"] = self._preprocessing_result(
-                entry, metadata, "rejected", reason,
+                entry,
+                metadata,
+                "rejected",
+                reason,
             )
             logger.warning("Group %s rejected: %s", key, reason)
+
             return [base]
 
         status = self._preprocessing_result(entry, metadata, "accepted")
         return self._successful_entries(entry, composite_id, metadata, status, options)
 
-    def _process_grouping_and_copy(self, identifiers, subdataset_configs, logger, workers=1):
+    def _process_grouping_and_copy(
+        self, identifiers, subdataset_configs, logger, workers=1
+    ):
+        """
+        Process grouped inputs serially or with thread-local preprocessors.
+
+        Args:
+            identifiers (dict): Grouped inputs keyed by identifier, split, subdataset,
+                and optional ordinal.
+            subdataset_configs (list[SubdatasetConfig] | None): Resolved subdataset
+                matching configurations, when available.
+            logger (logging.Logger): Logger receiving group processing and failure
+                diagnostics.
+            workers (int): Number of worker threads; one processes the groups serially.
+
+        Returns:
+            list[dict]: Group results in the input dictionary's iteration order.
+        """
         items = list(identifiers.items())
         if workers <= 1 or len(items) <= 1:
             results = []
             for key, entry in items:
-                results.extend(self._process_one_group(key, entry, subdataset_configs, logger))
+                results.extend(
+                    self._process_one_group(key, entry, subdataset_configs, logger)
+                )
+
             return results
 
+        # Each worker needs its own preprocessor because output and QC tracking
+        # are mutable and are reset at the start of every group.
         thread_state = threading.local()
 
         def process_one(item):
+            """
+            Process one group with an independently initialized thread-local dataset.
+
+            Args:
+                item (tuple): Group key and metadata assigned to the processing worker.
+
+            Returns:
+                list[dict]: Manifest entries produced for the assigned group.
+            """
             if not hasattr(thread_state, "dataset"):
                 current = self.preprocessor
                 worker_preprocessor = Preprocessor(
@@ -598,20 +928,39 @@ class SegmentationDataset:
                 worker_dataset = SegmentationDataset(self.dataset_name, self.metadata)
                 worker_dataset.preprocessor = worker_preprocessor
                 thread_state.dataset = worker_dataset
+
             key, entry = item
             return thread_state.dataset._process_one_group(
-                key, entry, subdataset_configs, logger,
+                key,
+                entry,
+                subdataset_configs,
+                logger,
             )
 
         results = []
         with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="dripp-group",
+            max_workers=workers,
+            thread_name_prefix="dripp-group",
         ) as executor:
             for group_results in executor.map(process_one, items):
                 results.extend(group_results)
+
         return results
 
     def _build_nested_manifest(self, source, results):
+        """
+        Replace processed groups at their original locations in the nested manifest.
+
+        Args:
+            source (dict): Original nested grouping manifest whose processed entries are
+                replaced.
+            results (list[dict]): Processed group entries with output tracking and
+                status metadata.
+
+        Returns:
+            dict: Manifest copy with processing schema version and updated group
+                records.
+        """
         by_locator = defaultdict(list)
         for result in results:
             locator = tuple(result.get("_source_locator", ()))
@@ -626,36 +975,71 @@ class SegmentationDataset:
                 rebuilt = []
                 for group_index, original in enumerate(subdataset.get(split, [])):
                     replacement = by_locator.get((sub_index, split, group_index))
-                    rebuilt.extend(replacement if replacement is not None else [original])
+                    rebuilt.extend(
+                        replacement if replacement is not None else [original]
+                    )
+
                 subdataset[split] = rebuilt
+
         return nested
 
     def _build_report(self, results, preprocessing_seconds, manifest_seconds):
+        """
+        Summarize unique attempted groups, QC policies, failure reasons, and durations.
+
+        Args:
+            results (list[dict]): Processed group entries with output tracking and
+                status metadata.
+            preprocessing_seconds (float): Elapsed time spent preprocessing the selected
+                groups, in seconds.
+            manifest_seconds (float): Elapsed time spent writing the nested and legacy
+                manifests, in seconds.
+
+        Returns:
+            dict: Dataset-level processing counts, issues, thresholds, policies, and
+                elapsed times.
+        """
+        # Modality splitting creates several outputs for one source group; count
+        # that source once so dataset-level status and QC totals stay accurate.
         unique_results = {}
         for result in results:
-            key = tuple(result.get("_source_locator") or (
-                result.get("identifier"), result.get("split"),
-                result.get("subdataset_name"),
-            ))
+            key = tuple(
+                result.get("_source_locator")
+                or (
+                    result.get("identifier"),
+                    result.get("split"),
+                    result.get("subdataset_name"),
+                )
+            )
             unique_results.setdefault(key, result)
+
         attempted_results = list(unique_results.values())
-        status_counts = Counter(result["preprocessing"]["status"] for result in attempted_results)
+        status_counts = Counter(
+            result["preprocessing"]["status"] for result in attempted_results
+        )
         reason_counts = Counter(
-            result["preprocessing"]["reason"] for result in attempted_results
+            result["preprocessing"]["reason"]
+            for result in attempted_results
             if result["preprocessing"].get("reason")
         )
         issues = []
+
         for result in attempted_results:
             state = result["preprocessing"]
             if state["status"] == "accepted":
                 continue
-            issues.append({
-                "identifier": result.get("source_identifier", result.get("identifier")),
-                "split": result.get("split"),
-                "subdataset": result.get("subdataset_name"),
-                "stage": state.get("stage"),
-                "reason": state.get("reason"),
-            })
+
+            issues.append(
+                {
+                    "identifier": result.get(
+                        "source_identifier", result.get("identifier")
+                    ),
+                    "split": result.get("split"),
+                    "subdataset": result.get("subdataset_name"),
+                    "stage": state.get("stage"),
+                    "reason": state.get("reason"),
+                }
+            )
 
         quality_policies_3d = []
         seen_policies = set()
@@ -663,6 +1047,7 @@ class SegmentationDataset:
             policy = result["preprocessing"].get("quality_policy_3d") or {}
             if not policy:
                 continue
+
             policy_key = json.dumps(policy, sort_keys=True, separators=(",", ":"))
             if policy_key not in seen_policies:
                 seen_policies.add(policy_key)
@@ -691,10 +1076,28 @@ class SegmentationDataset:
             "issues": issues,
         }
 
-    def process(self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None):
+    def process(
+        self, preprocessor: Preprocessor, max_groups=0, workers=1, modalities=None
+    ):
+        """
+        Process selected groups and atomically publish nested and legacy manifests.
+
+        Args:
+            preprocessor (Preprocessor): Preprocessor instance used to load, transform,
+                and save grouped inputs.
+            max_groups (int): Maximum sampled groups per split and subdataset; zero
+                processes all groups.
+            workers (int): Number of worker threads; one processes the groups serially.
+            modalities (str | Iterable[str] | None): Optional case-insensitive modality
+                selection; None or an all token disables filtering.
+
+        Returns:
+            None.
+        """
         self.preprocessor = preprocessor
         selected_modalities = normalize_modality_filter(modalities)
         groups_file = os.path.join(GROUPS_DIR, f"{self.dataset_name}_groups.json")
+
         with open(groups_file, "r", encoding="utf-8") as handle:
             groups_data = json.load(handle)
 
@@ -703,10 +1106,12 @@ class SegmentationDataset:
             get_regex_configs(grouping_regex, self.metadata) if grouping_regex else None
         )
         candidates = []
+
         for sub_index, subdataset in enumerate(groups_data.get("subdatasets", [])):
             sub_name = subdataset.get("name", "default")
             modality = subdataset.get(
-                "modality", (self.metadata.get("modalities") or ["default"])[0],
+                "modality",
+                (self.metadata.get("modalities") or ["default"])[0],
             )
             if not modality_is_selected(modality, selected_modalities):
                 continue
@@ -722,91 +1127,132 @@ class SegmentationDataset:
                     split_groups.append(entry)
                 if max_groups > 0 and len(split_groups) > max_groups:
                     split_groups = random.sample(split_groups, max_groups)
+
                 candidates.extend(split_groups)
 
         identifiers = {
-            (entry.get("identifier"), entry["split"], entry["subdataset_name"], ordinal): entry
+            (
+                entry.get("identifier"),
+                entry["split"],
+                entry["subdataset_name"],
+                ordinal,
+            ): entry
             for ordinal, entry in enumerate(candidates)
         }
         preprocessing_started = time.perf_counter()
         results = self._process_grouping_and_copy(
-            identifiers, subdataset_configs, self.preprocessor.dataset_logger,
+            identifiers,
+            subdataset_configs,
+            self.preprocessor.dataset_logger,
             workers=workers,
         )
         preprocessing_seconds = time.perf_counter() - preprocessing_started
 
         nested = self._build_nested_manifest(groups_data, results)
         legacy = []
+
         for result in results:
-            if (result["preprocessing"]["status"] in {"accepted", "partial"}
-                    and result.get("proc_images") and result.get("proc_masks")):
+            if (
+                result["preprocessing"]["status"] in {"accepted", "partial"}
+                and result.get("proc_images")
+                and result.get("proc_masks")
+            ):
                 legacy_result = copy.deepcopy(result)
                 legacy_result.pop("_source_locator", None)
                 legacy.append(legacy_result)
+
         manifest_started = time.perf_counter()
         atomic_write_json(
-            os.path.join(self.output_dir, f"{self.dataset_name}_groups.json"), nested,
+            os.path.join(self.output_dir, f"{self.dataset_name}_groups.json"),
+            nested,
         )
         atomic_write_json(os.path.join(self.output_dir, "groupings.json"), legacy)
         manifest_seconds = time.perf_counter() - manifest_started
         report = self._build_report(results, preprocessing_seconds, manifest_seconds)
         atomic_write_json(
-            os.path.join(self.output_dir, "preprocessing_report.json"), report, indent=2,
+            os.path.join(self.output_dir, "preprocessing_report.json"),
+            report,
+            indent=2,
         )
 
         self.metadata["Preprocessed?"] = "yes"
         self.preprocessor.dataset_logger.info(
             "Dataset %s: attempted=%d accepted=%d rejected=%d failed=%d partial=%d; "
             "preprocessing=%.3fs manifest_writing=%.3fs",
-            self.dataset_name, report["group_counts"]["attempted"],
-            report["group_counts"]["accepted"], report["group_counts"]["rejected"],
-            report["group_counts"]["failed"], report["group_counts"]["partial"],
-            preprocessing_seconds, manifest_seconds,
+            self.dataset_name,
+            report["group_counts"]["attempted"],
+            report["group_counts"]["accepted"],
+            report["group_counts"]["rejected"],
+            report["group_counts"]["failed"],
+            report["group_counts"]["partial"],
+            preprocessing_seconds,
+            manifest_seconds,
         )
+
 
 class DatasetManager:
     """
     Loader class to manage processing of multiple Segmentation Datasets.
-    
+
     Loads dataset metadata from a CSV file, instantiates SegmentationDataset objects,
     processes each dataset, and updates the CSV file with new metadata.
     """
+
     def __init__(self, csv_path):
         """
         Initialize the DatasetManager.
 
         Args:
             csv_path (str): Path to the CSV file containing dataset metadata.
-            preprocessor (Preprocessor): Instance for preprocessing operations.
+
+        Returns:
+            None.
         """
         self.csv_path = csv_path
         self.metadata = load_dataset_metadata(csv_path)
         self.datasets = []
+
         for name, meta in self.metadata.items():
             self.datasets.append(SegmentationDataset(name, meta))
 
     def process_all(self, start_at=None, max_groups=0, workers=1, modalities=None):
         """
-        Process all datasets by reorganizing files based on their groups JSON files.
-        If start_at is given, skip everything up to (but not including) that dataset.
+        Process all datasets by reorganizing files based on their groups JSON files. If
+        start_at is given, skip everything up to (but not including) that dataset.
 
         Args:
-            start_at (str, optional): Name of dataset to resume from.
-            max_groups (int): Optional maximum number of groups per split (train/test) to process.
+            start_at (str | None): Name of dataset to resume from.
+            max_groups (int): Optional maximum number of groups per split (train/test)
+                to process.
+            workers (int): Number of worker threads; one processes the groups serially.
+            modalities (str | Iterable[str] | None): Optional case-insensitive modality
+                selection; None or an all token disables filtering.
+
+        Returns:
+            None.
         """
         # Determine start index
         idx = 0
         if start_at:
-            idx = next((i for i, ds in enumerate(self.datasets)
-                        if ds.dataset_name == start_at), None)
+            idx = next(
+                (
+                    i
+                    for i, ds in enumerate(self.datasets)
+                    if ds.dataset_name == start_at
+                ),
+                None,
+            )
             if idx is None:
-                raise ValueError(f"Dataset '{start_at}' not found; cannot resume from it.")
+                raise ValueError(
+                    f"Dataset '{start_at}' not found; cannot resume from it."
+                )
 
         selected_modalities = normalize_modality_filter(modalities)
         datasets = self.datasets[idx:]
         if selected_modalities is not None:
             datasets = [
-                dataset for dataset in datasets
+                dataset
+                for dataset in datasets
                 if any(
                     modality_is_selected(modality, selected_modalities)
                     for modality in dataset.metadata.get("modalities", [])
@@ -815,11 +1261,17 @@ class DatasetManager:
 
         for dataset in tqdm(
             datasets,
-            desc=(f"Processing all datasets from '{start_at}'" if start_at else "Processing all datasets"),
+            desc=(
+                f"Processing all datasets from '{start_at}'"
+                if start_at
+                else "Processing all datasets"
+            ),
             total=len(datasets),
         ):
             self.process_dataset(
-                dataset.dataset_name, max_groups=max_groups, workers=workers,
+                dataset.dataset_name,
+                max_groups=max_groups,
+                workers=workers,
                 modalities=selected_modalities,
             )
 
@@ -831,15 +1283,25 @@ class DatasetManager:
 
         Args:
             dataset_name (str): Name of the dataset to process.
-            max_groups (int, optional): Optional maximum number of groups per split (train/test) to process.
+            max_groups (int): Optional maximum number of groups per split (train/test)
+                to process.
+            workers (int): Number of worker threads; one processes the groups serially.
+            modalities (str | Iterable[str] | None): Optional case-insensitive modality
+                selection; None or an all token disables filtering.
+
+        Returns:
+            bool: Whether processing completed successfully.
 
         Raises:
             ValueError: If the dataset name is not found in the metadata.
         """
         # Find the dataset object
-        dataset = next((ds for ds in self.datasets if ds.dataset_name == dataset_name), None)
+        dataset = next(
+            (ds for ds in self.datasets if ds.dataset_name == dataset_name), None
+        )
         if not dataset:
             raise ValueError(f"Dataset '{dataset_name}' not found in metadata")
+
         selected_modalities = normalize_modality_filter(modalities)
         if selected_modalities is not None and not any(
             modality_is_selected(modality, selected_modalities)
@@ -847,7 +1309,8 @@ class DatasetManager:
         ):
             logging.getLogger(f"SegmentationDataset.{dataset_name}").info(
                 "Skipping dataset %s because it has no selected modalities: %s",
-                dataset_name, ", ".join(sorted(selected_modalities)),
+                dataset_name,
+                ", ".join(sorted(selected_modalities)),
             )
             return False
 
@@ -857,11 +1320,12 @@ class DatasetManager:
         log_dir = os.path.join(BASE_PROC, dataset_name, ".preprocessing_logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{dataset_name}.log")
+
         if not dataset_logger.handlers:
             fh = RotatingFileHandler(
                 log_path,
-                maxBytes=400 * 1024 * 1024,    # Rotate after 400 MB
-                backupCount=5                  # Keep 5 old log files
+                maxBytes=400 * 1024 * 1024,  # Rotate after 400 MB
+                backupCount=5,  # Keep 5 old log files
             )
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
             dataset_logger.addHandler(fh)
@@ -874,26 +1338,32 @@ class DatasetManager:
         if processing_ct:
             stats_path = os.path.join(CT_STATS_DIR, f"{dataset_name}_ct_stats.json")
             ct_profiles = load_ct_profiles(stats_path, expected_dataset=dataset_name)
-            dataset_logger.info("Loaded %d validated CT profile(s) from %s", len(ct_profiles), stats_path)
+            dataset_logger.info(
+                "Loaded %d validated CT profile(s) from %s",
+                len(ct_profiles),
+                stats_path,
+            )
 
             preprocessor = Preprocessor(
                 target_size=(512, 512),
                 dataset_logger=dataset_logger,
                 ct_profiles=ct_profiles,
                 dataset_name=dataset_name,
-                background_value=meta.get("background_value", 0)
+                background_value=meta.get("background_value", 0),
             )
         else:
             preprocessor = Preprocessor(
                 target_size=(512, 512),
                 dataset_logger=dataset_logger,
                 dataset_name=dataset_name,
-                background_value=meta.get("background_value", 0)
+                background_value=meta.get("background_value", 0),
             )
 
         # Run the preprocessing for this one dataset
         dataset.process(
-            preprocessor, max_groups=max_groups, workers=workers,
+            preprocessor,
+            max_groups=max_groups,
+            workers=workers,
             modalities=selected_modalities,
         )
         # Preprocessors contain imported array modules and logger state that cannot be pickled.
@@ -902,17 +1372,26 @@ class DatasetManager:
 
         # Update the CSV metadata to reflect any changes
         self.update_csv()
+
         return True
 
     def update_csv(self):
         """
-        Update the CSV file in the processed directory with the latest metadata after processing.
+        Update the CSV file in the processed directory with the latest metadata after
+        processing.
+
+        Args:
+            None.
+
+        Returns:
+            None.
         """
         updated_data = []
         for dataset in self.datasets:
             meta = dataset.metadata.copy()
             meta["Dataset Name"] = dataset.dataset_name
             updated_data.append(meta)
+
         df = pd.DataFrame(updated_data)
         new_csv_path = normalize_path(os.path.join(BASE_PROC, CSV_FILENAME))
         df.to_csv(new_csv_path, index=False)
@@ -923,9 +1402,13 @@ class DatasetManager:
 
         Args:
             export_path (str): Path to the export pickle file.
+
+        Returns:
+            None.
         """
-        with open(normalize_path(export_path), 'wb') as f:
+        with open(normalize_path(export_path), "wb") as f:
             pickle.dump(self, f)
+
         print(f"Dataset manager exported to {export_path}.")
 
     @classmethod
@@ -939,71 +1422,76 @@ class DatasetManager:
         Returns:
             DatasetManager: The loaded DatasetManager instance.
         """
-        with open(normalize_path(export_path), 'rb') as f:
+        with open(normalize_path(export_path), "rb") as f:
             manager = pickle.load(f)
+
         print(f"Dataset manager loaded from {export_path}.")
         return manager
 
+
 if __name__ == "__main__":
     # Command-line Arg Parsing
-    parser = argparse.ArgumentParser(description="Process one or all segmentation datasets")
-    parser.add_argument(
-        '-preprocess',
-        action='store_true',
-        help="Run preprocessing on one or all datasets"
+    parser = argparse.ArgumentParser(
+        description="Process one or all segmentation datasets"
     )
     parser.add_argument(
-        '-d', '--dataset',
-        help="Name of the specific dataset to process"
+        "-preprocess",
+        action="store_true",
+        help="Run preprocessing on one or all datasets",
     )
     parser.add_argument(
-        '-a', '--all',
-        nargs='?',            # Allow optional value
-        const='',             # When provided without a value, args.all == ''
-        metavar='START_AT',
-        help="Process all datasets; optionally resume at START_AT"
+        "-d", "--dataset", help="Name of the specific dataset to process"
     )
     parser.add_argument(
-        '-m', '--max-groups',
+        "-a",
+        "--all",
+        nargs="?",  # Allow optional value
+        const="",  # When provided without a value, args.all == ''
+        metavar="START_AT",
+        help="Process all datasets; optionally resume at START_AT",
+    )
+    parser.add_argument(
+        "-m",
+        "--max-groups",
         type=int,
         default=0,
-        help="Maximum number of groups per split (train/test) to process"
+        help="Maximum number of groups per split (train/test) to process",
     )
     parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help="Enable GPU acceleration for preprocessing."
+        "--gpu", action="store_true", help="Enable GPU acceleration for preprocessing."
     )
     parser.add_argument(
-        "-w", "--workers",
+        "-w",
+        "--workers",
         type=int,
         default=2,
-        help="Number of concurrent CPU case workers (default: 2)."
+        help="Number of concurrent CPU case workers (default: 2).",
     )
     parser.add_argument(
-        "--output-dir",
-        help="Override the configured preprocessing output directory."
+        "--output-dir", help="Override the configured preprocessing output directory."
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed used when --max-groups samples cases (default: 42)."
+        help="Random seed used when --max-groups samples cases (default: 42).",
     )
     parser.add_argument(
         "--modality",
         action="append",
         default=[],
-        help="Only preprocess this modality (case-insensitive; repeatable or comma-separated)."
+        help="Only preprocess this modality (case-insensitive; repeatable or comma-separated).",
     )
     args = parser.parse_args()
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+
     random.seed(args.seed)
     if args.output_dir:
         BASE_PROC = normalize_path(args.output_dir)
         config.BASE_PROC = BASE_PROC
+
     modality_filter = normalize_modality_filter(args.modality)
 
     # Override the config flag at runtime:
@@ -1021,15 +1509,20 @@ if __name__ == "__main__":
         if args.dataset not in manager.metadata:
             print(f"Dataset '{args.dataset}' not found in {csv_path}.")
             sys.exit(1)
+
         manager.process_dataset(
-            args.dataset, max_groups=args.max_groups, workers=args.workers,
+            args.dataset,
+            max_groups=args.max_groups,
+            workers=args.workers,
             modalities=modality_filter,
         )
     elif args.all is not None:
         # If args.all == '' then no start name provided, so resume from beginning
         start = args.all or None
         manager.process_all(
-            start_at=start, max_groups=args.max_groups, workers=args.workers,
+            start_at=start,
+            max_groups=args.max_groups,
+            workers=args.workers,
             modalities=modality_filter,
         )
     else:

@@ -1,8 +1,8 @@
 """
 DRIPP: Dataset Regex Indexing & Preprocessing Pipeline.
 
-The package keeps heavyweight modules lazy so command-line help and config
-commands work before dataset paths have been created.
+The package keeps heavyweight modules lazy so command-line help and config commands work
+before dataset paths have been created.
 """
 
 from .config import *  # noqa: F401,F403
@@ -39,18 +39,28 @@ _LAZY_EXPORTS = {
 
 
 def __getattr__(name):
+    """
+    Load a public export lazily and cache it on the package.
+
+    Args:
+        name (str): Public export name requested from the package.
+
+    Returns:
+        object: Requested public class or function; raises AttributeError for unknown
+            names.
+    """
     if name in _LAZY_EXPORTS:
         module_name, attr_name = _LAZY_EXPORTS[name]
         from importlib import import_module
 
         attr = getattr(import_module(module_name), attr_name)
         globals()[name] = attr
+
         return attr
 
     raise AttributeError(name)
 
 
 __all__ = sorted(
-    name for name in globals()
-    if name.isupper() or name in {"__version__"}
+    name for name in globals() if name.isupper() or name in {"__version__"}
 ) + sorted(_LAZY_EXPORTS)

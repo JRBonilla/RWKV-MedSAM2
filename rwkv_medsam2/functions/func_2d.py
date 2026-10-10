@@ -1,7 +1,6 @@
-# Per-batch 2D training and validation steps for RWKV-MedSAM2.
-#
-# Includes input normalization, mixed prompt encoding, student/teacher
-# distillation training, and prompt-cache validation.
+"""
+Train and validate 2D segmentation batches with mixed prompts and optional distillation.
+"""
 
 import math
 import torch
@@ -14,7 +13,10 @@ from .func_metrics import (
     safe_float,
 )
 
-def normalize_sam2_input(x: torch.Tensor, img_mean=(0.485, 0.456, 0.406), img_std=(0.229, 0.224, 0.225)) -> torch.Tensor:
+
+def normalize_sam2_input(
+    x: torch.Tensor, img_mean=(0.485, 0.456, 0.406), img_std=(0.229, 0.224, 0.225)
+) -> torch.Tensor:
     """
     Normalize raw 2D inputs to the ImageNet scale expected by SAM2.
 
@@ -35,12 +37,31 @@ def normalize_sam2_input(x: torch.Tensor, img_mean=(0.485, 0.456, 0.406), img_st
     vmax = float(x.amax().item())
 
     def _robust_01(t: torch.Tensor, qlo=0.01, qhi=0.99):
-        """Robustly rescale a tensor to [0, 1]."""
+        """
+        Robustly rescale a tensor to [0, 1].
+
+        Args:
+            t (torch.Tensor): Stored frame index.
+            qlo (float): Lower quantile defining the robust intensity window.
+            qhi (float): Upper quantile defining the robust intensity window.
+
+        Returns:
+            torch.Tensor: Tensor clipped to [0, 1], or zeros when the intensity range is
+                degenerate.
+        """
         flat = t.reshape(-1)
-        qs = torch.quantile(flat, torch.tensor([qlo, qhi], device=flat.device, dtype=flat.dtype))
+        qs = torch.quantile(
+            flat, torch.tensor([qlo, qhi], device=flat.device, dtype=flat.dtype)
+        )
         lo, hi = qs[0], qs[1]
-        if (not torch.isfinite(lo)) or (not torch.isfinite(hi)) or float((hi - lo).item()) <= 1e-6:
+
+        if (
+            (not torch.isfinite(lo))
+            or (not torch.isfinite(hi))
+            or float((hi - lo).item()) <= 1e-6
+        ):
             return torch.zeros_like(t)
+
         return ((t - lo) / (hi - lo)).clamp_(0.0, 1.0)
 
     if (-6.5 <= vmin <= 0.0) and (0.0 <= vmax <= 6.5):
@@ -55,7 +76,9 @@ def normalize_sam2_input(x: torch.Tensor, img_mean=(0.485, 0.456, 0.406), img_st
 
     x = x / 255.0
     x = (x - mean) / std
+
     return x
+
 
 def train_step_2d(student, teacher, optimizer, batch, config, scaler):
     """
@@ -72,28 +95,29 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
     Returns:
         dict: Step status and loss values, including skip diagnostics on failure.
     """
-    device     = config.training.device
+    device = config.training.device
     feat_sizes = config.decoder.feat_sizes
-    out_size   = int(config.training.out_size)
+    out_size = int(config.training.out_size)
 
     # Loss weights
-    bce_w    = float(getattr(config.training, "bce_weight",   1.0))
-    dice_w   = float(getattr(config.training, "dice_weight",  1.0))
-    focal_w  = float(getattr(config.training, "focal_weight", 0.0))
-    f_gamma  = float(getattr(config.training, "focal_gamma",  2.0))
-    f_alpha  = float(getattr(config.training, "focal_alpha", -1.0))
+    bce_w = float(getattr(config.training, "bce_weight", 1.0))
+    dice_w = float(getattr(config.training, "dice_weight", 1.0))
+    focal_w = float(getattr(config.training, "focal_weight", 0.0))
+    f_gamma = float(getattr(config.training, "focal_gamma", 2.0))
+    f_alpha = float(getattr(config.training, "focal_alpha", -1.0))
 
     # Distillation
-    lam_base   = float(getattr(config.training, "lambda_distill_2d", 0.0))
+    lam_base = float(getattr(config.training, "lambda_distill_2d", 0.0))
     heavy_mult = float(getattr(config.training, "distill_heavy_mult", 1.0))
-    lam        = lam_base * heavy_mult
+    lam = lam_base * heavy_mult
     use_teacher = teacher is not None and lam > 0.0
-    tau        = float(getattr(config.training, "distill_temperature", 1.0))
+    tau = float(getattr(config.training, "distill_temperature", 1.0))
     logit_clip = float(getattr(config.training, "logit_clip", 12.0))
 
     imgs_all = batch["image"].to(device=device, non_blocking=True)  # [B,1,C,H,W]
-    msks_all = batch["mask"].to(device=device, non_blocking=True)   # [B,1,1,H,W]
+    msks_all = batch["mask"].to(device=device, non_blocking=True)  # [B,1,1,H,W]
     B, T, C, H, W = imgs_all.shape
+
     if T != 1:
         raise ValueError(f"2D training expects single-frame sequences, got T={T}")
 
@@ -107,6 +131,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
 
     pe_student = student.sam_prompt_encoder.get_dense_pe()
     pe_teacher = None
+
     if use_teacher:
         teacher.eval()
         pe_teacher = teacher.sam_prompt_encoder.get_dense_pe()
@@ -119,11 +144,17 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
     pts_all = raw_pts[0]
     lbs_all = raw_lbl[0]
     box_all = raw_box[0]
-    msk_all = (raw_mpr[0] if raw_mpr is not None else [None] * B)
+    msk_all = raw_mpr[0] if raw_mpr is not None else [None] * B
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         student_sparse, student_dense, _ = _encode_mixed_prompts(
-            student.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs_t, device
+            student.sam_prompt_encoder,
+            pts_all,
+            lbs_all,
+            box_all,
+            msk_all,
+            imgs_t,
+            device,
         )
 
         bb_out = student.forward_image(imgs_t)
@@ -137,26 +168,43 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
         hires_feats = feats[:-1]
 
         student_dense = F.interpolate(
-            student_dense, size=image_embed.shape[-2:], mode="bilinear", align_corners=False
+            student_dense,
+            size=image_embed.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
         )
         image_pe = pe_student
+
         if image_pe.shape[-2:] != image_embed.shape[-2:]:
-            image_pe = F.interpolate(image_pe, size=image_embed.shape[-2:], mode="bilinear", align_corners=False)
+            image_pe = F.interpolate(
+                image_pe,
+                size=image_embed.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
         image_pe = image_pe.to(image_embed.dtype)
 
-        student_logits, _student_iou, _, _student_obj_score_logits = student.sam_mask_decoder(
-            image_embeddings=image_embed,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=student_sparse,
-            dense_prompt_embeddings=student_dense,
-            multimask_output=False,
-            repeat_image=False,
-            high_res_features=hires_feats,
+        student_logits, _student_iou, _, _student_obj_score_logits = (
+            student.sam_mask_decoder(
+                image_embeddings=image_embed,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=student_sparse,
+                dense_prompt_embeddings=student_dense,
+                multimask_output=False,
+                repeat_image=False,
+                high_res_features=hires_feats,
+            )
         )
 
         student_logits = student_logits.clamp(-logit_clip, logit_clip)
-        stud_up = F.interpolate(student_logits, size=(out_size, out_size), mode="bilinear", align_corners=False)
-        gt_up   = F.interpolate(msks_t.float(),    size=(out_size, out_size), mode="nearest")
+        stud_up = F.interpolate(
+            student_logits,
+            size=(out_size, out_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        gt_up = F.interpolate(msks_t.float(), size=(out_size, out_size), mode="nearest")
 
     with torch.amp.autocast("cuda", enabled=False):
         gm = gt_up.float()
@@ -165,14 +213,16 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
         pos = gm.flatten(1).sum(1)
         tot = torch.full_like(pos, gm[0].numel(), dtype=gm.dtype)
         neg = tot - pos
-        dyn_pw = ((neg + 1.0) / (pos + 1.0)).clamp(1.0, float(getattr(config.training, "pos_weight_max", 8.0)))
+        dyn_pw = ((neg + 1.0) / (pos + 1.0)).clamp(
+            1.0, float(getattr(config.training, "pos_weight_max", 8.0))
+        )
         dyn_pw_pix = dyn_pw.view(B, 1, 1, 1)
 
         bce_raw = F.binary_cross_entropy_with_logits(sp, gm, reduction="none")
         pixel_w = 1.0 + (dyn_pw_pix - 1.0) * gm
         bce = (bce_raw * pixel_w).mean()
 
-        tv  = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
+        tv = tversky_loss_from_logits(sp, gm, alpha=0.15, beta=0.85, smooth=1.0)
         foc = binary_focal_loss_with_logits(sp, gm, gamma=f_gamma, alpha=f_alpha)
 
         seg_loss = (bce_w * bce) + (dice_w * tv) + (focal_w * foc)
@@ -190,13 +240,35 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
                 t_embed = t_list[-1]
 
                 t_sparse, t_dense, _ = _encode_mixed_prompts(
-                    teacher.sam_prompt_encoder, pts_all, lbs_all, box_all, msk_all, imgs_t, device
+                    teacher.sam_prompt_encoder,
+                    pts_all,
+                    lbs_all,
+                    box_all,
+                    msk_all,
+                    imgs_t,
+                    device,
                 )
-                t_dense = F.interpolate(t_dense, size=t_embed.shape[-2:], mode="bilinear", align_corners=False)
+                t_dense = F.interpolate(
+                    t_dense,
+                    size=t_embed.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-                t_pe = pe_teacher if pe_teacher is not None else teacher.sam_prompt_encoder.get_dense_pe()
+                t_pe = (
+                    pe_teacher
+                    if pe_teacher is not None
+                    else teacher.sam_prompt_encoder.get_dense_pe()
+                )
+
                 if t_pe.shape[-2:] != t_embed.shape[-2:]:
-                    t_pe = F.interpolate(t_pe, size=t_embed.shape[-2:], mode="bilinear", align_corners=False)
+                    t_pe = F.interpolate(
+                        t_pe,
+                        size=t_embed.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
                 t_pe = t_pe.to(t_embed.dtype)
 
                 t_logits, *_ = teacher.sam_mask_decoder(
@@ -209,15 +281,23 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
                     high_res_features=t_list[:-1],
                 )
                 t_logits = t_logits.clamp(-logit_clip, logit_clip)
-                t_up = F.interpolate(t_logits, size=(out_size, out_size), mode="bilinear", align_corners=False)
+                t_up = F.interpolate(
+                    t_logits,
+                    size=(out_size, out_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
         with torch.amp.autocast("cuda", enabled=False):
             tp = torch.sigmoid(t_up.float() / tau).clamp(1e-4, 1.0 - 1e-4)
-            dis = F.binary_cross_entropy_with_logits(stud_up.float(), tp, reduction="mean")
+            dis = F.binary_cross_entropy_with_logits(
+                stud_up.float(), tp, reduction="mean"
+            )
 
         loss = seg_loss + lam * dis
     else:
         loss = seg_loss
+
     loss_value = safe_float(loss)
 
     if not torch.isfinite(loss.detach()).all():
@@ -232,25 +312,36 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
     synchronize_gradients(student)
 
     try:
-        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            student.parameters(), 1.0, error_if_nonfinite=True
+        )
     except RuntimeError as e:
         bad = []
         max_items = 50
         for name, p in student.named_parameters():
             if p.grad is None:
                 continue
+
             g = p.grad.detach()
             if g.numel() == 0:
                 continue
             if not torch.isfinite(g).all():
                 finite = g[torch.isfinite(g)]
-                bad.append({
-                    "name": name,
-                    "shape": tuple(g.shape),
-                    "grad_absmax_finite": float(finite.abs().max().item()) if finite.numel() else None,
-                    "grad_min_finite": float(finite.min().item()) if finite.numel() else None,
-                    "grad_max_finite": float(finite.max().item()) if finite.numel() else None,
-                })
+                bad.append(
+                    {
+                        "name": name,
+                        "shape": tuple(g.shape),
+                        "grad_absmax_finite": (
+                            float(finite.abs().max().item()) if finite.numel() else None
+                        ),
+                        "grad_min_finite": (
+                            float(finite.min().item()) if finite.numel() else None
+                        ),
+                        "grad_max_finite": (
+                            float(finite.max().item()) if finite.numel() else None
+                        ),
+                    }
+                )
                 if len(bad) >= max_items:
                     break
 
@@ -271,6 +362,7 @@ def train_step_2d(student, teacher, optimizer, batch, config, scaler):
         "loss": float(loss.detach().item()),
         "grad_norm": float(grad_norm.detach().item()),
     }
+
 
 def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, device):
     """
@@ -300,27 +392,46 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
 
     # Partition indices
     idx_pts, idx_box, idx_mask, idx_none = [], [], [], []
+
     for i, (p, b, m) in enumerate(zip(pts_all, box_all, msk_all)):
-        has_p = (p is not None and hasattr(p, "numel") and p.numel() > 0)
-        has_b = (b is not None and hasattr(b, "numel") and b.numel() == 4)
-        has_m = (m is not None and hasattr(m, "numel") and m.numel() > 0)
-        if has_p:   idx_pts.append(i)
-        elif has_b: idx_box.append(i)
-        elif has_m: idx_mask.append(i)
-        else:       idx_none.append(i)
+        has_p = p is not None and hasattr(p, "numel") and p.numel() > 0
+        has_b = b is not None and hasattr(b, "numel") and b.numel() == 4
+        has_m = m is not None and hasattr(m, "numel") and m.numel() > 0
+
+        if has_p:
+            idx_pts.append(i)
+        elif has_b:
+            idx_box.append(i)
+        elif has_m:
+            idx_mask.append(i)
+        else:
+            idx_none.append(i)
 
     # Gather helpers
     def _gather_points(idxs):
-        """Gather and pad point prompts."""
-        if not idxs: return None
+        """
+        Gather and pad point prompts.
+
+        Args:
+            idxs (list[int]): Batch sample indices whose prompts are gathered.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor] | None: Batched point coordinates and labels, or
+                None when there are no points.
+        """
+        if not idxs:
+            return None
+
         # Variable num clicks -> pad to Nmax with label -1
         Ns = [int(pts_all[i].shape[0]) for i in idxs]
         Nmax = max(Ns)  # >=1 because has_p checked above
         pts_pad, lbs_pad = [], []
+
         for i, n in zip(idxs, Ns):
             p = pts_all[i].to(device).to(torch.float32)
             if p.ndim == 1:
                 p = p.reshape(-1, 2)
+
             l = lbs_all[i].to(device).to(torch.long).reshape(-1)
             if n < Nmax:
                 pp = torch.zeros((Nmax, 2), device=device, dtype=torch.float32)
@@ -328,72 +439,113 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
                 if n > 0:
                     pp[:n] = p[:n]
                     ll[:n] = l[:n]
+
                 pts_pad.append(pp)
                 lbs_pad.append(ll)
             else:
                 pts_pad.append(p[:Nmax])
                 lbs_pad.append(l[:Nmax])
+
         pts = torch.stack(pts_pad, dim=0)  # [k, Nmax, 2]
         lbs = torch.stack(lbs_pad, dim=0)  # [k, Nmax]
+
         return (pts, lbs)
 
     def _gather_boxes(idxs):
-        """Gather box prompts."""
-        if not idxs: return None
-        return torch.stack([box_all[i].to(device).to(torch.int64).reshape(4) for i in idxs], dim=0)  # [k,4]
+        """
+        Gather box prompts.
+
+        Args:
+            idxs (list[int]): Batch sample indices whose prompts are gathered.
+
+        Returns:
+            torch.Tensor | None: Integer box tensor, or None for an empty sample selection.
+        """
+        if not idxs:
+            return None
+
+        return torch.stack(
+            [box_all[i].to(device).to(torch.int64).reshape(4) for i in idxs], dim=0
+        )  # [k,4]
 
     def _gather_masks(idxs):
-        """Gather mask prompts."""
-        if not idxs: return None
-        return torch.stack([msk_all[i].to(device).to(torch.float32) for i in idxs], dim=0)       # [k,1,H,W]
+        """
+        Gather mask prompts.
 
-    dense_chunks  = [None, None, None, None]   # in order: pts, box, mask, none
+        Args:
+            idxs (list[int]): Batch sample indices whose prompts are gathered.
+
+        Returns:
+            torch.Tensor | None: Float32 mask tensor, or None for an empty sample selection.
+        """
+        if not idxs:
+            return None
+
+        return torch.stack(
+            [msk_all[i].to(device).to(torch.float32) for i in idxs], dim=0
+        )  # [k,1,H,W]
+
+    dense_chunks = [None, None, None, None]  # in order: pts, box, mask, none
     sparse_chunks = [None, None, None, None]
 
     # Points
     if idx_pts:
         se, de = prompter(points=_gather_points(idx_pts), boxes=None, masks=None)
         if de.shape[-2:] != (Hd, Wd):
-            de = F.interpolate(de, size=(Hd, Wd), mode='bilinear', align_corners=False)
+            de = F.interpolate(de, size=(Hd, Wd), mode="bilinear", align_corners=False)
+
         sparse_chunks[0] = se
-        dense_chunks[0]  = de
+        dense_chunks[0] = de
 
     # Boxes
     if idx_box:
         se, de = prompter(points=None, boxes=_gather_boxes(idx_box), masks=None)
         if de.shape[-2:] != (Hd, Wd):
-            de = F.interpolate(de, size=(Hd, Wd), mode='bilinear', align_corners=False)
+            de = F.interpolate(de, size=(Hd, Wd), mode="bilinear", align_corners=False)
+
         sparse_chunks[1] = se
-        dense_chunks[1]  = de
+        dense_chunks[1] = de
 
     # Masks
     if idx_mask:
         se, de = prompter(points=None, boxes=None, masks=_gather_masks(idx_mask))
         if de.shape[-2:] != (Hd, Wd):
-            de = F.interpolate(de, size=(Hd, Wd), mode='bilinear', align_corners=False)
+            de = F.interpolate(de, size=(Hd, Wd), mode="bilinear", align_corners=False)
+
         sparse_chunks[2] = se
-        dense_chunks[2]  = de
+        dense_chunks[2] = de
 
     # None -> neutral zero mask to keep batch dims aligned
     if idx_none:
         _, _, H_img, W_img = imgs.shape
-        zero_masks = torch.zeros((len(idx_none), 1, H_img, W_img), dtype=torch.float32, device=device)
+        zero_masks = torch.zeros(
+            (len(idx_none), 1, H_img, W_img), dtype=torch.float32, device=device
+        )
         se, de = prompter(points=None, boxes=None, masks=zero_masks)
+
         if de.shape[-2:] != (Hd, Wd):
-            de = F.interpolate(de, size=(Hd, Wd), mode='bilinear', align_corners=False)
+            de = F.interpolate(de, size=(Hd, Wd), mode="bilinear", align_corners=False)
+
         sparse_chunks[3] = se
-        dense_chunks[3]  = de
+        dense_chunks[3] = de
 
     # Find a dense chunk to read channel/dtype (spatial is fixed to Hd/Wd above)
     any_dense = next(d for d in dense_chunks if d is not None)
     C_d = int(any_dense.shape[1])  # channels
 
     # Stitch dense -> [B*T, C_d, Hd, Wd]
-    dense_full = torch.zeros((batch_size, C_d, Hd, Wd), dtype=any_dense.dtype, device=any_dense.device)
-    if idx_pts:  dense_full[torch.tensor(idx_pts,  device=device)] = dense_chunks[0]
-    if idx_box:  dense_full[torch.tensor(idx_box,  device=device)] = dense_chunks[1]
-    if idx_mask: dense_full[torch.tensor(idx_mask, device=device)] = dense_chunks[2]
-    if idx_none: dense_full[torch.tensor(idx_none, device=device)] = dense_chunks[3]
+    dense_full = torch.zeros(
+        (batch_size, C_d, Hd, Wd), dtype=any_dense.dtype, device=any_dense.device
+    )
+
+    if idx_pts:
+        dense_full[torch.tensor(idx_pts, device=device)] = dense_chunks[0]
+    if idx_box:
+        dense_full[torch.tensor(idx_box, device=device)] = dense_chunks[1]
+    if idx_mask:
+        dense_full[torch.tensor(idx_mask, device=device)] = dense_chunks[2]
+    if idx_none:
+        dense_full[torch.tensor(idx_none, device=device)] = dense_chunks[3]
 
     # Stitch sparse: pad to Nmax across subsets that produced sparse tokens
     Ns, subset_maps = [], []
@@ -404,8 +556,11 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
 
     if Ns:
         Nmax = max(Ns)
-        C_s  = subset_maps[0][1].shape[-1]
-        sparse_full = torch.zeros((batch_size, Nmax, C_s), dtype=subset_maps[0][1].dtype, device=device)
+        C_s = subset_maps[0][1].shape[-1]
+        sparse_full = torch.zeros(
+            (batch_size, Nmax, C_s), dtype=subset_maps[0][1].dtype, device=device
+        )
+
         for idxs, se_chunk in subset_maps:
             k, N, _ = se_chunk.shape
             sparse_full[torch.tensor(idxs, device=device), :N, :] = se_chunk
@@ -414,6 +569,7 @@ def _encode_mixed_prompts(prompter, pts_all, lbs_all, box_all, msk_all, imgs, de
 
     image_pe = None  # Caller pulls prompter.get_dense_pe()
     return sparse_full, dense_full, image_pe
+
 
 @torch.inference_mode()
 def validate_step_2d(
@@ -440,8 +596,12 @@ def validate_step_2d(
         dict | None: Logits and prompt metadata, or None if no prompt is available.
     """
     device = predictor.device
-    use_amp = (device.type == "cuda")
-    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.no_grad()
+    use_amp = device.type == "cuda"
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp
+        else torch.no_grad()
+    )
 
     if prompt_cache is None:
         return None
@@ -503,6 +663,7 @@ def validate_step_2d(
                     clear_old_points=False,
                     normalize_coords=bool(normalize_coords),
                 )
+
             pk_counts["point"] += int(pts.shape[0])
             prompts_added += 1
 
@@ -513,6 +674,7 @@ def validate_step_2d(
 
             if bb.ndim == 2:
                 bb = bb[0]
+
             bb = bb.to(device=device, dtype=torch.float32)
 
             empty_points = torch.empty((1, 0, 2), dtype=torch.float32, device=device)
@@ -529,6 +691,7 @@ def validate_step_2d(
                     clear_old_points=True,
                     normalize_coords=bool(normalize_coords),
                 )
+
             pk_counts["box"] += 1
             prompts_added += 1
 
@@ -539,6 +702,7 @@ def validate_step_2d(
 
             if mm.ndim == 3 and mm.shape[0] == 1:
                 mm = mm[0]
+
             mm = (mm > 0).to(device=device, dtype=torch.bool)
 
             with amp_ctx:
@@ -548,6 +712,7 @@ def validate_step_2d(
                     obj_id=1,
                     mask=mm,
                 )
+
             pk_counts["mask"] += 1
             prompts_added += 1
 

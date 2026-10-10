@@ -1,3 +1,10 @@
+"""
+Inspect mask-class assignments without writing processed images or masks.
+
+Replace save operations with diagnostic callbacks and run selected indexed groups
+through the preprocessor to report matching decisions.
+"""
+
 import os
 import sys
 import json
@@ -6,37 +13,44 @@ import pandas as pd
 from dripp.preprocessor import Preprocessor
 from dripp.helpers import parse_mask_classes
 
+
 # Monkey-patch Preprocessor to intercept mask saving.
-def fake_save_mask(self, mask, mode, idx, comp_idx, composite_id, out_dir, mask_tag=None):
+def fake_save_mask(
+    self, mask, mode, idx, comp_idx, composite_id, out_dir, mask_tag=None
+):
     """
     Print mask classification instead of writing a mask file.
 
     Args:
-        mask (Any): Mask image or component array.
-        mode (Any): Preprocessing output mode.
-        idx (Any): Slice index.
-        comp_idx (Any): Component index.
-        composite_id (Any): Composite group identifier.
-        out_dir (Any): Output directory.
-        mask_tag (Any): Resolved mask class tag.
+        mask (np.ndarray | cp.ndarray): Mask image or component array.
+        mode (str): Preprocessing output mode.
+        idx (int): Slice index.
+        comp_idx (int): Component index.
+        composite_id (str): Composite group identifier.
+        out_dir (str): Output directory.
+        mask_tag (str | None): Resolved mask class tag.
 
     Returns:
         None.
     """
     # Print the classification of each component instead of writing to disk
-    print(f"[CLASS] Group={composite_id} | component {idx}-{comp_idx} -> class: {mask_tag}")
+    print(
+        f"[CLASS] Group={composite_id} | component {idx}-{comp_idx} -> class: {mask_tag}"
+    )
+
     return None
+
 
 def fake_save_image(self, img, mode, idx, composite_id, out_dir):
     """
     Skip image writes while testing mask classification.
 
     Args:
-        img (Any): Image array.
-        mode (Any): Preprocessing output mode.
-        idx (Any): Slice index.
-        composite_id (Any): Composite group identifier.
-        out_dir (Any): Output directory.
+        img (np.ndarray | cp.ndarray): Image array.
+        mode (str): Preprocessing output mode.
+        idx (int): Slice index.
+        composite_id (str): Composite group identifier.
+        out_dir (str): Output directory.
 
     Returns:
         None.
@@ -44,15 +58,17 @@ def fake_save_image(self, img, mode, idx, composite_id, out_dir):
     # No-op for images
     return None
 
+
 Preprocessor._save_mask = fake_save_mask
 Preprocessor._save_image = fake_save_image
+
 
 def flatten_groups(groups_data):
     """
     Flatten group JSON subdatasets into split-level group records.
 
     Args:
-        groups_data (Any): Parsed groups JSON data.
+        groups_data (dict): Parsed groups JSON data.
 
     Returns:
         list[dict]: Flattened group records.
@@ -67,7 +83,9 @@ def flatten_groups(groups_data):
                 grp["pipeline"] = grp.get("subdataset_pipeline", sub.get("pipeline"))
                 grp["split"] = split
                 flat.append(grp)
+
     return flat
+
 
 def main():
     """
@@ -82,31 +100,49 @@ def main():
     parser = argparse.ArgumentParser(
         description="Test match_mask_class on processed mask components via Preprocessor"
     )
-    parser.add_argument("-b", "--base_dir", default="/data/research",
-                        help="Base directory for raw files (for relative paths)")
-    parser.add_argument("-c", "--csv", default="/data/research/datasets.csv",
-                        help="Path to datasets CSV")
-    parser.add_argument("-i", "--index_dir", default="/data/DatasetIndexes/Groups",
-                        help="Directory with [DatasetName]_groups.json files")
-    parser.add_argument("-d", "--dataset", required=True,
-                        help="Dataset name as in CSV and Groups JSON")
-    parser.add_argument("-s", "--subdatasets", nargs="+",
-                        help="Optional filter for subdataset names")
+    parser.add_argument(
+        "-b",
+        "--base_dir",
+        default="/data/research",
+        help="Base directory for raw files (for relative paths)",
+    )
+    parser.add_argument(
+        "-c",
+        "--csv",
+        default="/data/research/datasets.csv",
+        help="Path to datasets CSV",
+    )
+    parser.add_argument(
+        "-i",
+        "--index_dir",
+        default="/data/DatasetIndexes/Groups",
+        help="Directory with [DatasetName]_groups.json files",
+    )
+    parser.add_argument(
+        "-d", "--dataset", required=True, help="Dataset name as in CSV and Groups JSON"
+    )
+    parser.add_argument(
+        "-s", "--subdatasets", nargs="+", help="Optional filter for subdataset names"
+    )
     args = parser.parse_args()
 
     # Load CSV and parse mask_classes
     df = pd.read_csv(args.csv)
-    row = df[df['Dataset Name'] == args.dataset]
+    row = df[df["Dataset Name"] == args.dataset]
+
     if row.empty:
         print(f"[ERROR] Dataset '{args.dataset}' not found in CSV")
         return
-    spec = row['Mask Classes'].iloc[0]
+
+    spec = row["Mask Classes"].iloc[0]
     mask_classes = parse_mask_classes(spec)
 
     # Load groups JSON
     groups_file = os.path.join(args.index_dir, f"{args.dataset}_groups.json")
+
     with open(groups_file, "r") as f:
         groups_data = json.load(f)
+
     flat = flatten_groups(groups_data)
     if args.subdatasets:
         flat = [g for g in flat if g["subdataset_name"] in args.subdatasets]
@@ -120,15 +156,17 @@ def main():
         pipeline = grp["pipeline"]
         modality = grp["modality"]
         comp_id = grp["identifier"]
-        print(f"\n=== [{grp['split'].upper()}] Subdataset: {sub} | Group: {comp_id} ===")
+        print(
+            f"\n=== [{grp['split'].upper()}] Subdataset: {sub} | Group: {comp_id} ==="
+        )
         # Resolve file lists
         image_list = [rec["path"] for rec in grp.get("images", [])]
-        mask_list  = [rec["path"] for rec in grp.get("masks", [])]
+        mask_list = [rec["path"] for rec in grp.get("masks", [])]
         # Normalize mask paths if relative
         mask_list = [
-            m if os.path.isabs(m) else os.path.join(args.base_dir, m)
-            for m in mask_list
+            m if os.path.isabs(m) else os.path.join(args.base_dir, m) for m in mask_list
         ]
+
         # Call preprocess (will invoke fake_save_mask)
         try:
             prep.preprocess_group(
@@ -137,17 +175,18 @@ def main():
                 image_files=image_list,
                 mask_files=mask_list,
                 modality=modality,
-                img_out_dir="/tmp/img_out",   # Dummy
+                img_out_dir="/tmp/img_out",  # Dummy
                 mask_out_dir="/tmp/msk_out",  # Dummy
                 composite_id=comp_id,
-                mask_classes=mask_classes
+                mask_classes=mask_classes,
             )
         except FileNotFoundError as e:
             # Suppress only missing-mask_out_dir errors
-            if 'mask_out_dir' in str(e) or '/tmp/msk_out' in str(e):
+            if "mask_out_dir" in str(e) or "/tmp/msk_out" in str(e):
                 sys.exit(0)
             else:
                 raise
+
 
 if __name__ == "__main__":
     main()

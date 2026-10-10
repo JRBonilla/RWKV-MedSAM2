@@ -3,15 +3,10 @@
 import torch
 import torch.nn as nn
 
+
 class UncertaintyHead(nn.Module):
     """
     Predict a per-pixel uncertainty map from feature tensors.
-
-    Args:
-        nn.Module (type): PyTorch module base class.
-
-    Returns:
-        None.
     """
 
     def __init__(self, in_channels, out_channels):
@@ -26,7 +21,7 @@ class UncertaintyHead(nn.Module):
             None.
         """
         super().__init__()
-        self.conv1  = nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(in_channels // 2, out_channels, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
@@ -45,17 +40,13 @@ class UncertaintyHead(nn.Module):
         x = self.relu(x)
         x = self.conv2(x)
         uncertainty = self.sigmoid(x)
+
         return uncertainty
+
 
 class RefinementModule(nn.Module):
     """
     Refine features by amplifying uncertain regions before convolution.
-
-    Args:
-        nn.Module (type): PyTorch module base class.
-
-    Returns:
-        None.
     """
 
     def __init__(self, in_channels, mid_channels, out_channels):
@@ -82,12 +73,12 @@ class RefinementModule(nn.Module):
         Refine feature maps with an optional uncertainty gate.
 
         Args:
-            x (Tensor): Input feature map (e.g., segmentation features).
-            uncertainty_map (Tensor, optional): Uncertainty map indicating regions to refine.
-                                                Expected to have values in [0, 1].
+            x (torch.Tensor): Input feature map (e.g., segmentation features).
+            uncertainty_map (torch.Tensor | None): Optional uncertainty map in [0, 1] used to
+                amplify the input features.
 
         Returns:
-            Tensor: Refined output features.
+            torch.Tensor: Refined output features.
         """
         if uncertainty_map is not None:
             # Use the uncertainty map to modulate the features.
@@ -103,4 +94,5 @@ class RefinementModule(nn.Module):
 
         # Fuse the refined output with the original features (residual connection)
         output = x + refined
+
         return output

@@ -1,4 +1,6 @@
-"""CSV viewer/editor callbacks for the DRIPP debugger app."""
+"""
+CSV viewer/editor callbacks for the DRIPP debugger app.
+"""
 
 import configparser
 import hashlib
@@ -11,12 +13,6 @@ from .common import *
 class CsvDebuggerMixin:
     """
     Provide callbacks for viewing, creating, and editing DRIPP metadata CSVs.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
 
     DEFAULT_CSV_COLUMNS = [
@@ -89,7 +85,16 @@ class CsvDebuggerMixin:
         "#f48fb1",
     ]
     VOLUME_FILE_TYPES = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd", ".dcm", ".dicom"}
-    IMAGE_FILE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".ppm", ".pgm"}
+    IMAGE_FILE_TYPES = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".ppm",
+        ".pgm",
+    }
     VIDEO_FILE_TYPES = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
 
     CSV_ROW_HEIGHT = 26
@@ -105,19 +110,21 @@ class CsvDebuggerMixin:
         Load dataset metadata, prompting for a CSV if the configured file is missing.
 
         Args:
-            csv_path (Any): Configured path to the datasets CSV.
+            csv_path (str | None): Configured path to the datasets CSV.
 
         Returns:
             dict: Loaded dataset metadata, or an empty dict if unresolved.
         """
         attempted_path = csv_path
         should_persist = False
+
         while True:
             try:
                 metadata = load_dataset_metadata(attempted_path)
                 self.csv_path = normalize_path(attempted_path)
                 if should_persist:
                     self._persist_csv_location(self.csv_path)
+
                 return metadata
             except Exception as e:
                 messagebox.showwarning(
@@ -125,7 +132,7 @@ class CsvDebuggerMixin:
                     "DRIPP could not load the configured datasets CSV:\n\n"
                     f"{attempted_path}\n\n"
                     f"{e}\n\n"
-                    "Please choose where to look for the datasets CSV."
+                    "Please choose where to look for the datasets CSV.",
                 )
                 selected_path = filedialog.askopenfilename(
                     title="Locate DRIPP datasets CSV",
@@ -137,10 +144,12 @@ class CsvDebuggerMixin:
                 if not selected_path:
                     messagebox.showwarning(
                         "CSV Required",
-                        "No replacement CSV was selected. The debugger will stay open, but no datasets are loaded."
+                        "No replacement CSV was selected. The debugger will stay open, but no datasets are loaded.",
                     )
                     self.csv_path = normalize_path(attempted_path)
+
                     return {}
+
                 attempted_path = normalize_path(selected_path)
                 should_persist = True
 
@@ -160,16 +169,34 @@ class CsvDebuggerMixin:
         toolbar = ttk.Frame(self.csv_tab)
         toolbar.pack(fill="x", padx=8, pady=6)
 
-        ttk.Button(toolbar, text="Open...", command=self._open_csv_from_editor).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="New CSV", command=self._new_csv_from_editor).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Add Row", command=self._add_csv_row).pack(side="left", padx=(14, 2))
-        ttk.Button(toolbar, text="Delete Row", command=self._delete_csv_rows).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Reload", command=lambda: self._load_csv_table(show_errors=True)).pack(side="right", padx=2)
-        ttk.Button(toolbar, text="Save As...", command=self._save_csv_as_from_editor).pack(side="right", padx=2)
-        ttk.Button(toolbar, text="Save", command=self._save_csv_from_editor).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="Open...", command=self._open_csv_from_editor).pack(
+            side="left", padx=2
+        )
+        ttk.Button(toolbar, text="New CSV", command=self._new_csv_from_editor).pack(
+            side="left", padx=2
+        )
+        ttk.Button(toolbar, text="Add Row", command=self._add_csv_row).pack(
+            side="left", padx=(14, 2)
+        )
+        ttk.Button(toolbar, text="Delete Row", command=self._delete_csv_rows).pack(
+            side="left", padx=2
+        )
+        ttk.Button(
+            toolbar,
+            text="Reload",
+            command=lambda: self._load_csv_table(show_errors=True),
+        ).pack(side="right", padx=2)
+        ttk.Button(
+            toolbar, text="Save As...", command=self._save_csv_as_from_editor
+        ).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="Save", command=self._save_csv_from_editor).pack(
+            side="right", padx=2
+        )
 
         self.csv_status_var = tk.StringVar(value="")
-        ttk.Label(self.csv_tab, textvariable=self.csv_status_var, anchor="w").pack(fill="x", padx=10)
+        ttk.Label(self.csv_tab, textvariable=self.csv_status_var, anchor="w").pack(
+            fill="x", padx=10
+        )
         self.csv_signal_frame = ttk.Frame(self.csv_tab)
         self.csv_signal_frame.pack(fill="x", padx=8, pady=(4, 0))
 
@@ -180,11 +207,17 @@ class CsvDebuggerMixin:
 
         self.csv_canvas = tk.Canvas(table_frame, highlightthickness=0, bg="white")
         self.csv_canvas.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.csv_canvas.yview)
+        yscroll = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.csv_canvas.yview
+        )
         yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.csv_canvas.xview)
+        xscroll = ttk.Scrollbar(
+            table_frame, orient="horizontal", command=self.csv_canvas.xview
+        )
         xscroll.grid(row=1, column=0, sticky="ew")
-        self.csv_canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.csv_canvas.configure(
+            yscrollcommand=yscroll.set, xscrollcommand=xscroll.set
+        )
         self.csv_canvas.bind("<Button-1>", self._on_csv_canvas_click)
         self.csv_canvas.bind("<Double-1>", self._begin_csv_cell_edit)
         self.csv_canvas.bind("<Configure>", lambda _e: self._draw_csv_grid())
@@ -208,7 +241,7 @@ class CsvDebuggerMixin:
         Bind mouse-wheel scrolling while the pointer is over the CSV table.
 
         Args:
-            _event (Any, optional): Tk event object.
+            _event (tk.Event | None): Tk event object.
 
         Returns:
             None.
@@ -223,7 +256,7 @@ class CsvDebuggerMixin:
         Unbind CSV mouse-wheel scrolling after the pointer leaves the table.
 
         Args:
-            _event (Any, optional): Tk event object.
+            _event (tk.Event | None): Tk event object.
 
         Returns:
             None.
@@ -238,7 +271,7 @@ class CsvDebuggerMixin:
         Scroll the CSV table vertically with the mouse wheel.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
             str: Tk break marker.
@@ -249,6 +282,7 @@ class CsvDebuggerMixin:
             units = 3
         else:
             units = -1 * int(event.delta / 120) if event.delta else 0
+
         self.csv_canvas.yview_scroll(units, "units")
         return "break"
 
@@ -257,13 +291,14 @@ class CsvDebuggerMixin:
         Scroll the CSV table horizontally with Shift+mouse wheel.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
             str: Tk break marker.
         """
         units = -1 * int(event.delta / 120) if event.delta else 0
         self.csv_canvas.xview_scroll(units, "units")
+
         return "break"
 
     def _persist_csv_location(self, path):
@@ -279,8 +314,10 @@ class CsvDebuggerMixin:
         config_path = os.path.join(os.getcwd(), LOCAL_CONFIG_FILENAME)
         parser = configparser.ConfigParser()
         parser.read(config_path)
+
         if not parser.has_section("paths"):
             parser.add_section("paths")
+
         parser.set("paths", "base_unproc", normalize_path(os.path.dirname(path)))
         parser.set("paths", "csv_filename", os.path.basename(path))
         with open(config_path, "w") as f:
@@ -296,7 +333,9 @@ class CsvDebuggerMixin:
         Returns:
             None.
         """
-        self.csv_columns = list(df.columns) if len(df.columns) else list(self.DEFAULT_CSV_COLUMNS)
+        self.csv_columns = (
+            list(df.columns) if len(df.columns) else list(self.DEFAULT_CSV_COLUMNS)
+        )
         self.csv_rows = [
             [str(row.get(col, "")) for col in self.csv_columns]
             for _, row in df.fillna("").iterrows()
@@ -324,6 +363,7 @@ class CsvDebuggerMixin:
         ]
         self.csv_col_offsets = []
         offset = 0
+
         for width in self.csv_col_widths:
             self.csv_col_offsets.append(offset)
             offset += width
@@ -341,20 +381,24 @@ class CsvDebuggerMixin:
         self.csv_row_heights = []
         self.csv_row_offsets = []
         offset = self.CSV_HEADER_HEIGHT
+
         for row in self.csv_rows:
             values = row + [""] * (len(self.csv_columns) - len(row))
             max_lines = 1
-            for col_index, value in enumerate(values[:len(self.csv_columns)]):
+            for col_index, value in enumerate(values[: len(self.csv_columns)]):
                 usable_width = max(20, self.csv_col_widths[col_index] - 10)
                 chars_per_line = max(1, usable_width // self.CSV_CELL_CHAR_PX)
                 text = str(value)
                 lines = 1
+
                 for part in text.splitlines() or [""]:
                     lines += max(0, (len(part) - 1) // chars_per_line)
+
                 max_lines = max(max_lines, lines)
+
             height = min(
                 self.CSV_MAX_ROW_HEIGHT,
-                max(self.CSV_ROW_HEIGHT, 8 + max_lines * self.CSV_LINE_HEIGHT)
+                max(self.CSV_ROW_HEIGHT, 8 + max_lines * self.CSV_LINE_HEIGHT),
             )
             self.csv_row_offsets.append(offset)
             self.csv_row_heights.append(height)
@@ -385,20 +429,35 @@ class CsvDebuggerMixin:
         for col_index, column in enumerate(self.csv_columns):
             x0 = self.csv_col_offsets[col_index]
             x1 = x0 + self.csv_col_widths[col_index]
-            self.csv_canvas.create_rectangle(x0, 0, x1, self.CSV_HEADER_HEIGHT, fill="#d9d9d9", outline="#999999")
-            self.csv_canvas.create_text(x0 + 6, self.CSV_HEADER_HEIGHT // 2, text=column, anchor="w", fill="#111111")
+            self.csv_canvas.create_rectangle(
+                x0, 0, x1, self.CSV_HEADER_HEIGHT, fill="#d9d9d9", outline="#999999"
+            )
+            self.csv_canvas.create_text(
+                x0 + 6,
+                self.CSV_HEADER_HEIGHT // 2,
+                text=column,
+                anchor="w",
+                fill="#111111",
+            )
 
         for row_index, row in enumerate(self.csv_rows):
             y0 = self.csv_row_offsets[row_index]
             y1 = y0 + self.csv_row_heights[row_index]
             values = row + [""] * (len(self.csv_columns) - len(row))
+
             for col_index, column in enumerate(self.csv_columns):
                 x0 = self.csv_col_offsets[col_index]
                 x1 = x0 + self.csv_col_widths[col_index]
                 color = self._csv_cell_color(column, values)
-                outline = "#222222" if self.csv_selected_cell == (row_index, col_index) else "#cccccc"
+                outline = (
+                    "#222222"
+                    if self.csv_selected_cell == (row_index, col_index)
+                    else "#cccccc"
+                )
                 width = 2 if self.csv_selected_cell == (row_index, col_index) else 1
-                self.csv_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline=outline, width=width)
+                self.csv_canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=color, outline=outline, width=width
+                )
                 text = values[col_index] if col_index < len(values) else ""
                 self.csv_canvas.create_text(
                     x0 + 5,
@@ -408,6 +467,7 @@ class CsvDebuggerMixin:
                     fill="#111111",
                     width=max(20, self.csv_col_widths[col_index] - 10),
                 )
+
         self._update_csv_signal_chips()
 
     def _cell_at_canvas_position(self, event):
@@ -415,13 +475,14 @@ class CsvDebuggerMixin:
         Identify the cell at a canvas event position.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
-            tuple[int, int] or None: Row and column indexes.
+            tuple[int, int] | None: Row and column indexes.
         """
         x = self.csv_canvas.canvasx(event.x)
         y = self.csv_canvas.canvasy(event.y)
+
         if y < self.CSV_HEADER_HEIGHT:
             return None
 
@@ -440,6 +501,7 @@ class CsvDebuggerMixin:
                 break
         if col_index is None:
             return None
+
         return row_index, col_index
 
     def _on_csv_canvas_click(self, event):
@@ -447,7 +509,7 @@ class CsvDebuggerMixin:
         Select a CSV cell from a canvas click.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
             None.
@@ -455,6 +517,7 @@ class CsvDebuggerMixin:
         cell = self._cell_at_canvas_position(event)
         if not cell:
             return
+
         self._commit_csv_edit()
         self.csv_selected_cell = cell
         self.csv_selected_rows = {cell[0]}
@@ -465,14 +528,16 @@ class CsvDebuggerMixin:
         Begin editing the clicked CSV cell.
 
         Args:
-            event (Any): Tk event object.
+            event (tk.Event): Tk event object.
 
         Returns:
-            None.
+            str | None: Tk break marker after opening the cell editor, or None when no
+                cell is available.
         """
         cell = self._cell_at_canvas_position(event)
         if not cell:
             return
+
         self._commit_csv_edit()
         row_index, col_index = cell
         self.csv_selected_cell = cell
@@ -480,7 +545,11 @@ class CsvDebuggerMixin:
 
         x0 = self.csv_col_offsets[col_index]
         y0 = self.csv_row_offsets[row_index]
-        value = self.csv_rows[row_index][col_index] if col_index < len(self.csv_rows[row_index]) else ""
+        value = (
+            self.csv_rows[row_index][col_index]
+            if col_index < len(self.csv_rows[row_index])
+            else ""
+        )
 
         entry = ttk.Entry(self.csv_canvas)
         entry.insert(0, value)
@@ -497,6 +566,7 @@ class CsvDebuggerMixin:
         entry.bind("<FocusOut>", lambda _e: self._commit_csv_edit())
         entry.bind("<Escape>", lambda _e: self._cancel_csv_edit())
         entry.after_idle(lambda: self._focus_csv_edit_entry(entry))
+
         return "break"
 
     def _focus_csv_edit_entry(self, entry):
@@ -513,6 +583,7 @@ class CsvDebuggerMixin:
             return
         if not entry.winfo_exists():
             return
+
         entry.focus_set()
         entry.select_range(0, tk.END)
 
@@ -528,15 +599,20 @@ class CsvDebuggerMixin:
         """
         if not self.csv_edit_entry:
             return
+
         entry, window_id, row_index, col_index = self.csv_edit_entry
         self.csv_edit_entry = None
         if row_index < len(self.csv_rows) and col_index < len(self.csv_columns):
-            self.csv_rows[row_index] += [""] * (len(self.csv_columns) - len(self.csv_rows[row_index]))
+            self.csv_rows[row_index] += [""] * (
+                len(self.csv_columns) - len(self.csv_rows[row_index])
+            )
             self.csv_rows[row_index][col_index] = entry.get()
             self.csv_dirty = True
+
         self.csv_canvas.delete(window_id)
         if entry.winfo_exists():
             entry.destroy()
+
         self._measure_csv_rows()
         self._draw_csv_grid()
 
@@ -552,28 +628,73 @@ class CsvDebuggerMixin:
         """
         if not self.csv_edit_entry:
             return
+
         entry, window_id, _row_index, _col_index = self.csv_edit_entry
         self.csv_edit_entry = None
         self.csv_canvas.delete(window_id)
+
         if entry.winfo_exists():
             entry.destroy()
+
         self._draw_csv_grid()
 
     def _hex_to_rgb(self, color):
+        """
+        Convert a six-digit hexadecimal display color into RGB channels.
+
+        Args:
+            color (str): Hexadecimal Tk display color with red, green, and blue
+                channels.
+
+        Returns:
+            tuple[int, int, int]: Red, green, and blue channel values.
+        """
         color = color.lstrip("#")
-        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+        return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
 
     def _rgb_to_hex(self, rgb):
+        """
+        Format RGB channel values as a hexadecimal Tk display color.
+
+        Args:
+            rgb (tuple[int, int, int]): Red, green, and blue channel values in [0, 255].
+
+        Returns:
+            str: Six-digit color string with a leading hash.
+        """
         return "#{:02x}{:02x}{:02x}".format(*rgb)
 
     def _mix_colors(self, colors):
+        """
+        Average display colors with a white fallback for an empty selection.
+
+        Args:
+            colors (list[str]): Hexadecimal display colors to average.
+
+        Returns:
+            str: Hexadecimal color obtained by averaging each RGB channel.
+        """
         if not colors:
             return "#ffffff"
+
         rgbs = [self._hex_to_rgb(color) for color in colors]
         mixed = tuple(round(sum(rgb[i] for rgb in rgbs) / len(rgbs)) for i in range(3))
+
         return self._rgb_to_hex(mixed)
 
     def _blend_colors(self, base_color, overlay_color, overlay_weight):
+        """
+        Blend an overlay color into a base color using a clamped opacity.
+
+        Args:
+            base_color (str): Hexadecimal background color for the blend.
+            overlay_color (str): Hexadecimal color mixed over the background.
+            overlay_weight (float): Overlay fraction, clamped to [0, 1].
+
+        Returns:
+            str: Hexadecimal blended display color.
+        """
         overlay_weight = max(0.0, min(1.0, overlay_weight))
         base = self._hex_to_rgb(base_color)
         overlay = self._hex_to_rgb(overlay_color)
@@ -581,34 +702,87 @@ class CsvDebuggerMixin:
             round(base[i] * (1.0 - overlay_weight) + overlay[i] * overlay_weight)
             for i in range(3)
         )
+
         return self._rgb_to_hex(blended)
 
     def _value_for_column(self, columns, values, column):
+        """
+        Read a row value by column name with a missing-column fallback.
+
+        Args:
+            columns (list[str]): CSV column names in displayed order.
+            values (list[str]): CSV row values aligned to the column names.
+            column (str): Name of the requested CSV column.
+
+        Returns:
+            str: Corresponding cell value, or an empty string when unavailable.
+        """
         if column not in columns:
             return ""
+
         index = columns.index(column)
         return values[index] if index < len(values) else ""
 
     def _split_csv_tokens(self, value):
+        """
+        Split a comma-separated cell into lowercase nonempty tokens.
+
+        Args:
+            value (str): Comma-separated CSV cell contents to normalize.
+
+        Returns:
+            list[str]: Normalized cell tokens in their original order.
+        """
         return [item.strip().lower() for item in str(value).split(",") if item.strip()]
 
     def _option_color(self, namespace, value):
+        """
+        Choose a stable display color for a namespaced option value.
+
+        Args:
+            namespace (str): Option category included in the stable display-color hash.
+            value (str): Option value used to select a deterministic palette color.
+
+        Returns:
+            str: Palette color keyed by the option, or neutral gray for an empty value.
+        """
         normalized = str(value).strip().lower()
         if not normalized:
             return "#eeeeee"
+
         digest = hashlib.sha1(f"{namespace}:{normalized}".encode("utf-8")).digest()
         index = int.from_bytes(digest[:2], "big") % len(self.CSV_OPTION_COLORS)
+
         return self.CSV_OPTION_COLORS[index]
 
     def _modality_color(self, modality_value):
+        """
+        Combine colors for the modalities listed in a CSV cell.
+
+        Args:
+            modality_value (str): CSV cell listing one or more image modalities.
+
+        Returns:
+            str: Hexadecimal modality display color.
+        """
         modalities = self._split_csv_tokens(modality_value) or ["default"]
         colors = [
             self.MODALITY_COLORS.get(mod, self._option_color("modality", mod))
             for mod in modalities
         ]
+
         return self._mix_colors(colors)
 
     def _file_type_token_color(self, extension):
+        """
+        Choose the display color for one image, volume, or video extension.
+
+        Args:
+            extension (str): File extension, including its leading dot.
+
+        Returns:
+            str: Category color or a stable fallback for an unknown extension.
+        """
         ext = extension if extension.startswith(".") else f".{extension}"
         if ext in self.VOLUME_FILE_TYPES:
             return self.FILE_TYPE_COLORS["volume"]
@@ -616,18 +790,41 @@ class CsvDebuggerMixin:
             return self.FILE_TYPE_COLORS["image"]
         if ext in self.VIDEO_FILE_TYPES:
             return self.FILE_TYPE_COLORS["video"]
+
         return self._option_color("file-type", ext)
 
     def _file_type_color(self, value):
+        """
+        Combine colors for the file extensions listed in a CSV cell.
+
+        Args:
+            value (str): Comma-separated file extensions from the selected CSV cell.
+
+        Returns:
+            str: Mixed extension color, or the unknown-category color for an empty cell.
+        """
         extensions = self._split_csv_tokens(value)
         if not extensions:
             return self.FILE_TYPE_COLORS["unknown"]
-        return self._mix_colors([self._file_type_token_color(ext) for ext in extensions])
+
+        return self._mix_colors(
+            [self._file_type_token_color(ext) for ext in extensions]
+        )
 
     def _file_type_category(self, value):
+        """
+        Classify a cell's extensions as raster, volume, video, mixed, or unknown.
+
+        Args:
+            value (str): Comma-separated file extensions from the selected CSV cell.
+
+        Returns:
+            str: Category used to label the CSV selection.
+        """
         extensions = set(self._split_csv_tokens(value))
         if not extensions:
             return "unknown"
+
         categories = set()
         for ext in extensions:
             ext = ext if ext.startswith(".") else f".{ext}"
@@ -639,19 +836,48 @@ class CsvDebuggerMixin:
                 categories.add("video")
             else:
                 categories.add("unknown")
+
         known = categories - {"unknown"}
         if len(known) > 1 or (known and "unknown" in categories):
             return "mixed"
+
         return next(iter(known or categories))
 
     def _grouping_regex_category(self, value):
+        """
+        Classify a grouping expression as missing, single, or subdataset-specific.
+
+        Args:
+            value (str): Grouping expression whose subdataset syntax determines its
+                category.
+
+        Returns:
+            str: Regex category, either none, single, or multiple.
+        """
         regex = str(value).strip()
         if not regex:
             return "none"
+
         return "multiple" if regex.startswith("[") else "single"
 
     def _grouping_distance_value(self, columns, values):
-        for column in ("Grouping Distance", "Grouping distance", "grouping_distance", "Distance", "distance"):
+        """
+        Parse a nonnegative grouping distance from supported column aliases.
+
+        Args:
+            columns (list[str]): CSV column names in displayed order.
+            values (list[str]): CSV row values aligned to the column names.
+
+        Returns:
+            float | None: Clamped distance, or None when missing or invalid.
+        """
+        for column in (
+            "Grouping Distance",
+            "Grouping distance",
+            "grouping_distance",
+            "Distance",
+            "distance",
+        ):
             raw = self._value_for_column(columns, values, column).strip()
             if not raw:
                 continue
@@ -659,11 +885,23 @@ class CsvDebuggerMixin:
                 return max(0.0, float(raw))
             except ValueError:
                 return None
+
         return None
 
     def _grouping_distance_color(self, distance):
+        """
+        Map grouping distance to a green-to-red display color.
+
+        Args:
+            distance (float | None): Parsed grouping distance, or None when absent or
+                invalid.
+
+        Returns:
+            str: Distance color, or neutral gray for an undefined distance.
+        """
         if distance is None:
             return "#eeeeee"
+
         ratio = min(distance / 10.0, 1.0)
         return self._blend_colors("#3fd35f", "#ff3b30", ratio)
 
@@ -679,20 +917,52 @@ class CsvDebuggerMixin:
             str: Hex color.
         """
         if column == "Modality":
-            return self._modality_color(self._value_for_column(self.csv_columns, values, column))
+            return self._modality_color(
+                self._value_for_column(self.csv_columns, values, column)
+            )
         if column in ("Image File Type", "Mask File Type"):
-            return self._file_type_color(self._value_for_column(self.csv_columns, values, column))
+            return self._file_type_color(
+                self._value_for_column(self.csv_columns, values, column)
+            )
         if column == "Grouping Strategy":
-            strategy = self._value_for_column(self.csv_columns, values, column).strip().lower() or "unknown"
-            return self.GROUPING_STRATEGY_COLORS.get(strategy, self.GROUPING_STRATEGY_COLORS["unknown"])
+            strategy = (
+                self._value_for_column(self.csv_columns, values, column).strip().lower()
+                or "unknown"
+            )
+            return self.GROUPING_STRATEGY_COLORS.get(
+                strategy, self.GROUPING_STRATEGY_COLORS["unknown"]
+            )
         if column == "Grouping Regex":
-            category = self._grouping_regex_category(self._value_for_column(self.csv_columns, values, column))
+            category = self._grouping_regex_category(
+                self._value_for_column(self.csv_columns, values, column)
+            )
             return self.GROUPING_REGEX_COLORS[category]
-        if column in ("Grouping Distance", "Grouping distance", "grouping_distance", "Distance", "distance"):
-            return self._grouping_distance_color(self._grouping_distance_value(self.csv_columns, values))
+        if column in (
+            "Grouping Distance",
+            "Grouping distance",
+            "grouping_distance",
+            "Distance",
+            "distance",
+        ):
+            return self._grouping_distance_color(
+                self._grouping_distance_value(self.csv_columns, values)
+            )
+
         return "#ffffff"
 
     def _chip(self, label, value, color):
+        """
+        Append a colored label for the selected CSV row's metadata.
+
+        Args:
+            label (str): Metadata field label shown before the selected row value.
+            value (str): Selected row value displayed in the colored metadata label.
+            color (str): Hexadecimal Tk display color with red, green, and blue
+                channels.
+
+        Returns:
+            None.
+        """
         text = f"{label}: {value}" if value else label
         tk.Label(
             self.csv_signal_frame,
@@ -706,6 +976,15 @@ class CsvDebuggerMixin:
         ).pack(side="left", padx=2, pady=2)
 
     def _update_csv_signal_chips(self):
+        """
+        Refresh metadata labels and colors for the selected CSV row.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         if not hasattr(self, "csv_signal_frame"):
             return
         for child in self.csv_signal_frame.winfo_children():
@@ -720,17 +999,30 @@ class CsvDebuggerMixin:
             self._chip("Select a row to inspect colors", "", "#eeeeee")
             return
 
-        values = self.csv_rows[row_index] + [""] * (len(self.csv_columns) - len(self.csv_rows[row_index]))
+        values = self.csv_rows[row_index] + [""] * (
+            len(self.csv_columns) - len(self.csv_rows[row_index])
+        )
         modality = self._value_for_column(self.csv_columns, values, "Modality")
-        image_types = self._value_for_column(self.csv_columns, values, "Image File Type")
+        image_types = self._value_for_column(
+            self.csv_columns, values, "Image File Type"
+        )
         mask_types = self._value_for_column(self.csv_columns, values, "Mask File Type")
-        strategy = self._value_for_column(self.csv_columns, values, "Grouping Strategy").strip().lower() or "unknown"
-        regex_category = self._grouping_regex_category(self._value_for_column(self.csv_columns, values, "Grouping Regex"))
+        strategy = (
+            self._value_for_column(self.csv_columns, values, "Grouping Strategy")
+            .strip()
+            .lower()
+            or "unknown"
+        )
+        regex_category = self._grouping_regex_category(
+            self._value_for_column(self.csv_columns, values, "Grouping Regex")
+        )
         distance = self._grouping_distance_value(self.csv_columns, values)
 
         image_category = self._file_type_category(image_types)
         mask_category = self._file_type_category(mask_types)
-        strategy_color = self.GROUPING_STRATEGY_COLORS.get(strategy, self.GROUPING_STRATEGY_COLORS["unknown"])
+        strategy_color = self.GROUPING_STRATEGY_COLORS.get(
+            strategy, self.GROUPING_STRATEGY_COLORS["unknown"]
+        )
         distance_label = "n/a" if distance is None else f"{distance:g}"
 
         self._chip("Modality", modality or "default", self._modality_color(modality))
@@ -757,10 +1049,13 @@ class CsvDebuggerMixin:
                 self._set_csv_table(df)
                 self.csv_status_var.set(f"CSV: {self.csv_path}")
                 self.csv_dirty = False
+
                 return
             except Exception as e:
                 if show_errors:
-                    messagebox.showerror("CSV Load Error", f"Could not load CSV:\n\n{e}")
+                    messagebox.showerror(
+                        "CSV Load Error", f"Could not load CSV:\n\n{e}"
+                    )
 
         self._set_csv_table(pd.DataFrame(columns=self.DEFAULT_CSV_COLUMNS))
         self.csv_status_var.set(f"CSV: {self.csv_path} (not loaded)")
@@ -778,11 +1073,13 @@ class CsvDebuggerMixin:
         """
         self._commit_csv_edit()
         rows = []
+
         for row in self.csv_rows:
             values = row + [""] * (len(self.csv_columns) - len(row))
-            values = values[:len(self.csv_columns)]
+            values = values[: len(self.csv_columns)]
             if any(v.strip() for v in values):
                 rows.append(values)
+
         return pd.DataFrame(rows, columns=self.csv_columns)
 
     def _refresh_metadata_from_csv_editor(self):
@@ -801,13 +1098,15 @@ class CsvDebuggerMixin:
             messagebox.showwarning(
                 "CSV Saved",
                 "The CSV was saved, but DRIPP could not load it as dataset metadata:\n\n"
-                f"{e}"
+                f"{e}",
             )
             return False
+
         self.dataset_var.set("")
         self.preproc_dataset_var.set("")
         self.base_var.set("")
         self.save_json_btn.state(["disabled"])
+
         return True
 
     def _save_csv_to_path(self, path):
@@ -831,6 +1130,7 @@ class CsvDebuggerMixin:
             self.csv_dirty = False
             self._refresh_metadata_from_csv_editor()
             messagebox.showinfo("Saved CSV", f"Saved CSV to:\n{self.csv_path}")
+
             return True
         except Exception as e:
             messagebox.showerror("CSV Save Error", f"Could not save CSV:\n\n{e}")
@@ -855,6 +1155,7 @@ class CsvDebuggerMixin:
         )
         if not path:
             return
+
         self.csv_path = normalize_path(path)
         self._persist_csv_location(self.csv_path)
         self._load_csv_table(show_errors=True)
@@ -885,9 +1186,12 @@ class CsvDebuggerMixin:
         Returns:
             None.
         """
-        if not self.csv_path or not os.path.isdir(os.path.dirname(os.path.abspath(self.csv_path))):
+        if not self.csv_path or not os.path.isdir(
+            os.path.dirname(os.path.abspath(self.csv_path))
+        ):
             self._save_csv_as_from_editor()
             return
+
         self._save_csv_to_path(self.csv_path)
 
     def _save_csv_as_from_editor(self):
@@ -940,8 +1244,11 @@ class CsvDebuggerMixin:
         self._commit_csv_edit()
         if not self.csv_selected_rows:
             return
+
         selected = set(self.csv_selected_rows)
-        self.csv_rows = [row for index, row in enumerate(self.csv_rows) if index not in selected]
+        self.csv_rows = [
+            row for index, row in enumerate(self.csv_rows) if index not in selected
+        ]
         self.csv_selected_cell = None
         self.csv_selected_rows = set()
         self.csv_dirty = True

@@ -1,3 +1,10 @@
+"""
+Load, transform, and export segmentation images and masks.
+
+Support 2D images, medical volumes, DICOM series, and video; normalize modality
+intensities, filter connected components, and track output pairings and quality.
+"""
+
 import os
 import math
 import gzip
@@ -27,8 +34,11 @@ from .helpers import (
     match_mask_class,
 )
 from .config import (
-    PREPROCESSING_LOG_DIR, DEFAULT_LOG_LEVEL, DEFAULT_TARGET_SIZE,
-    MIN_COMPONENT_SIZE, MIN_COMPONENT_VOXELS_3D,
+    PREPROCESSING_LOG_DIR,
+    DEFAULT_LOG_LEVEL,
+    DEFAULT_TARGET_SIZE,
+    MIN_COMPONENT_SIZE,
+    MIN_COMPONENT_VOXELS_3D,
 )
 from .output_filenames import render_image_filename, render_mask_filename
 from .ct_profiles import CTProfile, CTProfileError, select_ct_profile
@@ -37,17 +47,31 @@ sitk.ProcessObject.SetGlobalWarningDisplay(False)
 
 
 def _dicom_slice_key_from_dataset(dataset):
-    """Return a slice-order key projected onto the DICOM acquisition normal."""
+    """
+    Return a slice-order key projected onto the DICOM acquisition normal.
+
+    Args:
+        dataset (pydicom.dataset.Dataset): DICOM header containing slice position,
+            acquisition orientation, and instance number.
+
+    Returns:
+        tuple[int, float | int, int]: Geometry-priority flag, projected position or
+            fallback instance number, and instance-number tiebreaker.
+    """
     instance_number = int(getattr(dataset, "InstanceNumber", 0))
     try:
         orientation = np.asarray(dataset.ImageOrientationPatient, dtype=np.float64)
         position = np.asarray(dataset.ImagePositionPatient, dtype=np.float64)
         if orientation.size != 6 or position.size != 3:
             raise ValueError("invalid DICOM orientation or position length")
+
+        # Projection follows the acquisition direction even when its normal is
+        # negative or oblique, unlike sorting by a fixed patient-space coordinate.
         slice_normal = np.cross(orientation[:3], orientation[3:])
         normal_length = np.linalg.norm(slice_normal)
         if normal_length <= np.finfo(np.float64).eps:
             raise ValueError("degenerate DICOM slice normal")
+
         projection = float(np.dot(position, slice_normal / normal_length))
         return (0, projection, instance_number)
     except (AttributeError, TypeError, ValueError):
@@ -55,8 +79,21 @@ def _dicom_slice_key_from_dataset(dataset):
 
 
 def _dicom_slice_key(path):
+    """
+    Read a DICOM header and derive its geometry-aware slice-order key.
+
+    Args:
+        path (str | pathlib.Path): Path to a DICOM slice whose header provides the
+            ordering geometry.
+
+    Returns:
+        tuple[int, float | int, int]: Geometry-priority flag, projected position or
+            fallback instance number, and instance-number tiebreaker.
+    """
     dataset = pydicom.dcmread(path, stop_before_pixels=True)
+
     return _dicom_slice_key_from_dataset(dataset)
+
 
 # Configure logger
 main_logger = logging.getLogger("Preprocessor")
@@ -69,17 +106,24 @@ if not main_logger.handlers:
     # File handler: logs save to "preprocessor_<date>.log"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = PREPROCESSING_LOG_DIR
+
     try:
         os.makedirs(log_dir, exist_ok=True)
         log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
-        fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
+        fh = RotatingFileHandler(
+            log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10
+        )
     except OSError:
         log_dir = os.path.join(os.getcwd(), ".dripp", "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_file_path = os.path.join(log_dir, f"preprocessor_{timestamp}.log")
-        fh = RotatingFileHandler(log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10)
+        fh = RotatingFileHandler(
+            log_file_path, maxBytes=400 * 1024 * 1024, backupCount=10
+        )
+
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     main_logger.addHandler(fh)
+
 
 class Preprocessor:
     """
@@ -98,35 +142,57 @@ class Preprocessor:
       - Ensure 3-channel output for grayscale inputs
       - Split multi-class masks into binary components and filter small regions
     """
+
     def __init__(
-        self, target_size=DEFAULT_TARGET_SIZE, ct_profiles=None, ct_window=None,
-        global_ct_stats=None, min_mask_size=MIN_COMPONENT_SIZE,
+        self,
+        target_size=DEFAULT_TARGET_SIZE,
+        ct_profiles=None,
+        ct_window=None,
+        global_ct_stats=None,
+        min_mask_size=MIN_COMPONENT_SIZE,
         min_component_voxels_3d=MIN_COMPONENT_VOXELS_3D,
-        dataset_logger=None, dataset_name=None, background_value=0,
+        dataset_logger=None,
+        dataset_name=None,
+        background_value=0,
     ):
         """
         Initialize the Preprocessor.
 
         Args:
-            target_size (tuple, optional): (width, height) for in-plane resizing. Defaults to (1024, 1024).
-            ct_profiles (mapping, optional): Validated schema-v2 profiles keyed by CT subdataset.
-            ct_window/global_ct_stats: Legacy fixed parameters retained for compatibility. Both
-                must be supplied together; schema-v2 profiles are preferred.
-            min_mask_size (int, optional): Minimum pixel area for keeping a mask component. Defaults to 100.
-            min_component_voxels_3d (int, optional): Minimum voxel count for keeping a
-                3D connected component. Zero disables 3D size filtering.
-            dataset_logger (logging.Logger, optional): Logger for dataset-specific logging. Defaults to main logger.
-            dataset_name (str, optional): Name of the dataset. Defaults to None.
-            background_value (int, optional): Background value for normalization. Defaults to 0.
+            target_size (tuple[int, int]): Target width and height for in-plane
+                resizing.
+            ct_profiles (Mapping[str, CTProfile] | None): Validated schema-v2 profiles
+                keyed by exact CT subdataset name.
+            ct_window (tuple[float, float] | None): Legacy CT window as (width, level);
+                must be supplied together with global_ct_stats.
+            global_ct_stats (tuple[float, float] | None): Legacy CT normalization
+                parameters as (mean, standard deviation); must be supplied together with
+                ct_window.
+            min_mask_size (int): Minimum accepted 2D connected-component area, in
+                pixels.
+            min_component_voxels_3d (int): Minimum voxel count for keeping a 3D
+                connected component. Zero disables 3D size filtering.
+            dataset_logger (logging.Logger | None): Dataset-specific logger, or None to
+                use the main preprocessor logger.
+            dataset_name (str | None): Name of the dataset. Defaults to None.
+            background_value (int | float): Pixel value treated as background for
+                cropping and normalization.
+
+        Returns:
+            None.
         """
         if min_component_voxels_3d < 0:
             raise ValueError("min_component_voxels_3d must be zero or greater")
+
         main_logger.info(
             "Initializing Preprocessor: target_size=%s, min_mask_size=%s, "
             "min_component_voxels_3d=%s, gpu_enabled=%s",
-            target_size, min_mask_size, min_component_voxels_3d, config.GPU_ENABLED,
+            target_size,
+            min_mask_size,
+            min_component_voxels_3d,
+            config.GPU_ENABLED,
         )
-        
+
         # Select the backend only after runtime configuration/CLI parsing.
         if config.GPU_ENABLED:
             try:
@@ -140,6 +206,7 @@ class Preprocessor:
                 device_count = xp.cuda.runtime.getDeviceCount()
                 if device_count < 1:
                     raise RuntimeError("CuPy did not detect any CUDA devices")
+
                 device = xp.cuda.Device(0)
                 device.use()
                 probe = xp.zeros(1, dtype=xp.float32)
@@ -147,22 +214,28 @@ class Preprocessor:
                 xp.cuda.Stream.null.synchronize()
                 properties = xp.cuda.runtime.getDeviceProperties(0)
                 device_name = properties["name"]
+
                 if isinstance(device_name, bytes):
                     device_name = device_name.decode("utf-8", errors="replace")
             except Exception as exc:
                 raise RuntimeError(
                     f"GPU preprocessing was requested, but CUDA initialization failed: {exc}"
                 ) from exc
-            main_logger.info("Selected array backend CuPy on CUDA device 0: %s", device_name)
+
+            main_logger.info(
+                "Selected array backend CuPy on CUDA device 0: %s", device_name
+            )
         else:
             xp = np
             main_logger.info("Selected array backend NumPy")
+
         self.xp = xp
 
         # Core configuration
         self.target_size = target_size
         self.ct_profiles = dict(ct_profiles or {})
         self._active_ct_profile = None
+
         if ct_window is not None or global_ct_stats is not None:
             if ct_window is None or global_ct_stats is None:
                 raise CTProfileError(
@@ -173,14 +246,19 @@ class Preprocessor:
                 width, level = map(float, ct_window)
                 mean, std = map(float, global_ct_stats)
                 self._legacy_ct_profile = CTProfile(
-                    name="default", intensity_space="hu",
+                    name="default",
+                    intensity_space="hu",
                     window_lower=level - width / 2.0,
                     window_upper=level + width / 2.0,
-                    mean=mean, std=std, count=1,
-                    source_image_count=1, failed_image_count=0,
+                    mean=mean,
+                    std=std,
+                    count=1,
+                    source_image_count=1,
+                    failed_image_count=0,
                 )
         else:
             self._legacy_ct_profile = None
+
         self.min_mask_size = min_mask_size
         self.dataset_name = dataset_name
         self.min_component_voxels_3d = int(min_component_voxels_3d)
@@ -192,8 +270,15 @@ class Preprocessor:
         # Modality categories (lowercase)
         self.modalities_3d = {"ct", "mri"}
         self.modalities_2d = {
-            "x-ray", "ultrasound", "retinal-scan", "colonoscopy",
-            "fetoscopy", "histopathology", "dermoscopy", "mammography", "oct"
+            "x-ray",
+            "ultrasound",
+            "retinal-scan",
+            "colonoscopy",
+            "fetoscopy",
+            "histopathology",
+            "dermoscopy",
+            "mammography",
+            "oct",
         }
 
         # Background value used for cropping and normalization decisions
@@ -207,7 +292,15 @@ class Preprocessor:
         self.dataset_logger.info("Preprocessor initialized successfully.")
 
     def _reset_group_tracking(self):
-        """Reset lightweight output and QC state for one preprocessing group."""
+        """
+        Reset lightweight output and QC state for one preprocessing group.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self._current_images = []
         self._current_masks = []
         self._current_stage = "group"
@@ -226,13 +319,32 @@ class Preprocessor:
         self._current_quality_policy_3d = normalize_3d_quality_policy(policy_options)
 
     def _record_reason(self, reason):
+        """
+        Record a group rejection reason once.
+
+        Args:
+            reason (str | None): Rejection or failure reason to record, if one is
+                available.
+
+        Returns:
+            None.
+        """
         if reason not in self._current_reasons:
             self._current_reasons.append(reason)
 
     def _group_tracking_metadata(self):
-        """Return a JSON-safe snapshot used by dataset-level result handling."""
+        """
+        Return a JSON-safe snapshot used by dataset-level result handling.
+
+        Args:
+            None.
+
+        Returns:
+            dict: JSON-safe tracking metadata for dataset-level result handling.
+        """
         images = [dict(record) for record in self._current_images]
         image_positions = {}
+
         for index, record in enumerate(images):
             image_positions.setdefault(record["pairing_index"], index)
 
@@ -241,8 +353,10 @@ class Preprocessor:
             item = dict(record)
             pairing_index = item.pop("pairing_index")
             image_index = image_positions.get(pairing_index)
+
             if image_index is None and len(images) == 1:
                 image_index = 0
+
             item["image_index"] = image_index
             masks.append(item)
 
@@ -256,11 +370,29 @@ class Preprocessor:
         }
 
     def get_group_tracking_metadata(self):
-        """Expose the latest tracking snapshot after a handled group failure."""
+        """
+        Expose the latest tracking snapshot after a handled group failure.
+
+        Args:
+            None.
+
+        Returns:
+            dict: Output paths, mask pairings, QC counters, policy, reasons, and current
+                stage.
+        """
         return self._group_tracking_metadata()
 
     def _record_3d_component_rejection(self, reason):
-        """Record one rejected 3D component without per-component logging."""
+        """
+        Record one rejected 3D component without per-component logging.
+
+        Args:
+            reason (str): Stable quality-rejection code to count for the current
+                component.
+
+        Returns:
+            None.
+        """
         self._current_qc["components_3d_rejected"] += 1
         counts = self._current_qc["components_3d_rejected_by_reason"]
         counts[reason] = counts.get(reason, 0) + 1
@@ -268,9 +400,24 @@ class Preprocessor:
 
     @staticmethod
     def _evaluate_3d_component_quality(relabeled, component_sizes, policy):
-        """Return component-label to rejection-reason mappings before mask writes."""
+        """
+        Return component-label to rejection-reason mappings before mask writes.
+
+        Args:
+            relabeled (SimpleITK.Image): Connected-component label image with positive,
+                consecutive component labels.
+            component_sizes (Sequence[int]): Exact full-resolution voxel counts aligned
+                to the positive component labels.
+            policy (dict): Validated 3D component quality thresholds and slice-axis
+                sampling semantics.
+
+        Returns:
+            dict[int, str]: Rejected component labels mapped to their first failing
+                quality criterion.
+        """
         rejections = {}
         min_voxels = policy["min_component_voxels_3d"]
+
         for component_label, component_size in enumerate(component_sizes, start=1):
             if min_voxels and component_size < min_voxels:
                 rejections[component_label] = "component_below_minimum_voxels_3d"
@@ -279,6 +426,7 @@ class Preprocessor:
         min_area_fraction = policy["min_slice_area_fraction_3d"]
         min_slices = policy["min_qualified_slices_3d"]
         area_enabled = min_area_px > 0 or min_area_fraction > 0.0
+
         if not area_enabled and min_slices == 0:
             return rejections
 
@@ -289,11 +437,14 @@ class Preprocessor:
             return rejections
 
         full_shape = tuple(int(value) for value in label_volume.shape)
-        inplane_areas = np.asarray([
-            full_shape[1] * full_shape[2],
-            full_shape[0] * full_shape[2],
-            full_shape[0] * full_shape[1],
-        ], dtype=np.int64)
+        inplane_areas = np.asarray(
+            [
+                full_shape[1] * full_shape[2],
+                full_shape[0] * full_shape[2],
+                full_shape[0] * full_shape[1],
+            ],
+            dtype=np.int64,
+        )
         hi_axis = int(inplane_areas.argmax())
         full_slice_area = int(inplane_areas[hi_axis])
 
@@ -303,43 +454,38 @@ class Preprocessor:
         sampled = label_volume[tuple(sampling)]
         sampled = np.moveaxis(sampled, hi_axis, 0)
         component_count = len(component_sizes)
-        slice_counts = np.zeros(
-            (sampled.shape[0], component_count + 1), dtype=np.int64
-        )
+        slice_counts = np.zeros((sampled.shape[0], component_count + 1), dtype=np.int64)
+
         for slice_index, label_slice in enumerate(sampled):
             counts = np.bincount(
                 np.asarray(label_slice).reshape(-1), minlength=component_count + 1
             )
-            slice_counts[slice_index] = counts[:component_count + 1]
+            slice_counts[slice_index] = counts[: component_count + 1]
 
         threshold_full = max(
             min_area_px, int(math.ceil(min_area_fraction * full_slice_area))
         )
-        threshold_sampled = max(
-            1, int(math.ceil(threshold_full / (downsample ** 2)))
-        )
+        threshold_sampled = max(1, int(math.ceil(threshold_full / (downsample**2))))
 
         for component_label in range(1, component_count + 1):
             if component_label in rejections:
                 continue
+
             per_slice = slice_counts[:, component_label]
             qualifying = per_slice >= threshold_sampled
             if area_enabled and not bool(qualifying.any()):
-                rejections[component_label] = (
-                    "component_below_minimum_slice_area_3d"
-                )
+                rejections[component_label] = "component_below_minimum_slice_area_3d"
                 continue
             if min_slices == 0:
                 continue
             if int(np.count_nonzero(qualifying)) < min_slices:
-                rejections[component_label] = (
-                    "component_below_minimum_slices_3d"
-                )
+                rejections[component_label] = "component_below_minimum_slices_3d"
                 continue
             if policy["require_contiguous_qualified_slices_3d"]:
                 flags = qualifying.astype(np.int32)
                 prefix = np.concatenate(([0], np.cumsum(flags)))
                 window_sums = prefix[min_slices:] - prefix[:-min_slices]
+
                 if not bool(np.any(window_sums == min_slices)):
                     rejections[component_label] = (
                         "component_below_minimum_contiguous_slices_3d"
@@ -347,9 +493,22 @@ class Preprocessor:
 
         return rejections
 
-    def preprocess_group(self, sub_name, pipeline, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, mask_classes, preprocessing_options=None):
+    def preprocess_group(
+        self,
+        sub_name,
+        pipeline,
+        image_files,
+        mask_files,
+        modality,
+        img_out_dir,
+        mask_out_dir,
+        composite_id,
+        mask_classes,
+        preprocessing_options=None,
+    ):
         """
-        Dispatch a group of images and masks through the specified preprocessing pipeline.
+        Dispatch a group of images and masks through the specified preprocessing
+        pipeline.
 
         Based on the pipeline argument ('2D', '3D', or 'Video'), this method:
         1. Computes a unified bounding box over all input images.
@@ -359,14 +518,19 @@ class Preprocessor:
 
         Args:
             sub_name (str): Identifier for the subdataset.
-            pipeline (str): One of '2D', '3D', or 'Video' specifying which workflow to use.
-            image_files (list of str): Paths to input image files or series.
-            mask_files (list of str): Paths to corresponding mask files or series.
-            modality (str): Modality key for normalization, for example 'ct', 'mri', or 'ultrasound'.
+            pipeline (str): One of '2D', '3D', or 'Video' specifying which workflow to
+                use.
+            image_files (list[str]): Paths to input image files or series.
+            mask_files (list[str]): Paths to corresponding mask files or series.
+            modality (str): Modality key for normalization, for example 'ct', 'mri', or
+                'ultrasound'.
             img_out_dir (str): Directory to save preprocessed images.
             mask_out_dir (str): Directory to save preprocessed masks.
             composite_id (str): Unique identifier used for naming output files.
-            mask_classes (list of str): List of mask class names and their corresponding rules.
+            mask_classes (dict[str, dict[str, str]] | None): Subdataset names mapped to
+                class-to-rule dictionaries for target matching.
+            preprocessing_options (dict | None): Optional group-level preprocessing
+                overrides.
 
         Returns:
             dict: Metadata including:
@@ -375,14 +539,20 @@ class Preprocessor:
                 - 'is_significant_crop' (bool): True if >=25 percent was cropped
                 plus pipeline-specific fields such as 'fps' for video or 'image_niftis' and 'mask_niftis' for 3D
         """
-        main_logger.info(f"Preprocessing group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
+        main_logger.info(
+            f"Preprocessing group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}"
+        )
         self._reset_group_tracking()
         self._current_stage = "configuration"
-        
+
         # Normalize modality key for lookup
-        self.dataset_logger.info(f"DEBUG: modality is {modality!r} of type {type(modality)}")
+        self.dataset_logger.info(
+            f"DEBUG: modality is {modality!r} of type {type(modality)}"
+        )
         key = modality.lower()
-        modality_key = key if key in self.modalities_3d.union(self.modalities_2d) else "default"
+        modality_key = (
+            key if key in self.modalities_3d.union(self.modalities_2d) else "default"
+        )
 
         if modality_key == "ct":
             if self.ct_profiles:
@@ -393,10 +563,15 @@ class Preprocessor:
                 raise CTProfileError(
                     f"CT preprocessing for {self.dataset_name!r}/{sub_name!r} requires a complete schema-v2 profile"
                 )
+
             profile = self._active_ct_profile
             self.dataset_logger.info(
                 "Selected CT profile %s: window=[%.4f, %.4f], mean=%.4f, std=%.4f",
-                profile.name, profile.window_lower, profile.window_upper, profile.mean, profile.std,
+                profile.name,
+                profile.window_lower,
+                profile.window_upper,
+                profile.mean,
+                profile.std,
             )
         else:
             self._active_ct_profile = None
@@ -405,7 +580,8 @@ class Preprocessor:
         options["min_component_voxels_3d"] = self.min_component_voxels_3d
         options.update(preprocessing_options or {})
         self._current_quality_policy_3d = normalize_3d_quality_policy(
-            options, applied=(pipeline == "3D"),
+            options,
+            applied=(pipeline == "3D"),
         )
         self._active_preprocessing_options = options
         self._cached_3d_input = None
@@ -417,31 +593,75 @@ class Preprocessor:
 
         # Sort the images and masks for consistency
         image_files = sorted(image_files)
-        mask_files  = sorted(mask_files)
-        
+        mask_files = sorted(mask_files)
+
         # Preprocess
         self._current_stage = "processing"
+
         try:
             if pipeline == "Video":
-                main_logger.info(f"Using video pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
+                main_logger.info(
+                    f"Using video pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}"
+                )
                 metadata = self.preprocess_video(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes
+                    sub_name,
+                    image_files,
+                    mask_files,
+                    modality_key,
+                    img_out_dir,
+                    mask_out_dir,
+                    composite_id,
+                    group_bbox,
+                    mask_classes,
                 )
             elif pipeline == "3D":
-                main_logger.info(f"Using 3D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
+                main_logger.info(
+                    f"Using 3D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}"
+                )
                 metadata = self.preprocess_3d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
+                    sub_name,
+                    image_files,
+                    mask_files,
+                    modality_key,
+                    img_out_dir,
+                    mask_out_dir,
+                    composite_id,
+                    group_bbox,
+                    mask_classes,
+                    options,
                 )
             elif pipeline == "2D":
-                main_logger.info(f"Using 2D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}")
+                main_logger.info(
+                    f"Using 2D pipeline for group: {len(image_files)} images, {len(mask_files)} masks, modality={modality}"
+                )
                 metadata = self.preprocess_2d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
+                    sub_name,
+                    image_files,
+                    mask_files,
+                    modality_key,
+                    img_out_dir,
+                    mask_out_dir,
+                    composite_id,
+                    group_bbox,
+                    mask_classes,
+                    options,
                 )
             else:
-                main_logger.warning(f"Pipeline either unrecognized or not implemented: {pipeline} with type {type(pipeline)}")
+                main_logger.warning(
+                    f"Pipeline either unrecognized or not implemented: {pipeline} with type {type(pipeline)}"
+                )
                 main_logger.warning("Defaulting to 2D preprocessing.")
                 metadata = self.preprocess_2d(
-                    sub_name, image_files, mask_files, modality_key, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, options
+                    sub_name,
+                    image_files,
+                    mask_files,
+                    modality_key,
+                    img_out_dir,
+                    mask_out_dir,
+                    composite_id,
+                    group_bbox,
+                    mask_classes,
+                    options,
                 )
         except Exception as e:
             main_logger.error(f"Error in preprocess_group: {e}", exc_info=True)
@@ -454,46 +674,98 @@ class Preprocessor:
 
         # Log and return
         main_logger.info(f"Completed preprocessing group for modality {modality}")
-        
+
         qc = tracking["qc"]
         main_logger.info(
             "QC summary: 2D kept=%d rejected=%d; 3D kept=%d rejected=%d; empty=%d",
-            qc["components_2d_found"] - qc["components_2d_rejected"], qc["components_2d_rejected"],
-            qc["components_3d_found"] - qc["components_3d_rejected"], qc["components_3d_rejected"],
+            qc["components_2d_found"] - qc["components_2d_rejected"],
+            qc["components_2d_rejected"],
+            qc["components_3d_found"] - qc["components_3d_rejected"],
+            qc["components_3d_rejected"],
             qc["empty_masks"],
         )
+
         return metadata
-    
+
     def _mask_stem_for_strategy(self, path, strategy):
+        """
+        Derive the matching source stem for a configured 2D mask strategy.
+
+        Args:
+            path (str | pathlib.Path): Source mask path from which the pairing stem is
+                extracted.
+            strategy (str): Configured source-stem matching strategy for 2D image/mask
+                pairing.
+
+        Returns:
+            str | None: Complete or underscore-trimmed stem, or None when stem matching
+                is disabled.
+        """
         stem = Path(path).stem
         if strategy == "stem":
             return stem
         if strategy == "stem_before_underscore":
             return stem.split("_")[0]
+
         return None
 
-    def _order_mask_series_like_dicom_images(self, image_series, mask_series, preprocessing_options):
-        if (
-            preprocessing_options.get("dicom_sort") != "position"
-            or len(image_series) != len(mask_series)
-        ):
+    def _order_mask_series_like_dicom_images(
+        self, image_series, mask_series, preprocessing_options
+    ):
+        """
+        Reorder mask slices to match geometry-sorted DICOM image slices when applicable.
+
+        Args:
+            image_series (list[str]): Image paths whose DICOM geometry determines slice
+                order.
+            mask_series (list[str]): Mask paths to align with the ordered image slices.
+            preprocessing_options (dict): Effective group options; dicom_sort=position
+                enables geometry-based alignment.
+
+        Returns:
+            list[str]: Mask paths in matching slice order, or the original order when
+                pairing is unavailable.
+        """
+        if preprocessing_options.get("dicom_sort") != "position" or len(
+            image_series
+        ) != len(mask_series):
             return list(mask_series)
 
         image_exts = [get_extension(p).lower() for p in image_series]
-        if not image_exts or not all(ext in ('.dcm', '.dicom') for ext in image_exts):
+        if not image_exts or not all(ext in (".dcm", ".dicom") for ext in image_exts):
             return list(mask_series)
 
         try:
-            order = sorted(range(len(image_series)), key=lambda i: _dicom_slice_key(image_series[i]))
+            order = sorted(
+                range(len(image_series)),
+                key=lambda i: _dicom_slice_key(image_series[i]),
+            )
         except Exception as exc:
-            self.dataset_logger.warning(f"Could not align mask series to DICOM image order: {exc}")
+            self.dataset_logger.warning(
+                f"Could not align mask series to DICOM image order: {exc}"
+            )
             return list(mask_series)
 
         if order != list(range(len(image_series))):
-            self.dataset_logger.info("Reordered mask series to match DICOM image position order.")
+            self.dataset_logger.info(
+                "Reordered mask series to match DICOM image position order."
+            )
+
         return [mask_series[i] for i in order]
 
-    def preprocess_2d(self, sub_name, image_files, mask_files, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, preprocessing_options=None):
+    def preprocess_2d(
+        self,
+        sub_name,
+        image_files,
+        mask_files,
+        modality,
+        img_out_dir,
+        mask_out_dir,
+        composite_id,
+        group_bbox,
+        mask_classes,
+        preprocessing_options=None,
+    ):
         """
         Preprocess a batch of 2D masks and images using a shared bounding box.
 
@@ -517,14 +789,18 @@ class Preprocessor:
 
         Args:
             sub_name (str): Identifier for the subdataset.
-            image_files (list of str): Paths to the 2D image files.
-            mask_files (list of str): Paths to the mask files.
-            modality (str): Lowercase modality key for normalization, e.g. 'ct', 'mri', 'ultrasound'.
+            image_files (list[str]): Paths to the 2D image files.
+            mask_files (list[str]): Paths to the mask files.
+            modality (str): Lowercase modality key for normalization, e.g. 'ct', 'mri',
+                'ultrasound'.
             img_out_dir (str): Directory to save preprocessed images.
             mask_out_dir (str): Directory to save preprocessed masks.
             composite_id (str): Unique identifier for naming output files.
             group_bbox (tuple): (min_row, max_row, min_col, max_col) bounding box.
-            mask_classes (list): List of mask class definitions used by match_mask_class.
+            mask_classes (dict[str, dict[str, str]] | None): Subdataset names mapped to
+                class-to-rule dictionaries for target matching.
+            preprocessing_options (dict | None): Optional group-level preprocessing
+                overrides.
 
         Returns:
             dict: Metadata containing:
@@ -537,14 +813,23 @@ class Preprocessor:
 
         preprocessing_options = preprocessing_options or DEFAULT_PREPROCESSING_OPTIONS
         mask_stem_strategy = preprocessing_options.get("mask_stem_strategy", "none")
-        save_with_source_stem = bool(preprocessing_options.get("save_2d_masks_with_source_stem"))
-        skip_unmatched_images = bool(preprocessing_options.get("skip_unmatched_2d_images"))
+        save_with_source_stem = bool(
+            preprocessing_options.get("save_2d_masks_with_source_stem")
+        )
+        skip_unmatched_images = bool(
+            preprocessing_options.get("skip_unmatched_2d_images")
+        )
 
         # Collect mask stems that passed the size filter when configured.
         valid_mask_stems = set()
 
         # 1) Mask loop
-        for i, msk_path in enumerate(tqdm(mask_files, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D masks...")):
+        for i, msk_path in enumerate(
+            tqdm(
+                mask_files,
+                desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D masks...",
+            )
+        ):
             self.dataset_logger.info(f"Loading mask {msk_path}")
             mask_arr, header, palette = self.load_mask(msk_path)
             components_found_before = self._current_qc["components_2d_found"]
@@ -560,26 +845,55 @@ class Preprocessor:
                     resized_mask = self._resize(cropped_mask, is_mask=True)
 
                     comps = []
+
                     for lbl, binary in self._split_multiclass_mask(resized_mask):
                         for comp_bin in self._split_connected_components(binary):
                             # Re-label the component pixels with the original class label
-                            comp = (comp_bin > 0).astype(self.xp.int32) * int(lbl)                        
-                            self.dataset_logger.debug(f"Unique values in component: {self.xp.unique(comp)}")
+                            comp = (comp_bin > 0).astype(self.xp.int32) * int(lbl)
+                            self.dataset_logger.debug(
+                                f"Unique values in component: {self.xp.unique(comp)}"
+                            )
                             comps.append(comp)
+
                     filtered = self._filter_small_components(comps)
 
                     if not filtered:
-                        self.dataset_logger.warning(f"No significant components in slice {z} of mask {msk_path}")
+                        self.dataset_logger.warning(
+                            f"No significant components in slice {z} of mask {msk_path}"
+                        )
                         continue
 
                     for j, comp in enumerate(filtered):
-                        cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
-                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem, pairing_index=z)
+                        cls = match_mask_class(
+                            msk_path,
+                            comp,
+                            mask_classes,
+                            sub_name,
+                            palette,
+                            self.dataset_logger,
+                            self.background_value,
+                        )
+                        self._save_mask(
+                            comp,
+                            "2d",
+                            0,
+                            i,
+                            j,
+                            composite_id,
+                            mask_out_dir,
+                            cls,
+                            Path(msk_path).stem,
+                            pairing_index=z,
+                        )
                         del comp
+
                     del filtered, comps, resized_mask, cropped_mask
+
                 del vol
                 self._log_2d_component_summary(
-                    msk_path, components_found_before, components_rejected_before,
+                    msk_path,
+                    components_found_before,
+                    components_rejected_before,
                 )
 
             # Truly 2D mask case
@@ -588,27 +902,40 @@ class Preprocessor:
                 resized_mask = self._resize(cropped_mask, is_mask=True)
 
                 comps = []
+
                 for lbl, binary in self._split_multiclass_mask(resized_mask):
                     for comp_bin in self._split_connected_components(binary):
                         # Re-label the component pixels with the original class label
                         comp = (comp_bin > 0).astype(self.xp.int32) * int(lbl)
-                        self.dataset_logger.debug(f"Unique values in component: {self.xp.unique(comp)}")
+                        self.dataset_logger.debug(
+                            f"Unique values in component: {self.xp.unique(comp)}"
+                        )
                         comps.append(comp)
+
                 filtered = self._filter_small_components(comps)
 
                 if not filtered:
-                    self.dataset_logger.warning(f"No significant components found in mask {msk_path}")
+                    self.dataset_logger.warning(
+                        f"No significant components found in mask {msk_path}"
+                    )
                     self._log_2d_component_summary(
-                        msk_path, components_found_before, components_rejected_before,
+                        msk_path,
+                        components_found_before,
+                        components_rejected_before,
                     )
                     continue
 
                 valid_stem = self._mask_stem_for_strategy(msk_path, mask_stem_strategy)
                 if valid_stem is not None:
                     valid_mask_stems.add(valid_stem)
+
                 pairing_idx = next(
-                    (image_idx for image_idx, image_path in enumerate(image_files)
-                     if self._mask_stem_for_strategy(image_path, mask_stem_strategy) == valid_stem),
+                    (
+                        image_idx
+                        for image_idx, image_path in enumerate(image_files)
+                        if self._mask_stem_for_strategy(image_path, mask_stem_strategy)
+                        == valid_stem
+                    ),
                     None,
                 )
                 if pairing_idx is None and len(image_files) == 1:
@@ -619,35 +946,73 @@ class Preprocessor:
                     self._record_reason("unmatched_2d_mask")
                     self.dataset_logger.warning(
                         "No image stem matched 2D mask %s; skipping the mask "
-                        "instead of assigning it to image 0.", msk_path,
+                        "instead of assigning it to image 0.",
+                        msk_path,
                     )
                     del filtered, comps, resized_mask, cropped_mask, mask_arr
                     self._log_2d_component_summary(
-                        msk_path, components_found_before, components_rejected_before,
+                        msk_path,
+                        components_found_before,
+                        components_rejected_before,
                     )
                     continue
 
                 for j, comp in enumerate(filtered):
-                    cls = match_mask_class(msk_path, comp, mask_classes, sub_name, palette, self.dataset_logger, self.background_value)
+                    cls = match_mask_class(
+                        msk_path,
+                        comp,
+                        mask_classes,
+                        sub_name,
+                        palette,
+                        self.dataset_logger,
+                        self.background_value,
+                    )
                     if save_with_source_stem:
-                        self._save_mask(comp, '2d', 0, i, j, composite_id, mask_out_dir, cls, Path(msk_path).stem, pairing_index=pairing_idx)
+                        self._save_mask(
+                            comp,
+                            "2d",
+                            0,
+                            i,
+                            j,
+                            composite_id,
+                            mask_out_dir,
+                            cls,
+                            Path(msk_path).stem,
+                            pairing_index=pairing_idx,
+                        )
                     else:
                         img_idx = self.get_matching_image_idx(composite_id, image_files)
                         # Filename formatting is independent from the explicit
                         # image-mask relationship. Keep the legacy filename
                         # index while recording the stem-matched image index.
                         self._save_mask(
-                            comp, '2d', img_idx, i, j, composite_id,
-                            mask_out_dir, cls, pairing_index=pairing_idx,
+                            comp,
+                            "2d",
+                            img_idx,
+                            i,
+                            j,
+                            composite_id,
+                            mask_out_dir,
+                            cls,
+                            pairing_index=pairing_idx,
                         )
+
                     del comp
+
                 del filtered, comps, resized_mask, cropped_mask, mask_arr
                 self._log_2d_component_summary(
-                    msk_path, components_found_before, components_rejected_before,
+                    msk_path,
+                    components_found_before,
+                    components_rejected_before,
                 )
 
         # 2) Image loop
-        for i, img_path in enumerate(tqdm(image_files, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D images...")):
+        for i, img_path in enumerate(
+            tqdm(
+                image_files,
+                desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 2D images...",
+            )
+        ):
             if skip_unmatched_images:
                 stem = Path(img_path).stem
                 if stem not in valid_mask_stems:
@@ -661,6 +1026,7 @@ class Preprocessor:
                 vol = image_arr
                 n_slices = vol.shape[0]
                 normalized_mri_volume = None
+
                 if modality == "mri":
                     r0, r1, c0, c1 = group_bbox
                     normalized_mri_volume = self._normalize_mri_volume(
@@ -674,15 +1040,27 @@ class Preprocessor:
                         slice_img = vol[z]
                         cropped_img = self._crop(slice_img, group_bbox)
                         norm_img = self._normalize_intensity(
-                            cropped_img, modality, use_central_region=self.is_significant_crop
+                            cropped_img,
+                            modality,
+                            use_central_region=self.is_significant_crop,
                         )
+
                     resized_img = self._resize(norm_img, is_mask=False)
                     final_img = self._ensure_three_channels(resized_img)
 
-                    self._save_image(final_img, '2d', 0, composite_id, img_out_dir, f"modality{z}", pairing_index=z)
+                    self._save_image(
+                        final_img,
+                        "2d",
+                        0,
+                        composite_id,
+                        img_out_dir,
+                        f"modality{z}",
+                        pairing_index=z,
+                    )
                     del final_img, resized_img, norm_img, cropped_img
                 if normalized_mri_volume is not None:
                     del normalized_mri_volume
+
                 del vol
 
             # Truly 2D image case
@@ -694,7 +1072,7 @@ class Preprocessor:
                 resized_img = self._resize(norm_img, is_mask=False)
                 final_img = self._ensure_three_channels(resized_img)
 
-                self._save_image(final_img, '2d', i, composite_id, img_out_dir)
+                self._save_image(final_img, "2d", i, composite_id, img_out_dir)
                 del final_img, resized_img, norm_img, cropped_img, image_arr
 
         metadata = {"modality": modality, "resize_shape": self.target_size}
@@ -702,9 +1080,22 @@ class Preprocessor:
         main_logger.info(
             f"Completed 2D batch preprocessing: {len(image_files)} images, {len(mask_files)} masks"
         )
+
         return metadata
 
-    def preprocess_3d(self, sub_name, image_series, mask_series, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes, preprocessing_options=None):
+    def preprocess_3d(
+        self,
+        sub_name,
+        image_series,
+        mask_series,
+        modality,
+        img_out_dir,
+        mask_out_dir,
+        composite_id,
+        group_bbox,
+        mask_classes,
+        preprocessing_options=None,
+    ):
         """
         Preprocess a batch of 3D volumes and their masks using a shared bounding box.
 
@@ -724,14 +1115,18 @@ class Preprocessor:
 
         Args:
             sub_name (str): Identifier for the subdataset.
-            image_series (str or list of str): Path(s) to the 3D image series.
-            mask_series (str or list of str): Path(s) to the corresponding mask series.
-            modality (str): Lowercase modality key for normalization, e.g. 'ct' or 'mri'.
+            image_series (str | list[str]): Path(s) to the 3D image series.
+            mask_series (str | list[str]): Path(s) to the corresponding mask series.
+            modality (str): Lowercase modality key for normalization, e.g. 'ct' or
+                'mri'.
             img_out_dir (str): Directory to save preprocessed image NIfTIs.
             mask_out_dir (str): Directory to save preprocessed mask NIfTIs.
             composite_id (str): Unique identifier used for naming output files.
             group_bbox (tuple): (z0, z1, y0, y1, x0, x1) bounding box coordinates.
-            mask_classes (list): List of mask class definitions for match_mask_class.
+            mask_classes (dict[str, dict[str, str]] | None): Subdataset names mapped to
+                class-to-rule dictionaries for target matching.
+            preprocessing_options (dict | None): Optional group-level preprocessing
+                overrides.
 
         Returns:
             dict: Metadata including:
@@ -754,10 +1149,13 @@ class Preprocessor:
 
         # 1) Load image volume and metadata (SimpleITK image)
         cache_key = tuple(sorted(str(path) for path in image_series))
+
         if self._cached_3d_input and self._cached_3d_input[0] == cache_key:
             img_vol, img_itk = self._cached_3d_input[1], self._cached_3d_input[2]
             self._cached_3d_input = None
-            self.dataset_logger.debug("Reusing image volume loaded for 3D bounding-box calculation")
+            self.dataset_logger.debug(
+                "Reusing image volume loaded for 3D bounding-box calculation"
+            )
         else:
             img_vol, img_itk = self.load_image(image_series)
 
@@ -769,12 +1167,15 @@ class Preprocessor:
         mask_itk_list = []
 
         # Multi-modality case (img_vol is a list of numpy volumes, img_itk is a list of ITK images)
-        if isinstance(img_vol, list) and all(isinstance(v, self.xp.ndarray) for v in img_vol):
+        if isinstance(img_vol, list) and all(
+            isinstance(v, self.xp.ndarray) for v in img_vol
+        ):
             # Load mask as a single SimpleITK volume, matching the first modality's geometry
             msk_vol, msk_itk, _ = self.load_mask(mask_series)
             if msk_vol.ndim == 2:
                 msk_vol = msk_vol[self.xp.newaxis, ...]
                 msk_itk = sitk.GetImageFromArray(self._as_numpy(msk_vol))
+
             mask_itk_list.append(msk_itk)
 
             # Build image_itk_list and image_array_list from each modality
@@ -788,7 +1189,8 @@ class Preprocessor:
         elif (
             isinstance(mask_series, (list, tuple))
             and len(mask_series) > 1
-            and preprocessing_options.get("mask_series_strategy") == "split_unique_labels"
+            and preprocessing_options.get("mask_series_strategy")
+            == "split_unique_labels"
         ):
             ordered_mask_series = self._order_mask_series_like_dicom_images(
                 image_series,
@@ -797,20 +1199,25 @@ class Preprocessor:
             )
             mask_slices = []
             for mpath in ordered_mask_series:
-                raw, header = self.load_image(mpath)     # raw grayscale (0–255)
+                raw, header = self.load_image(mpath)  # raw grayscale (0–255)
                 mask_slices.append(self.xp.asarray(raw))
+
             chaos_vol = self.xp.stack(mask_slices, axis=0)
 
             # Build a single global map
             unique_vals = self.xp.unique(chaos_vol)
             unique_vals = unique_vals[unique_vals != self.background_value]
             uniq_sorted = self.xp.sort(unique_vals)
-            global_map = {int(v): i+1 for i, v in enumerate(uniq_sorted)}
+            global_map = {int(v): i + 1 for i, v in enumerate(uniq_sorted)}
 
             # Split & save
             for orig_val, lbl in global_map.items():
                 bin_vol = self.xp.asarray(chaos_vol == orig_val).astype(self.xp.uint8)
-                bin_np = self.xp.asnumpy(bin_vol * lbl) if config.GPU_ENABLED else self.xp.array(bin_vol * lbl)
+                bin_np = (
+                    self.xp.asnumpy(bin_vol * lbl)
+                    if config.GPU_ENABLED
+                    else self.xp.array(bin_vol * lbl)
+                )
                 itk_lbl = sitk.GetImageFromArray(bin_np)
                 itk_lbl.CopyInformation(img_itk)
                 mask_itk_list.append(itk_lbl)
@@ -821,13 +1228,16 @@ class Preprocessor:
         # Generic DICOM-series masks or single 3D file
         else:
             exts = [get_extension(p).lower() for p in mask_series]
-            if all(ext in {'.dcm', '.dicom'} for ext in exts):
-                sop = pydicom.dcmread(mask_series[0], stop_before_pixels=True).SOPClassUID
-                if sop == "1.2.840.10008.5.1.4.1.1.66.4":   # DICOM-SEG
+            if all(ext in {".dcm", ".dicom"} for ext in exts):
+                sop = pydicom.dcmread(
+                    mask_series[0], stop_before_pixels=True
+                ).SOPClassUID
+                if sop == "1.2.840.10008.5.1.4.1.1.66.4":  # DICOM-SEG
                     # 1) Build a mapping from CT SOPInstanceUID to the loaded slice order
                     ordered_ct_paths = list(image_series)
                     if preprocessing_options.get("dicom_sort") == "position":
                         ordered_ct_paths.sort(key=_dicom_slice_key)
+
                     ct_uids = [
                         pydicom.dcmread(path, stop_before_pixels=True).SOPInstanceUID
                         for path in ordered_ct_paths
@@ -836,33 +1246,45 @@ class Preprocessor:
                     # 2) Create a full-zero volume matching CT depth/shape
                     depth = len(ct_uids)
                     height = img_itk.GetHeight()
-                    width  = img_itk.GetWidth()
-                    full_vol = self.xp.zeros((depth, height, width), dtype=self.xp.uint8)
+                    width = img_itk.GetWidth()
+                    full_vol = self.xp.zeros(
+                        (depth, height, width), dtype=self.xp.uint8
+                    )
 
                     # 3) Insert each SEG slice into its proper z-location
                     for mp in mask_series:
                         ds_seg = pydicom.dcmread(mp, force=True)
-                        ref_uid = ds_seg.PerFrameFunctionalGroupsSequence[0] \
-                                         .DerivationImageSequence[0] \
-                                         .SourceImageSequence[0] \
-                                         .ReferencedSOPInstanceUID
+                        ref_uid = (
+                            ds_seg.PerFrameFunctionalGroupsSequence[0]
+                            .DerivationImageSequence[0]
+                            .SourceImageSequence[0]
+                            .ReferencedSOPInstanceUID
+                        )
                         z_idx = ct_uids.index(ref_uid)
-                        seg_itk = sitk.ReadImage(mp) # read as 2D mask
+                        seg_itk = sitk.ReadImage(mp)  # read as 2D mask
                         seg_arr = sitk.GetArrayFromImage(seg_itk)
+
                         if seg_arr.ndim == 3 and seg_arr.shape[0] == 1:
                             seg_arr = seg_arr[0]
+
                         full_vol[z_idx] = seg_arr.astype(self.xp.uint8)
 
-                    # 4) Wrap back into ITK and copy CT metadata safely 
-                    msk_itk = sitk.GetImageFromArray(self.xp.asnumpy(full_vol) if config.GPU_ENABLED else full_vol)
+                    # 4) Wrap back into ITK and copy CT metadata safely
+                    msk_itk = sitk.GetImageFromArray(
+                        self.xp.asnumpy(full_vol) if config.GPU_ENABLED else full_vol
+                    )
                     msk_itk.CopyInformation(img_itk)
                 else:
                     # Fallback for non-SEG DICOM masks
                     msk_vol, msk_itk, _ = self.load_mask(mask_series)
                     if msk_vol.ndim == 2:
                         msk_vol = msk_vol[self.xp.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(self.xp.asnumpy(msk_vol) if config.GPU_ENABLED else msk_vol)
+                        msk_itk = sitk.GetImageFromArray(
+                            self.xp.asnumpy(msk_vol) if config.GPU_ENABLED else msk_vol
+                        )
+
                     msk_itk.CopyInformation(img_itk)
+
                 mask_itk_list.append(msk_itk)
             else:
                 # Load each mask volume from the list of paths
@@ -870,7 +1292,10 @@ class Preprocessor:
                     msk_vol, msk_itk, _ = self.load_mask(mpath)
                     if msk_vol.ndim == 2:
                         msk_vol = msk_vol[self.xp.newaxis, ...]
-                        msk_itk = sitk.GetImageFromArray(self.xp.asnumpy(msk_vol) if config.GPU_ENABLED else msk_vol)
+                        msk_itk = sitk.GetImageFromArray(
+                            self.xp.asnumpy(msk_vol) if config.GPU_ENABLED else msk_vol
+                        )
+
                     mask_itk_list.append(msk_itk)
 
             image_itk_list.append(img_itk)
@@ -880,6 +1305,7 @@ class Preprocessor:
         self._current_stage = "resample"
         resampled_mask_itk_list = []
         reference_itk = image_itk_list[0]
+
         for msk_itk in mask_itk_list:
             same_geometry = (
                 msk_itk.GetSize() == reference_itk.GetSize()
@@ -889,10 +1315,15 @@ class Preprocessor:
             )
             if same_geometry:
                 resampled_mask_itk_list.append(msk_itk)
-                self.dataset_logger.debug("Mask geometry already matches the image; skipping resampling")
+                self.dataset_logger.debug(
+                    "Mask geometry already matches the image; skipping resampling"
+                )
             else:
                 resampled = sitk.Resample(
-                    msk_itk, reference_itk, sitk.Transform(), sitk.sitkNearestNeighbor,
+                    msk_itk,
+                    reference_itk,
+                    sitk.Transform(),
+                    sitk.sitkNearestNeighbor,
                     defaultPixelValue=self.background_value,
                 )
                 resampled_mask_itk_list.append(resampled)
@@ -903,7 +1334,9 @@ class Preprocessor:
         orig_org = reference_itk.GetOrigin()
         orig_dir = reference_itk.GetDirection()
 
-        for m_idx, (mod_itk, mod_array) in enumerate(zip(image_itk_list, image_array_list)):
+        for m_idx, (mod_itk, mod_array) in enumerate(
+            zip(image_itk_list, image_array_list)
+        ):
             img_crop = mod_array[z0:z1, y0:y1, x0:x1]
 
             target_h, target_w = self.target_size
@@ -911,10 +1344,14 @@ class Preprocessor:
                 (img_crop.shape[0], target_h, target_w), dtype=self.xp.float32
             )
             normalized_volume = None
+
             if modality == "ct":
                 profile = self._active_ct_profile
                 if profile is None:
-                    raise CTProfileError("CT volume normalization requires an active subdataset profile")
+                    raise CTProfileError(
+                        "CT volume normalization requires an active subdataset profile"
+                    )
+
                 normalized_volume = self.xp.asarray(img_crop, dtype=self.xp.float32)
                 normalized_volume = self.xp.clip(
                     normalized_volume, profile.window_lower, profile.window_upper
@@ -930,13 +1367,19 @@ class Preprocessor:
                     norm_img = normalized_volume[idx]
                 else:
                     norm_img = self._normalize_intensity(
-                        img_crop[idx], modality,
-                        use_central_region=self.is_significant_crop
+                        img_crop[idx],
+                        modality,
+                        use_central_region=self.is_significant_crop,
                     )
+
                 resized_img = self._resize(norm_img, is_mask=False)
                 img_processed_vol[idx] = resized_img
 
-            image_nifti = sitk.GetImageFromArray(self.xp.asnumpy(img_processed_vol) if config.GPU_ENABLED else img_processed_vol)
+            image_nifti = sitk.GetImageFromArray(
+                self.xp.asnumpy(img_processed_vol)
+                if config.GPU_ENABLED
+                else img_processed_vol
+            )
             new_spacing_img = (
                 orig_sp[0] * (x1 - x0) / self.target_size[0],
                 orig_sp[1] * (y1 - y0) / self.target_size[1],
@@ -951,14 +1394,22 @@ class Preprocessor:
             image_nifti.SetOrigin(new_origin_img)
             image_nifti.SetDirection(orig_dir)
 
-            img_path = self._save_image(image_nifti, '3d', m_idx, composite_id, img_out_dir, f"modality{m_idx}")
+            img_path = self._save_image(
+                image_nifti, "3d", m_idx, composite_id, img_out_dir, f"modality{m_idx}"
+            )
             image_paths.append(img_path)
+
             if normalized_volume is not None:
                 del normalized_volume
 
         # 4) Process each resampled mask: crop, resize, split components or labels, save
         self._current_stage = "processing"
-        for idx, msk_itk_res in enumerate(tqdm(resampled_mask_itk_list, desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 3D masks")):
+        for idx, msk_itk_res in enumerate(
+            tqdm(
+                resampled_mask_itk_list,
+                desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing 3D masks",
+            )
+        ):
             # (a) Convert to numpy and crop
             mask_array = sitk.GetArrayFromImage(msk_itk_res).astype(self.xp.int32)
             mask_crop = mask_array[z0:z1, y0:y1, x0:x1]
@@ -968,6 +1419,7 @@ class Preprocessor:
             mask_processed_vol = self.xp.empty(
                 (mask_crop.shape[0], target_h, target_w), dtype=self.xp.int32
             )
+
             for sidx in range(mask_crop.shape[0]):
                 slice_mask = mask_crop[sidx]
                 resized_mask = self._resize(slice_mask, is_mask=True)
@@ -976,7 +1428,11 @@ class Preprocessor:
             # (c) Build a SimpleITK image from the resized mask (either uint8 or int32 may be used;
             # casting to uint8 here is necessary for ConnectedComponent to work as it must be binary,
             # while mask_processed_vol remains int32 for label checking):
-            mask_nifti_raw = sitk.GetImageFromArray(self.xp.asnumpy(mask_processed_vol.astype(self.xp.uint8)) if config.GPU_ENABLED else mask_processed_vol.astype(self.xp.uint8))
+            mask_nifti_raw = sitk.GetImageFromArray(
+                self.xp.asnumpy(mask_processed_vol.astype(self.xp.uint8))
+                if config.GPU_ENABLED
+                else mask_processed_vol.astype(self.xp.uint8)
+            )
             mask_nifti_raw.SetSpacing(new_spacing_img)
             mask_nifti_raw.SetOrigin(new_origin_img)
             mask_nifti_raw.SetDirection(orig_dir)
@@ -994,30 +1450,47 @@ class Preprocessor:
 
             # Multi-class: one volume per original label
             if not (len(unique_labels) == 2 and set(unique_labels) == {0, 1}):
-                self.dataset_logger.info(f"Multi-class mask detected in mask index {idx}")
+                self.dataset_logger.info(
+                    f"Multi-class mask detected in mask index {idx}"
+                )
                 for lbl in unique_labels:
                     if lbl == 0:
                         continue
+
                     vol = (mask_processed_vol == lbl).astype(self.xp.int32) * int(lbl)
                     label_items.append((vol, int(lbl), mask_series[0]))
 
             # Pure binary + multi-file: each file is one mask
-            elif isinstance(mask_series, (list, tuple)) and len(mask_series) > 1 and get_extension(mask_series[0]) in ('.nii', '.nii.gz'):
+            elif (
+                isinstance(mask_series, (list, tuple))
+                and len(mask_series) > 1
+                and get_extension(mask_series[0]) in (".nii", ".nii.gz")
+            ):
                 self.dataset_logger.info(f"Binary mask #{idx} in multi-file series")
-                bin_vol = (mask_processed_vol != self.background_value).astype(self.xp.int32)
-                label_items.append((bin_vol * (idx+1), idx+1, mask_series[idx]))
+                bin_vol = (mask_processed_vol != self.background_value).astype(
+                    self.xp.int32
+                )
+                label_items.append((bin_vol * (idx + 1), idx + 1, mask_series[idx]))
 
             # Pure binary, single file
             else:
-                self.dataset_logger.info(f"Pure binary mask detected in mask index {idx}")
-                bin_vol = (mask_processed_vol != self.background_value).astype(self.xp.int32)
+                self.dataset_logger.info(
+                    f"Pure binary mask detected in mask index {idx}"
+                )
+                bin_vol = (mask_processed_vol != self.background_value).astype(
+                    self.xp.int32
+                )
                 label_items.append((bin_vol, 1, mask_series[0]))
 
             # 2) Run one connected-component + save routine over all items
             source_components_found = 0
             source_components_rejected = 0
             for vol_array, label_val, mask_ref in label_items:
-                itk_lbl = sitk.GetImageFromArray(self.xp.asnumpy(vol_array.astype(self.xp.uint8)) if config.GPU_ENABLED else vol_array.astype(self.xp.uint8))
+                itk_lbl = sitk.GetImageFromArray(
+                    self.xp.asnumpy(vol_array.astype(self.xp.uint8))
+                    if config.GPU_ENABLED
+                    else vol_array.astype(self.xp.uint8)
+                )
                 itk_lbl.CopyInformation(mask_nifti_raw)
 
                 self.dataset_logger.info("Splitting connected components…")
@@ -1033,26 +1506,40 @@ class Preprocessor:
                     int(size) for size in relabel_filter.GetSizeOfObjectsInPixels()
                 )
                 rejections = self._evaluate_3d_component_quality(
-                    relabeled, component_sizes, self._current_quality_policy_3d,
+                    relabeled,
+                    component_sizes,
+                    self._current_quality_policy_3d,
                 )
                 self._current_qc["components_3d_found"] += len(component_sizes)
                 source_components_found += len(component_sizes)
                 source_components_rejected += len(rejections)
+
                 for reason in rejections.values():
                     self._record_3d_component_rejection(reason)
 
-                cls = match_mask_class(mask_ref, vol_array, mask_classes, sub_name, logger=self.dataset_logger, background_value=self.background_value)
+                cls = match_mask_class(
+                    mask_ref,
+                    vol_array,
+                    mask_classes,
+                    sub_name,
+                    logger=self.dataset_logger,
+                    background_value=self.background_value,
+                )
                 for comp_idx in range(1, len(component_sizes) + 1):
                     if comp_idx in rejections:
                         continue
-                    self.dataset_logger.debug(f"Saving component {comp_idx} of class {cls}…")
+
+                    self.dataset_logger.debug(
+                        f"Saving component {comp_idx} of class {cls}…"
+                    )
                     comp_bin = sitk.Equal(relabeled, comp_idx)
                     comp_lbl = sitk.Cast(comp_bin, sitk.sitkInt32)
                     comp_lbl = sitk.Multiply(comp_lbl, int(label_val))
                     comp_lbl.CopyInformation(mask_nifti_raw)
 
                     path = self._save_mask(
-                        comp_lbl, '3d',
+                        comp_lbl,
+                        "3d",
                         img_idx=0,
                         mask_idx=idx,
                         comp_idx=comp_idx,
@@ -1060,33 +1547,49 @@ class Preprocessor:
                         out_dir=mask_out_dir,
                         class_tag=cls,
                         mask_tag=None,
-                        label_value=label_val
+                        label_value=label_val,
                     )
                     mask_paths.append(path)
-
 
             source_mask = mask_series[idx] if idx < len(mask_series) else mask_series[0]
             self.dataset_logger.info(
                 "3D component summary for mask %s: found=%d accepted=%d rejected=%d",
-                source_mask, source_components_found,
+                source_mask,
+                source_components_found,
                 source_components_found - source_components_rejected,
                 source_components_rejected,
             )
 
         # Unified return with metadata
         return {
-            "modality":     modality,
+            "modality": modality,
             "resize_shape": self.target_size,
-            "volume_shape": image_array_list[0].shape if isinstance(image_array_list[0], self.xp.ndarray) else None,
+            "volume_shape": (
+                image_array_list[0].shape
+                if isinstance(image_array_list[0], self.xp.ndarray)
+                else None
+            ),
             "image_niftis": image_paths,
-            "mask_niftis":  mask_paths,
-            "bbox":         group_bbox,
+            "mask_niftis": mask_paths,
+            "bbox": group_bbox,
         }
 
-    def preprocess_video(self, sub_name, video_paths, mask_paths, modality, img_out_dir, mask_out_dir, composite_id, group_bbox, mask_classes):
+    def preprocess_video(
+        self,
+        sub_name,
+        video_paths,
+        mask_paths,
+        modality,
+        img_out_dir,
+        mask_out_dir,
+        composite_id,
+        group_bbox,
+        mask_classes,
+    ):
         """
         Preprocess one or more video files and their corresponding mask videos (if any)
-        as a batch, applying a shared crop bounding box, and save only frames with valid masks.
+        as a batch, applying a shared crop bounding box, and save only frames with valid
+        masks.
 
         Steps:
         1. Load frames (+ fps) from the first video in 'video_paths'.
@@ -1110,15 +1613,16 @@ class Preprocessor:
         5. Clear intermediate tensors to free memory after each save.
 
         Args:
-            sub_name     (str): Subject name.
-            video_paths  (List[str]): Paths to video files (typically one).
-            mask_paths   (List[str]): Paths to mask videos (optional).
-            modality     (str): Normalized modality key.
-            img_out_dir  (str): Output directory for frames.
+            sub_name (str): Subject name.
+            video_paths (list[str]): Paths to video files (typically one).
+            mask_paths (list[str]): Paths to mask videos (optional).
+            modality (str): Normalized modality key.
+            img_out_dir (str): Output directory for frames.
             mask_out_dir (str): Output directory for masks.
             composite_id (str): Composite identifier for filename tagging.
-            group_bbox   (tuple): (min_row, max_row, min_col, max_col).
-            mask_classes (List[str]): List of mask classes and their corresponding rules.
+            group_bbox (tuple): (min_row, max_row, min_col, max_col).
+            mask_classes (dict[str, dict[str, str]] | None): Subdataset names mapped to
+                class-to-rule dictionaries for target matching.
 
         Returns:
             dict: Metadata, e.g. {fps, num_frames, modality, resize_shape}.
@@ -1128,6 +1632,7 @@ class Preprocessor:
 
         # 2) Load mask frames (if any)
         mask_frames = []
+
         if mask_paths:
             mask_frames, _, _ = self.load_mask(mask_paths[0])
 
@@ -1135,7 +1640,15 @@ class Preprocessor:
         frame_h, frame_w = frames[0].shape[:2]
         if mask_frames.shape[1:] != (frame_h, frame_w):
             mask_frames = [
-                cv2.resize(self.xp.asnumpy(m.astype(self.xp.uint8)) if config.GPU_ENABLED else m.astype(self.xp.uint8), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                cv2.resize(
+                    (
+                        self.xp.asnumpy(m.astype(self.xp.uint8))
+                        if config.GPU_ENABLED
+                        else m.astype(self.xp.uint8)
+                    ),
+                    (frame_w, frame_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
                 for m in mask_frames
             ]
 
@@ -1143,7 +1656,13 @@ class Preprocessor:
         num_frames = len(frames)
         components_found_before = self._current_qc["components_2d_found"]
         components_rejected_before = self._current_qc["components_2d_rejected"]
-        for idx, frame in enumerate(tqdm(frames, desc=f'[{self.dataset_name} - {sub_name}: {composite_id}] Processing frames')):
+
+        for idx, frame in enumerate(
+            tqdm(
+                frames,
+                desc=f"[{self.dataset_name} - {sub_name}: {composite_id}] Processing frames",
+            )
+        ):
             keep_frame = True
 
             # 4a) Process mask and decide whether to keep frame
@@ -1153,9 +1672,11 @@ class Preprocessor:
                     resized_m = self._resize(cropped_m, is_mask=True)
 
                     comps = []
+
                     for lbl, bin_mask in self._split_multiclass_mask(resized_m):
                         for comp in self._split_connected_components(bin_mask):
                             comps.append(comp)
+
                     filtered = self._filter_small_components(comps)
 
                     if not filtered:
@@ -1165,8 +1686,24 @@ class Preprocessor:
                         keep_frame = False
                     else:
                         for comp_idx, comp in enumerate(filtered):
-                            cls = match_mask_class(mask_paths[0], comp, mask_classes, sub_name, logger=self.dataset_logger, background_value=self.background_value)
-                            self._save_mask(comp, 'video', idx, 0, comp_idx, composite_id, mask_out_dir, cls)
+                            cls = match_mask_class(
+                                mask_paths[0],
+                                comp,
+                                mask_classes,
+                                sub_name,
+                                logger=self.dataset_logger,
+                                background_value=self.background_value,
+                            )
+                            self._save_mask(
+                                comp,
+                                "video",
+                                idx,
+                                0,
+                                comp_idx,
+                                composite_id,
+                                mask_out_dir,
+                                cls,
+                            )
                             del comp
 
                     del cropped_m, resized_m, comps, filtered
@@ -1186,28 +1723,32 @@ class Preprocessor:
             resized = self._resize(norm, is_mask=False)
             final = self._ensure_three_channels(resized)
 
-            self._save_image(final, 'video', idx, composite_id, img_out_dir)
+            self._save_image(final, "video", idx, composite_id, img_out_dir)
 
             del cropped, norm, resized, final
         if mask_paths:
             self._log_2d_component_summary(
-                mask_paths[0], components_found_before, components_rejected_before,
+                mask_paths[0],
+                components_found_before,
+                components_rejected_before,
             )
 
         metadata = {
             "fps": fps,
             "num_frames": num_frames,
             "modality": modality,
-            "resize_shape": self.target_size
+            "resize_shape": self.target_size,
         }
         main_logger.info(
             f"Completed video preprocessing: {len(frames)} frames at {fps} fps, {len(mask_frames)} masks"
         )
+
         return metadata
 
     def load_image(self, image_paths):
         """
-        Load image data from a file or series and return the image array(s) and header information.
+        Load image data from a file or series and return the image array(s) and header
+        information.
 
         Supports:
         1. DICOM series (list of .dcm or .dicom files) using SimpleITK ImageSeriesReader.
@@ -1217,12 +1758,14 @@ class Preprocessor:
         4. Single-file images (PNG, JPEG, TIFF, optionally .gz): returns a numpy array and the PIL info dict.
 
         Args:
-            image_paths (str or list of str): Path to an image file or a list of paths for a DICOM series.
+            image_paths (str | list[str]): Path to an image file or a list of paths for
+                a DICOM series.
 
         Returns:
-            tuple:
-                data (self.xp.ndarray or list of self.xp.ndarray): Image data array(s).
-                header (SimpleITK.Image or list of SimpleITK.Image or dict): 
+            tuple: Image array or modality arrays, and matching spatial headers or
+                raster metadata.
+                data (np.ndarray | cp.ndarray | list[np.ndarray | cp.ndarray]): Image data array(s).
+                header (SimpleITK.Image | list[SimpleITK.Image] | dict):
                     - For DICOM/volume inputs: a SimpleITK.Image or list of images.
                     - For multi-modality splits: a list of SimpleITK.Image objects.
                     - For single-file images: a dict of PIL image info.
@@ -1232,12 +1775,13 @@ class Preprocessor:
             paths = image_paths
         else:
             paths = [image_paths]
+
         self.dataset_logger.info(f"Loading image: {paths}")
         ext = get_extension(paths[0]).lower()
 
         try:
             # 1) DICOM series (multi-slice)
-            if len(paths) > 1 and ext in ('.dcm', '.dicom'):
+            if len(paths) > 1 and ext in (".dcm", ".dicom"):
                 # Sort by position projected onto the acquisition normal. Raw Z
                 # ordering reverses series whose slice direction points toward -Z.
                 if self._active_preprocessing_options.get("dicom_sort") == "position":
@@ -1248,10 +1792,11 @@ class Preprocessor:
                 reader.SetFileNames(paths)
                 img_itk = reader.Execute()
             # 2) Any numpy file
-            elif ext == '.npy':
+            elif ext == ".npy":
                 data_np = np.load(paths[0])
-                img_itk = sitk.GetImageFromArray(data_np) # SITK expects a NumPy array
+                img_itk = sitk.GetImageFromArray(data_np)  # SITK expects a NumPy array
                 data = self.xp.asarray(data_np)
+
                 return data, img_itk
             # 3) Any single-file volume (NIfTI, NRRD, MHD, or single-slice DICOM)
             elif ext in self.volume_exts:
@@ -1264,8 +1809,9 @@ class Preprocessor:
                     self.dataset_logger.info(f"Splitting 4D volume into 3D volumes")
                     vols = []
                     its = []
-                    size = list(img_itk.GetSize()) # shape (Z, Y, X, M)
+                    size = list(img_itk.GetSize())  # shape (Z, Y, X, M)
                     num_modalities = size[3]
+
                     for m in range(num_modalities):
                         # Extract a 3D SimpleITK volume for modality m
                         extract_size = [size[0], size[1], size[2], 0]
@@ -1275,23 +1821,26 @@ class Preprocessor:
                         vol3d = self.xp.array(vol3d_np)
                         vols.append(vol3d)
                         its.append(itk3d)
+
                     return vols, its
 
                 # Otherwise, return the single volume
                 return data, img_itk
             else:
                 # 4) Any single-file image (PNG, JPEG, TIFF, etc.)
-                opener = gzip.open if paths[0].lower().endswith('.gz') else open
-                with opener(paths[0], 'rb') as f:
+                opener = gzip.open if paths[0].lower().endswith(".gz") else open
+                with opener(paths[0], "rb") as f:
                     pil_img = Image.open(f)
                     data = self.xp.asarray(pil_img)
                     header = pil_img.info
+
                 return data, header
 
             # Convert SimpleITK volume to numpy
             data_np = sitk.GetArrayFromImage(img_itk)  # shape (Z, H, W) for volumes
             data = self.xp.asarray(data_np)
             header = img_itk
+
             return data, header
         except Exception as e:
             self.dataset_logger.error(f"Failed to load image: {paths} ({e})")
@@ -1299,7 +1848,8 @@ class Preprocessor:
 
     def load_mask(self, mask_path):
         """
-        Load mask data from a file, series, or .mat file and return a mask array, header, and palette.
+        Load mask data from a file, series, or .mat file and return a mask array,
+        header, and palette.
 
         Supports:
         1. list or tuple of paths: treated as a volume or DICOM series via load_image
@@ -1311,38 +1861,47 @@ class Preprocessor:
         7. single-channel arrays: detects multiclass or binary mask and returns a collapsed label map
 
         Args:
-            mask_path (str or list of str): Path or list of paths to the mask file(s).
+            mask_path (str | Sequence[str]): Single mask file path or a sequence of mask
+                slice paths.
 
         Returns:
-            tuple:
-                mask_array (self.xp.ndarray): 2D or 3D mask array with dtype int32
-                header (SimpleITK.Image or dict): Header or metadata returned by load_image, or empty dict for .mat
-                palette (dict or None): Mapping from original pixel values to label IDs for collapsed masks, or None if not applicable
+            tuple: Mask array, spatial header or metadata, and optional
+                original-value-to-label palette.
+                mask_array (np.ndarray | cp.ndarray): 2D or 3D mask array with dtype int32
+                header (SimpleITK.Image | dict): Header or metadata returned by load_image, or empty dict for .mat
+                palette (dict | None): Mapping from original pixel values to label IDs for collapsed masks, or None if not applicable
         """
         # Series of files -> delegate to load_image (handles DICOM series, NIfTI, etc.)
         if isinstance(mask_path, (list, tuple)):
             self.dataset_logger.info(f"Loading mask series: {mask_path}")
             raw, header = self.load_image(mask_path)
             mask = self.xp.rint(raw).astype(self.xp.int32)
+
             return mask, header, None
 
         self.dataset_logger.info(f"Loading mask: {mask_path!r}")
         ext = get_extension(mask_path).lower()
 
-        if ext == '.npy':
+        if ext == ".npy":
             raw_np = np.load(mask_path)
             msk_itk = sitk.GetImageFromArray(raw_np.astype(np.int32))
             mask = self.xp.asarray(raw_np)
             mask = self.xp.rint(mask).astype(self.xp.int32)
+
             return mask, msk_itk, None
 
         # .mat volume
-        if ext == '.mat':
+        if ext == ".mat":
             mat = scipy.io.loadmat(mask_path)
-            keys = [k for k in mat if not k.startswith('__')]
-            key = 'predicted' if 'predicted' in keys else 'inst_map' if 'inst_map' in keys else keys[0]
+            keys = [k for k in mat if not k.startswith("__")]
+            key = (
+                "predicted"
+                if "predicted" in keys
+                else "inst_map" if "inst_map" in keys else keys[0]
+            )
             mask = self.xp.rint(mat[key]).astype(self.xp.int32)
             self.dataset_logger.info(f"  -> .mat key='{key}', shape={mask.shape}")
+
             return mask, {}, None
 
         # All other formats via load_image
@@ -1356,7 +1915,10 @@ class Preprocessor:
         # 1) True-color or grayscale/indexed -> labels+palette
         try:
             lbl, palette = self._collapse_mask_to_labels(raw, self.background_value)
-            self.dataset_logger.info(f"  -> mask collapsed -> shape={lbl.shape}, palette={palette}")
+            self.dataset_logger.info(
+                f"  -> mask collapsed -> shape={lbl.shape}, palette={palette}"
+            )
+
             return lbl, header, palette
         except ValueError:
             self.dataset_logger.error(f"Unable to collapse mask of shape {raw.shape}")
@@ -1364,8 +1926,13 @@ class Preprocessor:
 
         # 2) Fallback for any other multi-channel (e.g. unusual C>4) -> binary
         if raw.ndim == 3:
-            lbl = self.xp.any(raw != self.background_value, axis=2).astype(self.xp.int32)
-            self.dataset_logger.info(f"  -> multi-channel any-nonzero -> shape={lbl.shape}")
+            lbl = self.xp.any(raw != self.background_value, axis=2).astype(
+                self.xp.int32
+            )
+            self.dataset_logger.info(
+                f"  -> multi-channel any-nonzero -> shape={lbl.shape}"
+            )
+
             return lbl, header, None
 
         # In any other case, raise
@@ -1379,12 +1946,13 @@ class Preprocessor:
             video_path (str): Path to the video file.
 
         Returns:
-            tuple:
-                frames (List[self.xp.ndarray]): List of HxWx3 RGB frames.
+            tuple: RGB frame arrays and the video's frame rate in frames per second.
+                frames (list[np.ndarray | cp.ndarray]): List of HxWx3 RGB frames.
                 fps (float): Frames per second of the video.
         """
         self.dataset_logger.info(f"Opening video: {video_path}")
         cap = cv2.VideoCapture(video_path)
+
         if not cap.isOpened():
             raise IOError(f"Cannot open video file {video_path}")
 
@@ -1410,27 +1978,30 @@ class Preprocessor:
 
         cap.release()
         self.dataset_logger.info(f"Loaded {len(frames)} frames at {fps} fps")
+
         return frames, fps
-    
+
     def _to_uint8(self, arr):
         """
         Scale [min,max] -> [0,255] and cast to uint8, with NaN/Inf -> 0.
 
         Args:
-            arr (self.xp.ndarray): Input array.
+            arr (np.ndarray | cp.ndarray): Input array.
 
         Returns:
-            self.xp.ndarray: Scaled and cast array.
+            np.ndarray | cp.ndarray: Scaled and cast array.
         """
         arr = self.xp.asarray(arr)
         a, b = self.xp.nanmin(arr), self.xp.nanmax(arr)
+
         if b > a:
             scaled = (arr - a) / (b - a)
         else:
             scaled = arr * 0
+
         scaled = self.xp.nan_to_num(scaled, nan=0, posinf=0, neginf=0)
         return (scaled * 255).astype(self.xp.uint8)
-    
+
     def _short_id(self, composite_id):
         """
         Generate a short identifier for a composite image using MD5.
@@ -1444,26 +2015,61 @@ class Preprocessor:
         return hashlib.md5(composite_id.encode()).hexdigest()[:8]
 
     def _track_image_output(self, path, mode, pairing_index):
-        """Record an image output while it is being written."""
-        self._current_images.append({
-            "path": path,
-            "pairing_index": int(pairing_index),
-            "dimension": 3 if mode == "3d" else 2,
-        })
+        """
+        Record an image output while it is being written.
+
+        Args:
+            path (str): Written image path to retain in the group output manifest.
+            mode (str): Preprocessing output mode, either 2d, 3d, or video.
+            pairing_index (int | None): Explicit processed-image index associated with
+                the output, if available.
+
+        Returns:
+            str: The supplied output path after tracking.
+        """
+        self._current_images.append(
+            {
+                "path": path,
+                "pairing_index": int(pairing_index),
+                "dimension": 3 if mode == "3d" else 2,
+            }
+        )
+
         return path
 
     def _track_mask_output(self, path, mode, pairing_index, class_tag):
-        """Record a mask output and its image relationship at write time."""
-        self._current_masks.append({
-            "path": path,
-            "class": class_tag,
-            "pairing_index": int(pairing_index),
-            "dimension": 3 if mode == "3d" else 2,
-        })
+        """
+        Record a mask output and its image relationship at write time.
+
+        Args:
+            path (str): Written mask path to retain with its image pairing and class.
+            mode (str): Preprocessing output mode, either 2d, 3d, or video.
+            pairing_index (int | None): Explicit processed-image index associated with
+                the output, if available.
+            class_tag (str): Target class label recorded for the mask.
+
+        Returns:
+            str: The supplied output path after tracking.
+        """
+        self._current_masks.append(
+            {
+                "path": path,
+                "class": class_tag,
+                "pairing_index": int(pairing_index),
+                "dimension": 3 if mode == "3d" else 2,
+            }
+        )
+
         return path
-    
+
     def _save_image(
-        self, img, mode, idx, composite_id, out_dir, image_tag=None,
+        self,
+        img,
+        mode,
+        idx,
+        composite_id,
+        out_dir,
+        image_tag=None,
         pairing_index=None,
     ):
         """
@@ -1472,18 +2078,22 @@ class Preprocessor:
         Uses configured output formats for 2D images, video frames, and 3D volumes.
 
         Args:
-            img (np.ndarray or sitk.Image): Image data to save.
+            img (np.ndarray | sitk.Image): Image data to save.
             mode (str): '2d', 'video', or '3d'.
             idx (int): Index of the image within the group.
             composite_id (str): Base identifier used to generate filenames.
             out_dir (str): Output directory.
-            image_tag (str, optional): Optional tag to append to filenames.
+            image_tag (str | None): Optional tag to append to filenames.
+            pairing_index (int | None): Explicit processed-image index associated with
+                the output, if available.
+
         Returns:
             str: Full path to the saved file.
         """
         self._current_stage = "write"
         pairing_index = idx if pairing_index is None else pairing_index
-        if mode == '3d':
+
+        if mode == "3d":
             # composite_id includes desired suffix (e.g., 'patient_image' or 'patient_modality0')
             sid = self._short_id(composite_id)
             ext = config.OUTPUT_FORMATS["3d_image"]
@@ -1497,11 +2107,13 @@ class Preprocessor:
                 config.OUTPUT_FILENAMES["separator"],
             )
             path = os.path.join(out_dir, filename)
+
             if isinstance(img, sitk.Image):
                 sitk.WriteImage(img, path)
             else:
                 img_np = self.xp.asnumpy(img) if config.GPU_ENABLED else img
                 sitk.WriteImage(sitk.GetImageFromArray(img_np), path)
+
             self.dataset_logger.info(f"Saved 3D image: {filename} to {out_dir}")
             return self._track_image_output(path, mode, pairing_index)
 
@@ -1520,23 +2132,38 @@ class Preprocessor:
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(img)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
+
         if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
             sitk.WriteImage(sitk.GetImageFromArray(arr8), path)
             self.dataset_logger.info(f"Saved 2D medical image: {filename} to {out_dir}")
+
             return self._track_image_output(path, mode, pairing_index)
+
         # DRIPP keeps color images in RGB order (PIL convention). OpenCV expects
         # BGR when writing raster images, so convert only at this boundary.
-        raster_arr = cv2.cvtColor(arr8, cv2.COLOR_RGB2BGR) if (
-            arr8.ndim == 3 and arr8.shape[2] == 3
-        ) else arr8
+        raster_arr = (
+            cv2.cvtColor(arr8, cv2.COLOR_RGB2BGR)
+            if (arr8.ndim == 3 and arr8.shape[2] == 3)
+            else arr8
+        )
         if not cv2.imwrite(path, raster_arr):
             raise IOError(f"OpenCV failed to write image output: {path}")
+
         self.dataset_logger.info(f"Saved {filename} to {out_dir}")
         return self._track_image_output(path, mode, pairing_index)
 
     def _save_mask(
-        self, mask, mode, img_idx, mask_idx, comp_idx, composite_id,
-        out_dir, class_tag, mask_tag=None, label_value=1,
+        self,
+        mask,
+        mode,
+        img_idx,
+        mask_idx,
+        comp_idx,
+        composite_id,
+        out_dir,
+        class_tag,
+        mask_tag=None,
+        label_value=1,
         pairing_index=None,
     ):
         """
@@ -1545,7 +2172,7 @@ class Preprocessor:
         Uses configured output formats for 2D masks, video masks, and 3D masks.
 
         Args:
-            mask (np.ndarray or sitk.Image): Mask data to save.
+            mask (np.ndarray | sitk.Image): Mask data to save.
             mode (str): '2d', 'video', or '3d'.
             img_idx (int): Index of the image within the group.
             mask_idx (int): Index of the mask within the image.
@@ -1553,15 +2180,19 @@ class Preprocessor:
             composite_id (str): Base identifier used to generate filenames.
             out_dir (str): Output directory.
             class_tag (str): Class tag to append to the filename.
-            mask_tag (str, optional): Optional tag to append to the filename.
-            label_value (int, optional): Label value of the component (only used for 3D). Defaults to 1.
+            mask_tag (str | None): Optional tag to append to the filename.
+            label_value (int): Label value of the component (only used for 3D). Defaults
+                to 1.
+            pairing_index (int | None): Explicit processed-image index associated with
+                the output, if available.
 
         Returns:
             str: Full path to the saved file.
         """
         self._current_stage = "write"
         pairing_index = img_idx if pairing_index is None else pairing_index
-        if mode == '3d':
+
+        if mode == "3d":
             # Composite_id includes desired suffix (e.g., 'patient_mask')
             sid = self._short_id(composite_id)
             ext = config.OUTPUT_FORMATS["3d_mask"]
@@ -1579,11 +2210,17 @@ class Preprocessor:
                 config.OUTPUT_FILENAMES["separator"],
             )
             path = os.path.join(out_dir, filename)
+
             if isinstance(mask, sitk.Image):
                 sitk.WriteImage(mask, path)
             else:
-                mask_np = self.xp.asnumpy(mask.astype(self.xp.int32)) if config.GPU_ENABLED else mask.astype(self.xp.int32)
+                mask_np = (
+                    self.xp.asnumpy(mask.astype(self.xp.int32))
+                    if config.GPU_ENABLED
+                    else mask.astype(self.xp.int32)
+                )
                 sitk.WriteImage(sitk.GetImageFromArray(mask_np), path)
+
             self.dataset_logger.debug(f"Saved 3D mask: {filename} to {out_dir}")
             return self._track_mask_output(path, mode, pairing_index, class_tag)
 
@@ -1606,12 +2243,15 @@ class Preprocessor:
         path = os.path.join(out_dir, filename)
         arr8 = self._to_uint8(mask)
         arr8 = self.xp.asnumpy(arr8) if config.GPU_ENABLED else arr8
+
         if mode == "2d" and ext in config.SUPPORTED_VOLUME_OUTPUT_EXTS:
             sitk.WriteImage(sitk.GetImageFromArray(arr8.astype(np.uint8)), path)
             self.dataset_logger.debug(f"Saved 2D medical mask: {filename} to {out_dir}")
+
             return self._track_mask_output(path, mode, pairing_index, class_tag)
         if not cv2.imwrite(path, arr8):
             raise IOError(f"OpenCV failed to write mask output: {path}")
+
         self.dataset_logger.debug(f"Saved {filename} to {out_dir}")
         return self._track_mask_output(path, mode, pairing_index, class_tag)
 
@@ -1632,15 +2272,19 @@ class Preprocessor:
         - Set self.is_significant_crop to True if >=25 percent of area is removed
 
         Args:
-            image_paths (list of str): Paths to image files or series.
+            image_paths (list[str]): Paths to image files or series.
             pipeline (str): '3D' to perform 3D bounding box, otherwise 2D.
+            preprocessing_options (dict | None): Optional group-level preprocessing
+                overrides.
 
         Returns:
-            tuple:
-                For 3D: (z0, z1, y0, y1, x0, x1)
-                For 2D: (y0, y1, x0, x1)
+            tuple: Bounds as (z0, z1, y0, y1, x0, x1) for volumes or (y0, y1, x0, x1)
+                for 2D images. For 3D: (z0, z1, y0, y1, x0, x1) For 2D: (y0, y1, x0,
+                x1).
         """
-        self.dataset_logger.info(f"Computing group bounding box for {len(image_paths)} inputs")
+        self.dataset_logger.info(
+            f"Computing group bounding box for {len(image_paths)} inputs"
+        )
         preprocessing_options = preprocessing_options or DEFAULT_PREPROCESSING_OPTIONS
         ext0 = get_extension(image_paths[0]).lower()
 
@@ -1649,7 +2293,9 @@ class Preprocessor:
             # Load_image may return (self.xp.ndarray, itk) or (List[self.xp.ndarray], List[itk])
             vol_data, vol_header = self.load_image(image_paths)
             self._cached_3d_input = (
-                tuple(sorted(str(path) for path in image_paths)), vol_data, vol_header
+                tuple(sorted(str(path) for path in image_paths)),
+                vol_data,
+                vol_header,
             )
 
             # If load_image returned a list of 3D volumes (i.e., original was multi-modality),
@@ -1659,11 +2305,16 @@ class Preprocessor:
                 fg_all = self.xp.zeros(vol_data[0].shape, dtype=self.xp.bool_)
                 for vol in vol_data:
                     fg_all |= self.xp.asarray(vol != self.background_value)
+
                 vol_shape = fg_all.shape  # (Z, Y, X)
                 if not self.xp.any(fg_all):
                     Z, Y, X = vol_shape
-                    self.dataset_logger.warning("No foreground found in multi-modality volume; using full extent")
+                    self.dataset_logger.warning(
+                        "No foreground found in multi-modality volume; using full extent"
+                    )
+
                     return (0, Z, 0, Y, 0, X)
+
                 z_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(1, 2)))
                 y_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 2)))
                 x_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 1)))
@@ -1681,8 +2332,12 @@ class Preprocessor:
                     vol_shape = fg_all.shape
                     if not self.xp.any(fg_all):
                         Z, Y, X = vol_shape
-                        self.dataset_logger.warning("No foreground found in 4D volume; using full extent")
+                        self.dataset_logger.warning(
+                            "No foreground found in 4D volume; using full extent"
+                        )
+
                         return (0, Z, 0, Y, 0, X)
+
                     z_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(1, 2)))
                     y_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 2)))
                     x_used = self.xp.flatnonzero(self.xp.any(fg_all, axis=(0, 1)))
@@ -1693,8 +2348,12 @@ class Preprocessor:
                     fg = self.xp.asarray(vol != self.background_value)
                     if not self.xp.any(fg):
                         Z, Y, X = vol_shape
-                        self.dataset_logger.warning("No foreground found in volume; using full extent")
+                        self.dataset_logger.warning(
+                            "No foreground found in volume; using full extent"
+                        )
+
                         return (0, Z, 0, Y, 0, X)
+
                     z_used = self.xp.flatnonzero(self.xp.any(fg, axis=(1, 2)))
                     y_used = self.xp.flatnonzero(self.xp.any(fg, axis=(0, 2)))
                     x_used = self.xp.flatnonzero(self.xp.any(fg, axis=(0, 1)))
@@ -1711,6 +2370,7 @@ class Preprocessor:
 
             bbox3d = (z0, z1, y0, y1, x0, x1)
             self.dataset_logger.info(f"3D group bbox: {bbox3d}")
+
             return bbox3d
 
         # 2) 2D case: images or videos -> compute 2D bbox tile-by-tile
@@ -1743,7 +2403,7 @@ class Preprocessor:
                         fg_mask = self.xp.any(data != self.background_value, axis=0)
                 else:
                     # data is already 2D (HxW)
-                    fg_mask = (data != self.background_value)
+                    fg_mask = data != self.background_value
 
                 ys_local, xs_local = self.xp.nonzero(fg_mask)
                 if ys_local.size == 0:
@@ -1754,7 +2414,11 @@ class Preprocessor:
                 # Parse the tile's row/col indices from its filename, e.g. "0_10.jpeg"
                 basename = os.path.basename(path)
                 name_no_ext = os.path.splitext(basename)[0]
-                if preprocessing_options.get("tile_coordinate_strategy") == "row_col_filename":
+
+                if (
+                    preprocessing_options.get("tile_coordinate_strategy")
+                    == "row_col_filename"
+                ):
                     try:
                         row_str, col_str = name_no_ext.split("_")
                         row_idx, col_idx = int(row_str), int(col_str)
@@ -1762,7 +2426,7 @@ class Preprocessor:
                         row_idx, col_idx = 0, 0
                 else:
                     row_idx, col_idx = 0, 0
-                
+
                 # Convert local coords to slide-global coords (tile size 512)
                 ys_global = ys_local + (row_idx * 512)
                 xs_global = xs_local + (col_idx * 512)
@@ -1797,7 +2461,9 @@ class Preprocessor:
             else:
                 H0, W0 = self.target_size
 
-            self.dataset_logger.warning("No foreground found across group; using full image")
+            self.dataset_logger.warning(
+                "No foreground found across group; using full image"
+            )
             return (0, H0, 0, W0)
 
         y0, y1 = int(global_min_y), int(global_max_y) + 1
@@ -1812,6 +2478,7 @@ class Preprocessor:
 
         bbox2d = (y0, y1, x0, x1)
         self.dataset_logger.info(f"2D group bbox: {bbox2d}")
+
         return bbox2d
 
     def _crop(self, arr, bbox):
@@ -1819,14 +2486,15 @@ class Preprocessor:
         Crop a 2D image, volume slice, or mask array to the specified bounding box.
 
         Args:
-            arr (self.xp.ndarray): Array of shape (H, W) or (H, W, C).
+            arr (np.ndarray | cp.ndarray): Array of shape (H, W) or (H, W, C).
             bbox (tuple): (min_row, max_row, min_col, max_col) to crop.
 
         Returns:
-            self.xp.ndarray: Cropped array of the same dimensionality as input.
+            np.ndarray | cp.ndarray: Cropped array of the same dimensionality as input.
         """
         self.dataset_logger.debug(f"Cropping array with bbox={bbox}")
         r0, r1, c0, c1 = bbox
+
         return arr[r0:r1, c0:c1]
 
     def _normalize_intensity(self, image, modality, use_central_region=False):
@@ -1847,20 +2515,25 @@ class Preprocessor:
             - Z-score over full image
 
         Args:
-            image (self.xp.ndarray): Input image array (any dtype, 2D).
+            image (np.ndarray | cp.ndarray): Input image array (any dtype, 2D).
             modality (str): Lowercase modality key ('ct', 'mri', etc.).
             use_central_region (bool): If True, normalize over central region.
 
         Returns:
-            self.xp.ndarray: Normalized image (float32).
+            np.ndarray | cp.ndarray: Normalized image (float32).
         """
-        self.dataset_logger.debug(f"Normalizing intensity image with modality={modality}")
+        self.dataset_logger.debug(
+            f"Normalizing intensity image with modality={modality}"
+        )
         img = self.xp.asarray(image).astype(self.xp.float32)
 
-        if modality == 'ct':
+        if modality == "ct":
             profile = self._active_ct_profile
             if profile is None:
-                raise CTProfileError("CT normalization was called without selecting a subdataset profile")
+                raise CTProfileError(
+                    "CT normalization was called without selecting a subdataset profile"
+                )
+
             img = self.xp.clip(img, profile.window_lower, profile.window_upper)
             mean, std = profile.mean, profile.std
             result = self._calculate_zscore(img, mean, std)
@@ -1908,15 +2581,26 @@ class Preprocessor:
 
             result = self._calculate_zscore(img, mean, std)
 
-        self.dataset_logger.debug(f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}")
+        self.dataset_logger.debug(
+            f"Normalized image with modality={modality}, mean={mean:.3f}, std={std:.3f}"
+        )
         return result.astype(self.xp.float32)
 
     def _normalize_mri_volume(self, volume):
-        """Normalize one cropped 3D MRI channel using fixed volume-wide statistics.
+        """
+        Normalize one cropped 3D MRI channel using fixed volume-wide statistics.
 
         Foreground percentiles and z-score statistics are calculated once for the
-        complete channel. Background and non-finite voxels remain zero so padding
-        does not become an artificial negative signal after normalization.
+        complete channel. Background and non-finite voxels remain zero so padding does
+        not become an artificial negative signal after normalization.
+
+        Args:
+            volume (np.ndarray | cp.ndarray): Cropped scalar MRI channel with shape [Z,
+                H, W].
+
+        Returns:
+            np.ndarray | cp.ndarray: Float32 volume with clipped, normalized foreground
+                and zero background/nonfinite voxels.
         """
         img = self.xp.asarray(volume, dtype=self.xp.float32)
         finite = self.xp.isfinite(img)
@@ -1939,14 +2623,28 @@ class Preprocessor:
 
         self.dataset_logger.debug(
             "Normalized MRI volume with window=[%.3f, %.3f], mean=%.3f, std=%.3f",
-            float(lower), float(upper), float(mean), float(std),
+            float(lower),
+            float(upper),
+            float(mean),
+            float(std),
         )
+
         return result.astype(self.xp.float32)
 
     def _as_numpy(self, array):
-        """Explicitly transfer a backend array to host memory when required."""
+        """
+        Explicitly transfer a backend array to host memory when required.
+
+        Args:
+            array (np.ndarray | cp.ndarray): Array whose backend is selected or whose
+                contents are transferred to the host.
+
+        Returns:
+            np.ndarray: NumPy array suitable for CPU libraries or serialization.
+        """
         if self.xp is np:
             return np.asarray(array)
+
         return self.xp.asnumpy(array)
 
     def _calculate_zscore(self, img, mean, std):
@@ -1954,12 +2652,12 @@ class Preprocessor:
         Zero-centers or z-scores img, then replaces any NaN/Inf with 0.
 
         Args:
-            img (self.xp.ndarray): Input image array (any dtype, 2D).
+            img (np.ndarray | cp.ndarray): Input image array (any dtype, 2D).
             mean (float): Mean value.
             std (float): Standard deviation.
 
         Returns:
-            self.xp.ndarray: Normalized image (float32).
+            np.ndarray | cp.ndarray: Normalized image (float32).
         """
         if std <= 0:
             result = img - mean
@@ -1972,16 +2670,18 @@ class Preprocessor:
         """
         Resize a 2D or 3D array (image or mask) to the target size.
 
-        For image data (is_mask=False): use bicubic interpolation to preserve intensity continuity.
-        For mask data (is_mask=True): use nearest-neighbor interpolation to preserve label values.
+        For image data (is_mask=False): use bicubic interpolation to preserve intensity
+        continuity. For mask data (is_mask=True): use nearest-neighbor interpolation to
+        preserve label values.
 
-        Parameters:
-            data (self.xp.ndarray): Input array of shape (H, W) or (H, W, C).
-            is_mask (bool): Flag indicating whether this is a mask (use nearest-neighbor).
+        Args:
+            data (np.ndarray | cp.ndarray): Input array of shape (H, W) or (H, W, C).
+            is_mask (bool): Flag indicating whether this is a mask (use
+                nearest-neighbor).
 
         Returns:
-            self.xp.ndarray: Resized array of shape (target_height, target_width) or
-                        (target_height, target_width, C) matching input channels.
+            np.ndarray | cp.ndarray: Array resized to the configured in-plane size,
+                retaining the input channel count.
         """
         self.dataset_logger.debug(f"Resizing to {self.target_size}")
         interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
@@ -1999,7 +2699,9 @@ class Preprocessor:
             # 4) Download from GPU
             resized_np = gres.download()
         else:
-            host_np = self.xp.asnumpy(data) if config.GPU_ENABLED else data # cv2 expects numpy
+            host_np = (
+                self.xp.asnumpy(data) if config.GPU_ENABLED else data
+            )  # cv2 expects numpy
             resized_np = cv2.resize(host_np, (target_w, target_h), interpolation=interp)
 
         return self.xp.asarray(resized_np)
@@ -2008,12 +2710,12 @@ class Preprocessor:
         """
         Ensure an image has three channels by replicating or trimming as needed.
 
-        Parameters:
-            img (self.xp.ndarray): Input image array, either
-                              2D (H, W) or 3D (H, W, C).
+        Args:
+            img (np.ndarray | cp.ndarray): Input image array, either 2D (H, W) or 3D (H,
+                W, C).
 
         Returns:
-            self.xp.ndarray: 3D image array of shape (H, W, 3).
+            np.ndarray | cp.ndarray: 3D image array of shape (H, W, 3).
         """
         if img.ndim == 2:
             # Single-channel: replicate to RGB
@@ -2037,11 +2739,12 @@ class Preprocessor:
         Split a multi-class segmentation mask into binary masks for each class.
 
         Args:
-            mask (self.xp.ndarray): Integer mask array where 0 = background and
-                            positive integers represent distinct classes.
+            mask (np.ndarray | cp.ndarray): Integer mask array where 0 = background and
+                positive integers represent distinct classes.
 
         Returns:
-            List[Tuple[int, self.xp.ndarray]]: List of (label, binary_mask) for each class label > 0.
+            list[tuple[int, np.ndarray | cp.ndarray]]: List of (label, binary_mask) for
+                each class label > 0.
         """
         self.dataset_logger.info("Splitting multi-class mask")
 
@@ -2049,9 +2752,11 @@ class Preprocessor:
         fg_labels = [lbl for lbl in labels if lbl != self.background_value]
 
         out = []
+
         for lbl in fg_labels:
             binary = (mask == lbl).astype(self.xp.uint8)
             out.append((lbl, binary))
+
         return out
 
     def _split_connected_components(self, binary_mask):
@@ -2059,10 +2764,11 @@ class Preprocessor:
         Split a binary mask into its connected components.
 
         Args:
-            binary_mask (self.xp.ndarray): 2D array of 0/1 values.
+            binary_mask (np.ndarray | cp.ndarray): 2D array of 0/1 values.
 
         Returns:
-            List[self.xp.ndarray]: List of binary masks, one per connected component.
+            list[np.ndarray | cp.ndarray]: List of binary masks, one per connected
+                component.
         """
         self.dataset_logger.info("Splitting connected components")
 
@@ -2089,14 +2795,16 @@ class Preprocessor:
         Remove connected-component masks smaller than the minimum area threshold.
 
         Args:
-            mask_list (List[self.xp.ndarray]): List of binary mask arrays.
+            mask_list (list[np.ndarray | cp.ndarray]): List of binary mask arrays.
 
         Returns:
-            List[self.xp.ndarray]: Filtered list where each mask has area >= min_mask_size.
+            list[np.ndarray | cp.ndarray]: Filtered list where each mask has area >=
+                min_mask_size.
         """
         found = len(mask_list)
 
         filtered = []
+
         for m in mask_list:
             # Count non-zero pixels
             area = int(m.sum())
@@ -2106,21 +2814,38 @@ class Preprocessor:
         rejected = found - len(filtered)
         self._current_qc["components_2d_found"] += found
         self._current_qc["components_2d_rejected"] += rejected
+
         if found == 0:
             self._current_qc["empty_masks"] += 1
             self._record_reason("empty_mask")
         elif rejected:
             self._record_reason("component_below_minimum_size_2d")
+
         return filtered
 
-
     def _log_2d_component_summary(self, source, found_before, rejected_before):
-        """Log one aggregate 2D component summary for a source mask or mask video."""
+        """
+        Log one aggregate 2D component summary for a source mask or mask video.
+
+        Args:
+            source (str): Source mask or video path included in the aggregate log
+                message.
+            found_before (int): Number of 2D components found before processing this
+                source.
+            rejected_before (int): Number of 2D components rejected before processing
+                this source.
+
+        Returns:
+            None.
+        """
         found = self._current_qc["components_2d_found"] - found_before
         rejected = self._current_qc["components_2d_rejected"] - rejected_before
         self.dataset_logger.info(
             "2D component summary for mask %s: found=%d accepted=%d rejected=%d",
-            source, found, found - rejected, rejected,
+            source,
+            found,
+            found - rejected,
+            rejected,
         )
 
     def _is_multiclass_mask(self, mask_array):
@@ -2132,7 +2857,7 @@ class Preprocessor:
         - For single-channel masks, returns True if any label > 1 exists.
 
         Args:
-            mask_array (self.xp.ndarray): Input mask array.
+            mask_array (np.ndarray | cp.ndarray): Input mask array.
 
         Returns:
             bool: True if the mask has multiple foreground classes, False otherwise.
@@ -2145,46 +2870,49 @@ class Preprocessor:
             # Discard pure black background
             bg = [self.background_value] * 3
             non_background = unique[~self.xp.all(unique == bg, axis=1)]
+
             return len(non_background) > 1
         else:
             # Single-channel: any value beyond binary?
             return self.xp.any(mask_array > 1)
-        
+
     def _collapse_mask_to_labels(self, raw_mask, background_value=0):
         """
         Convert a color- or intensity-coded mask into a single-channel label map.
 
-        For RGB(A) inputs, each unique color is mapped to a distinct integer label.
-        For single-channel inputs, background_value is mapped to 0 and all other
-        pixel values are mapped to positive labels.
+        For RGB(A) inputs, each unique color is mapped to a distinct integer label. For
+        single-channel inputs, background_value is mapped to 0 and all other pixel
+        values are mapped to positive labels.
 
         Args:
-            raw_mask (self.xp.ndarray): A 2D array of shape (H, W) or a 3D array of
-                shape (H, W, 3) or (H, W, 4) representing the mask.
-            background_value (int, optional): Pixel value to treat as background.
-                Defaults to 0.
+            raw_mask (np.ndarray | cp.ndarray): A 2D array of shape (H, W) or a 3D array
+                of shape (H, W, 3) or (H, W, 4) representing the mask.
+            background_value (int): Pixel value to treat as background. Defaults to 0.
 
         Returns:
-            tuple:
-                label_map (self.xp.ndarray): A 2D int32 array of shape (H, W) where each
+            tuple: Int32 label map and a palette mapping original values or colors to
+                label IDs.
+                label_map (np.ndarray | cp.ndarray): A 2D int32 array of shape (H, W) where each
                     value is the assigned label (0..N).
                 palette (dict): Mapping from original color tuples (R, G, B) or
                     intensity tuples (v, v, v) to assigned label integers.
         """
         # 1) Handle true-color inputs
-        if raw_mask.ndim == 3 and raw_mask.shape[2] in (3,4):
+        if raw_mask.ndim == 3 and raw_mask.shape[2] in (3, 4):
             rgb = raw_mask[..., :3].astype(self.xp.uint8)
             h, w, _ = rgb.shape
             flat = rgb.reshape(-1, 3)
             unique_cols = self.xp.unique(flat, axis=0)
 
-            bg = (background_value,)*3
-            palette = { bg: 0 }
+            bg = (background_value,) * 3
+            palette = {bg: 0}
             next_lbl = 1
+
             for col in unique_cols:
                 col_t = tuple(int(x) for x in col)
                 if col_t == bg:
                     continue
+
                 palette[col_t] = next_lbl
                 next_lbl += 1
 
@@ -2198,20 +2926,24 @@ class Preprocessor:
 
         # 2) Handle single-channel inputs
         elif raw_mask.ndim == 2:
-            self.dataset_logger.info(f"Collapsing mask to labels. Background value: {background_value}")
+            self.dataset_logger.info(
+                f"Collapsing mask to labels. Background value: {background_value}"
+            )
             unique_vals = self.xp.unique(raw_mask)
             # Multiclass
             bg_check = self.xp.array([0, background_value], dtype=raw_mask.dtype)
+
             if len(unique_vals) > 2 or (unique_vals == bg_check).all():
                 # Map background_value->0, others->1,2,…
                 palette = {}
                 label_map = self.xp.zeros_like(raw_mask, dtype=self.xp.int32)
                 next_lbl = 1
+
                 for v in unique_vals:
                     if v == background_value:
-                        palette[(v,)*3] = 0
+                        palette[(v,) * 3] = 0
                     else:
-                        palette[(v,)*3] = next_lbl
+                        palette[(v,) * 3] = next_lbl
                         label_map[raw_mask == v] = next_lbl
                         next_lbl += 1
             # Pure binary
@@ -2220,10 +2952,7 @@ class Preprocessor:
                 fg_vals = [int(v) for v in unique_vals if v != background_value]
                 # If there is somehow only one value, pick inverted background
                 fg_val = fg_vals[0] if fg_vals else (255 - background_value)
-                palette = {
-                    (background_value,)*3: 0,
-                    (fg_val,)*3: 1
-                }
+                palette = {(background_value,) * 3: 0, (fg_val,) * 3: 1}
                 label_map = (raw_mask != background_value).astype(self.xp.int32)
 
             return label_map, palette
@@ -2234,34 +2963,35 @@ class Preprocessor:
 
     def get_matching_image_idx(self, mask_composite_id, image_paths):
         """
-        Given a mask's composite_id and the list of image paths in the group,
-        return the index of the image whose id2 matches the one tagged
-        inside the mask_composite_id.
+        Given a mask's composite_id and the list of image paths in the group, return the
+        index of the image whose id2 matches the one tagged inside the
+        mask_composite_id.
 
-        If there's only one image, returns 0.
-        If id2 isn't found or no image contains that id2, also returns 0.
+        If there's only one image, returns 0. If id2 isn't found or no image contains
+        that id2, also returns 0.
 
-        This is only used for multi-image groups where it can be ambiguous
-        which mask corresponds to which image.
+        This is only used for multi-image groups where it can be ambiguous which mask
+        corresponds to which image.
 
         Args:
-            mask_composite_id (str): The composite_id of the mask
-            image_paths (list): A list of image paths in the group
+            mask_composite_id (str): The composite_id of the mask.
+            image_paths (list): A list of image paths in the group.
 
         Returns:
-            int: The index of the matching image
+            int: The index of the matching image.
         """
         # Single-image case -> always 0
         if len(image_paths) <= 1:
             return 0
 
         # Multi-image -> grab id2 from composite_id
-        match = re.search(r'__ID2__(.*?)__', mask_composite_id)
+        match = re.search(r"__ID2__(.*?)__", mask_composite_id)
         if match:
             id2_val = match.group(1)
             # find the first image path containing that id2
             for idx, p in enumerate(image_paths):
                 if id2_val in p:
                     return idx
+
         # Fallback
         return 0

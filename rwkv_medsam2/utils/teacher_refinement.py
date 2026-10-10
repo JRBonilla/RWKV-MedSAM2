@@ -14,7 +14,6 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-
 SAM2_IMAGE_MEAN = (0.485, 0.456, 0.406)
 SAM2_IMAGE_STD = (0.229, 0.224, 0.225)
 
@@ -33,7 +32,25 @@ def teacher_prefetch_memory_requirement(
     mask_itemsize: int = 1,
     headroom: float = 1.25,
 ) -> Mapping[str, int]:
-    """Estimate shared memory needed by a teacher DataLoader prefetch queue."""
+    """
+    Estimate shared memory needed by a teacher DataLoader prefetch queue.
+
+    Args:
+        batch_size (int): Number of samples or objects in the batch.
+        sequence_length (int): Number of frames in each prefetched sequence.
+        height (int): Frame height in pixels.
+        width (int): Frame width in pixels.
+        num_workers (int): Number of DataLoader worker processes.
+        prefetch_factor (int): Number of batches prefetched by each worker.
+        image_channels (int): Number of image channels transported by the loader.
+        mask_channels (int): Number of mask channels transported by the loader.
+        image_itemsize (int): Bytes per transported image element.
+        mask_itemsize (int): Bytes per transported mask element.
+        headroom (float): Safety multiplier applied to the estimated prefetch footprint.
+
+    Returns:
+        Mapping[str, int]: Batch bytes, queue slots, and required bytes including headroom.
+    """
     positive = {
         "batch_size": batch_size,
         "sequence_length": sequence_length,
@@ -63,6 +80,7 @@ def teacher_prefetch_memory_requirement(
     )
     queue_slots = 1 + int(num_workers) * int(prefetch_factor) if num_workers else 1
     required_bytes = math.ceil(batch_bytes * queue_slots * float(headroom))
+
     return {
         "batch_bytes": batch_bytes,
         "queue_slots": queue_slots,
@@ -71,8 +89,17 @@ def teacher_prefetch_memory_requirement(
 
 
 def available_shared_memory_bytes(path: str = "/dev/shm") -> int:
-    """Return currently available bytes in the shared-memory filesystem."""
+    """
+    Return currently available bytes in the shared-memory filesystem.
+
+    Args:
+        path (str): Shared-memory filesystem directory whose available capacity is queried.
+
+    Returns:
+        int: Bytes available to unprivileged processes at the supplied path.
+    """
     stats = os.statvfs(path)
+
     return int(stats.f_bavail * stats.f_frsize)
 
 
@@ -82,13 +109,28 @@ def assert_teacher_shared_memory_capacity(
     shm_path: str = "/dev/shm",
     **loader_shape,
 ) -> Mapping[str, int]:
-    """Fail early when a teacher loader configuration is unsafe for /dev/shm."""
+    """
+    Fail early when a teacher loader configuration is unsafe for /dev/shm.
+
+    Args:
+        available_bytes (Optional[int]): Explicit shared-memory capacity, or None to query
+            the filesystem.
+        shm_path (str): Shared-memory filesystem path whose capacity is checked.
+        **loader_shape (dict): Keyword arguments accepted by
+            teacher_prefetch_memory_requirement, including batch_size, sequence_length,
+            height, width, num_workers, and prefetch_factor.
+
+    Returns:
+        Mapping[str, int]: Estimated memory requirement; raises RuntimeError when capacity
+            is insufficient.
+    """
     requirement = dict(teacher_prefetch_memory_requirement(**loader_shape))
     available = (
         available_shared_memory_bytes(shm_path)
         if available_bytes is None
         else int(available_bytes)
     )
+
     if available < 0:
         raise ValueError(f"available_bytes must be nonnegative, got {available}")
     if available < requirement["required_bytes"]:
@@ -100,31 +142,52 @@ def assert_teacher_shared_memory_capacity(
             f"{available_mib:.1f} MiB is available. Reduce workers or prefetching; "
             "do not switch worker transport back to float tensors."
         )
+
     requirement["available_bytes"] = available
     return requirement
 
 
 def normalize_sam2_images(images_255: torch.Tensor) -> torch.Tensor:
-    """Convert RGB images in ``[0, 255]`` to SAM2's normalized input space."""
+    """
+    Convert RGB images in ``[0, 255]`` to SAM2's normalized input space.
+
+    Args:
+        images_255 (torch.Tensor): RGB image tensor with intensities on the [0, 255] scale.
+
+    Returns:
+        torch.Tensor: Float32 ImageNet-normalized RGB tensor with the input shape.
+    """
     if images_255.ndim < 4 or images_255.shape[-3] != 3:
         raise ValueError(
             f"Expected RGB images with channel dimension 3, got {tuple(images_255.shape)}"
         )
+
     images = images_255.float() / 255.0
     shape = [1] * images.ndim
     shape[-3] = 3
     mean = images.new_tensor(SAM2_IMAGE_MEAN).view(shape)
     std = images.new_tensor(SAM2_IMAGE_STD).view(shape)
+
     return (images - mean) / std
 
 
 def highest_resolution_axis(volume_shape: Sequence[int]) -> int:
-    """Return the slicing axis whose slices have the greatest pixel area."""
+    """
+    Return the slicing axis whose slices have the greatest pixel area.
+
+    Args:
+        volume_shape (Sequence[int]): Three-dimensional volume shape in array-axis order.
+
+    Returns:
+        int: Selected axis index, with the first axis winning ties.
+    """
     if len(volume_shape) != 3:
         raise ValueError(f"Expected a 3D volume shape, got {tuple(volume_shape)}")
+
     d, h, w = (int(value) for value in volume_shape)
     if min(d, h, w) <= 0:
         raise ValueError(f"Volume dimensions must be positive, got {(d, h, w)}")
+
     return int(np.asarray((h * w, d * w, d * h), dtype=np.int64).argmax())
 
 
@@ -133,16 +196,28 @@ def select_contiguous_foreground_window(
     seq_len: int,
     rng: Optional[np.random.RandomState] = None,
 ) -> Tuple[int, np.ndarray]:
-    """Select a contiguous foreground-rich window on the highest-resolution axis.
+    """
+    Select a contiguous foreground-rich window on the highest-resolution axis.
 
     Windows are ranked first by their number of nonempty slices and then by
     total foreground area. Validation callers omit ``rng`` for deterministic
     center-nearest tie breaking; training callers may provide an RNG to sample
     among equally ranked windows.
+
+    Args:
+        mask_volume (np.ndarray): Three-dimensional mask used to select a foreground-rich
+            window.
+        seq_len (int): Required number of consecutive slices in the selected window.
+        rng (Optional[np.random.RandomState]): Optional random generator for training-time
+            tie breaking.
+
+    Returns:
+        Tuple[int, np.ndarray]: Slice axis and consecutive selected slice indices.
     """
     mask = np.asarray(mask_volume)
     if mask.ndim != 3:
         raise ValueError(f"Expected a 3D mask, got shape {mask.shape}")
+
     seq_len = int(seq_len)
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
@@ -158,6 +233,7 @@ def select_contiguous_foreground_window(
         raise ValueError("3D mask has no foreground")
 
     foreground = (areas > 0).astype(np.int64)
+    # Prefix sums score every contiguous window without rescanning its slices.
     count_cs = np.concatenate(([0], np.cumsum(foreground)))
     area_cs = np.concatenate(([0], np.cumsum(areas, dtype=np.int64)))
     window_counts = count_cs[seq_len:] - count_cs[:-seq_len]
@@ -184,44 +260,92 @@ def extract_contiguous_volume_window(
     seq_len: int,
     rng: Optional[np.random.RandomState] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
-    """Extract matching ``[T,H,W]`` image and mask windows."""
+    """
+    Extract matching ``[T,H,W]`` image and mask windows.
+
+    Args:
+        image_volume (np.ndarray): Three-dimensional image aligned with mask_volume.
+        mask_volume (np.ndarray): Three-dimensional mask used to select a foreground-rich
+            window.
+        seq_len (int): Required number of consecutive slices in the selected window.
+        rng (Optional[np.random.RandomState]): Optional random generator for training-time
+            tie breaking.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, int, np.ndarray]: Image window, mask window, slice
+            axis, and selected indices.
+    """
     image = np.asarray(image_volume)
     mask = np.asarray(mask_volume)
+
     if image.shape != mask.shape:
         raise ValueError(f"Image/mask shape mismatch: {image.shape} vs {mask.shape}")
+
     axis, indices = select_contiguous_foreground_window(mask, seq_len, rng=rng)
     images = np.moveaxis(np.take(image, indices, axis=axis), axis, 0)
     masks = np.moveaxis(np.take(mask, indices, axis=axis), axis, 0)
+
     return images, masks, axis, indices
 
 
 def scale_intensity_to_u8(array: np.ndarray) -> np.ndarray:
-    """Robustly window a scalar medical image/volume into uint8."""
+    """
+    Robustly window a scalar medical image/volume into uint8.
+
+    Args:
+        array (np.ndarray): Input image, mask, or volume array.
+
+    Returns:
+        np.ndarray: Uint8 image or volume with nonfinite values mapped to valid byte
+            intensities.
+    """
     values = np.asarray(array, dtype=np.float32)
     finite = values[np.isfinite(values)]
+
     if finite.size == 0:
         raise ValueError("Image contains no finite intensities")
+
     lo, hi = np.percentile(finite, (0.5, 99.5))
     if not np.isfinite(lo) or not np.isfinite(hi):
         raise ValueError("Could not determine a finite intensity window")
     if hi <= lo:
         hi = lo + 1.0
+
     scaled = (np.clip(values, lo, hi) - lo) * (255.0 / (hi - lo))
     return np.nan_to_num(scaled, nan=0.0, posinf=255.0, neginf=0.0).astype(np.uint8)
 
 
 def source_paths(sequences: Iterable[Mapping]) -> set[str]:
-    """Collect normalized source image paths from formatted sequence records."""
+    """
+    Collect normalized source image paths from formatted sequence records.
+
+    Args:
+        sequences (Iterable[Mapping]): Formatted dataset records containing source
+            identities and image paths.
+
+    Returns:
+        set[str]: Absolute, case-normalized source image paths.
+    """
     paths = set()
     for record in sequences:
         sequence = record.get("sequence") or []
         if sequence:
             paths.add(os.path.normcase(os.path.abspath(str(sequence[0][0]))))
+
     return paths
 
 
 def source_keys(sequences: Iterable[Mapping]) -> set[str]:
-    """Collect case/group identities, falling back to normalized image paths."""
+    """
+    Collect case/group identities, falling back to normalized image paths.
+
+    Args:
+        sequences (Iterable[Mapping]): Formatted dataset records containing source
+            identities and image paths.
+
+    Returns:
+        set[str]: Dataset-qualified case identities, falling back to normalized image paths.
+    """
     keys = set()
     for record in sequences:
         source = record.get("source_identifier") or record.get("identifier")
@@ -236,15 +360,28 @@ def source_keys(sequences: Iterable[Mapping]) -> set[str]:
             dataset = str(record.get("dataset") or "")
             subdataset = str(record.get("subdataset") or "")
             keys.add(f"{dataset}\x1f{subdataset}\x1f{source}")
+
     return keys
 
 
-def assert_disjoint_sources(train_sequences: Iterable[Mapping], val_sequences: Iterable[Mapping]) -> None:
-    """Raise when train and validation share an image or source-group identity."""
+def assert_disjoint_sources(
+    train_sequences: Iterable[Mapping], val_sequences: Iterable[Mapping]
+) -> None:
+    """
+    Raise when train and validation share an image or source-group identity.
+
+    Args:
+        train_sequences (Iterable[Mapping]): Formatted training sequence records.
+        val_sequences (Iterable[Mapping]): Formatted validation sequence records.
+
+    Returns:
+        None.
+    """
     train_sequences = list(train_sequences)
     val_sequences = list(val_sequences)
     image_overlap = source_paths(train_sequences) & source_paths(val_sequences)
     group_overlap = source_keys(train_sequences) & source_keys(val_sequences)
+
     if image_overlap or group_overlap:
         examples = sorted(image_overlap or group_overlap)[:3]
         raise RuntimeError(
@@ -256,14 +393,22 @@ def assert_disjoint_sources(train_sequences: Iterable[Mapping], val_sequences: I
 
 
 def checkpoint_selection_score(metrics: Mapping[str, float]) -> float:
-    """Macro-average fixed-threshold 2D/3D Dice for checkpoint selection."""
+    """
+    Macro-average fixed-threshold 2D/3D Dice for checkpoint selection.
+
+    Args:
+        metrics (Mapping[str, float]): Validation metrics keyed by fixed-threshold Dice
+            names.
+
+    Returns:
+        float: Balanced checkpoint-selection score for the available dimensions.
+    """
     values = []
     for key in ("dice2d@0.5", "dice3d@0.5"):
         value = metrics.get(key)
         if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
             values.append(float(value))
     if not values:
-        raise ValueError(
-            "Validation did not produce fixed-threshold 2D or 3D Dice"
-        )
+        raise ValueError("Validation did not produce fixed-threshold 2D or 3D Dice")
+
     return float(np.mean(values))

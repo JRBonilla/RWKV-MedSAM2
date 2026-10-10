@@ -1,3 +1,7 @@
+"""
+Test MRI/CT intensity normalization and preservation of saved image channel order.
+"""
+
 import logging
 import sys
 import tempfile
@@ -16,7 +20,20 @@ from dripp.preprocessor import Preprocessor
 
 
 class PreprocessorNormalizationTests(unittest.TestCase):
+    """
+    Check modality normalization across MRI volumes, channels, and 2D images.
+    """
+
     def setUp(self):
+        """
+        Create a small preprocessor for modality intensity normalization checks.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         logger = logging.getLogger(f"{__name__}.{self._testMethodName}")
         logger.handlers = [logging.NullHandler()]
         logger.propagate = False
@@ -29,6 +46,15 @@ class PreprocessorNormalizationTests(unittest.TestCase):
         )
 
     def test_mri_volume_uses_one_mapping_across_slices(self):
+        """
+        Verify consistent volume-wide MRI intensity mapping across slices.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         volume = np.array(
             [
                 [[0, 10, 20], [30, 40, 50]],
@@ -40,11 +66,22 @@ class PreprocessorNormalizationTests(unittest.TestCase):
         normalized = self.preprocessor._normalize_mri_volume(volume)
 
         self.assertEqual(normalized.dtype, np.float32)
-        self.assertAlmostEqual(float(normalized[0, 0, 1]), float(normalized[1, 0, 1]), places=6)
+        self.assertAlmostEqual(
+            float(normalized[0, 0, 1]), float(normalized[1, 0, 1]), places=6
+        )
         self.assertEqual(float(normalized[0, 0, 0]), 0.0)
         self.assertEqual(float(normalized[1, 0, 0]), 0.0)
 
     def test_mri_volume_foreground_is_zscored_after_clipping(self):
+        """
+        Verify foreground z-score normalization after MRI percentile clipping.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         volume = np.arange(27, dtype=np.float32).reshape(3, 3, 3)
         normalized = self.preprocessor._normalize_mri_volume(volume)
         foreground = volume != 0
@@ -54,24 +91,51 @@ class PreprocessorNormalizationTests(unittest.TestCase):
         self.assertEqual(float(normalized[~foreground][0]), 0.0)
 
     def test_mri_channels_are_normalized_independently(self):
+        """
+        Verify independent normalization of multiple MRI channels.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         channel_a = np.array([[[0, 1], [2, 3]], [[0, 4], [5, 6]]], dtype=np.float32)
-        channel_b = np.array([[[0, 100], [300, 700]], [[0, 900], [1500, 2200]]], dtype=np.float32)
+        channel_b = np.array(
+            [[[0, 100], [300, 700]], [[0, 900], [1500, 2200]]], dtype=np.float32
+        )
 
         normalized_a = self.preprocessor._normalize_mri_volume(channel_a)
         normalized_b = self.preprocessor._normalize_mri_volume(channel_b)
 
-        for source, normalized in ((channel_a, normalized_a), (channel_b, normalized_b)):
+        for source, normalized in (
+            (channel_a, normalized_a),
+            (channel_b, normalized_b),
+        ):
             foreground = source != 0
             self.assertAlmostEqual(float(normalized[foreground].mean()), 0.0, places=6)
             self.assertAlmostEqual(float(normalized[foreground].std()), 1.0, places=6)
 
     def test_mri_volume_zeros_nonfinite_and_handles_empty_or_constant_data(self):
-        invalid = np.array([[[0, np.nan], [np.inf, -np.inf]], [[1, 2], [3, 4]]], dtype=np.float32)
+        """
+        Verify zeroing of nonfinite voxels and handling of empty or constant MRI data.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        invalid = np.array(
+            [[[0, np.nan], [np.inf, -np.inf]], [[1, 2], [3, 4]]], dtype=np.float32
+        )
         normalized_invalid = self.preprocessor._normalize_mri_volume(invalid)
         self.assertTrue(np.isfinite(normalized_invalid).all())
         self.assertTrue(np.all(normalized_invalid[0] == 0))
 
-        normalized_empty = self.preprocessor._normalize_mri_volume(np.zeros((2, 2, 2), dtype=np.float32))
+        normalized_empty = self.preprocessor._normalize_mri_volume(
+            np.zeros((2, 2, 2), dtype=np.float32)
+        )
         self.assertTrue(np.all(normalized_empty == 0))
 
         constant = np.full((2, 2, 2), 7, dtype=np.float32)
@@ -80,6 +144,15 @@ class PreprocessorNormalizationTests(unittest.TestCase):
         self.assertTrue(np.all(normalized_constant == 0))
 
     def test_2d_mri_normalization_retains_existing_per_image_behavior(self):
+        """
+        Verify that 2D MRI normalization retains its per-image statistics.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         image = np.array([[0, 1], [2, 3]], dtype=np.float32)
         foreground = image > 0
         clipped = np.clip(
@@ -92,9 +165,20 @@ class PreprocessorNormalizationTests(unittest.TestCase):
 
         actual = self.preprocessor._normalize_intensity(image, "mri")
 
-        np.testing.assert_allclose(actual, expected.astype(np.float32), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(
+            actual, expected.astype(np.float32), rtol=1e-6, atol=1e-6
+        )
 
     def test_ct_normalization_is_unchanged(self):
+        """
+        Verify CT intensity normalization using the selected fixed profile.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         preprocessor = Preprocessor(
             target_size=(2, 2),
             ct_window=(100, 50),
@@ -113,7 +197,20 @@ class PreprocessorNormalizationTests(unittest.TestCase):
 
 
 class PreprocessorColorOutputTests(unittest.TestCase):
+    """
+    Check saved RGB, grayscale, and medical-volume array content.
+    """
+
     def setUp(self):
+        """
+        Create a small preprocessor for image and volume output checks.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         logger = logging.getLogger(f"{__name__}.{self._testMethodName}")
         logger.handlers = [logging.NullHandler()]
         logger.propagate = False
@@ -125,6 +222,15 @@ class PreprocessorColorOutputTests(unittest.TestCase):
         )
 
     def test_rgb_raster_round_trip_preserves_channel_order(self):
+        """
+        Verify that raster image saving preserves RGB channel order.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         rgb = np.array(
             [
                 [[255, 0, 0], [0, 0, 255]],
@@ -135,12 +241,24 @@ class PreprocessorColorOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_dir:
             with patch.dict(config.OUTPUT_FORMATS, {"2d_image": ".png"}):
-                path = self.preprocessor._save_image(rgb, "2d", 0, "rgb-test", output_dir)
+                path = self.preprocessor._save_image(
+                    rgb, "2d", 0, "rgb-test", output_dir
+                )
+
             reopened = np.asarray(Image.open(path).convert("RGB"))
 
         np.testing.assert_array_equal(reopened, rgb)
 
     def test_rgb_video_frame_round_trip_preserves_channel_order(self):
+        """
+        Verify that video frame saving preserves RGB channel order.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         rgb = np.array(
             [
                 [[255, 0, 0], [0, 0, 255]],
@@ -151,27 +269,54 @@ class PreprocessorColorOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_dir:
             with patch.dict(config.OUTPUT_FORMATS, {"video_frame": ".png"}):
-                path = self.preprocessor._save_image(rgb, "video", 0, "video-rgb-test", output_dir)
+                path = self.preprocessor._save_image(
+                    rgb, "video", 0, "video-rgb-test", output_dir
+                )
+
             reopened = np.asarray(Image.open(path).convert("RGB"))
 
         np.testing.assert_array_equal(reopened, rgb)
 
     def test_grayscale_raster_output_is_unchanged(self):
+        """
+        Verify preservation of grayscale values in raster output.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         grayscale = np.array([[0, 64], [128, 255]], dtype=np.uint8)
 
         with tempfile.TemporaryDirectory() as output_dir:
             with patch.dict(config.OUTPUT_FORMATS, {"2d_image": ".png"}):
-                path = self.preprocessor._save_image(grayscale, "2d", 0, "gray-test", output_dir)
+                path = self.preprocessor._save_image(
+                    grayscale, "2d", 0, "gray-test", output_dir
+                )
+
             reopened = np.asarray(Image.open(path).convert("L"))
 
         np.testing.assert_array_equal(reopened, grayscale)
 
     def test_medical_volume_output_does_not_apply_color_conversion(self):
+        """
+        Verify that medical-volume saving retains the original array channel order.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         image = np.array([[0, 64], [128, 255]], dtype=np.uint8)
 
         with tempfile.TemporaryDirectory() as output_dir:
             with patch.dict(config.OUTPUT_FORMATS, {"2d_image": ".nii.gz"}):
-                path = self.preprocessor._save_image(image, "2d", 0, "medical-test", output_dir)
+                path = self.preprocessor._save_image(
+                    image, "2d", 0, "medical-test", output_dir
+                )
+
             reopened = sitk.GetArrayFromImage(sitk.ReadImage(path))
 
         np.testing.assert_array_equal(reopened, image)

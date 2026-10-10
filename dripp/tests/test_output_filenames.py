@@ -1,3 +1,7 @@
+"""
+Test configurable output filename tags, separators, and validation.
+"""
+
 import unittest
 from pathlib import Path
 import sys
@@ -13,7 +17,20 @@ from dripp.output_filenames import (
 
 
 class OutputFilenameTests(unittest.TestCase):
+    """
+    Check default and custom output filenames and unsafe-setting rejection.
+    """
+
     def test_default_image_filename_matches_existing_format(self):
+        """
+        Verify that default image filename tags preserve the established format.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.assertEqual(
             render_image_filename("2d", 3, "a1b2c3d4", ".png"),
             "a1b2c3d4_img003.png",
@@ -24,16 +41,36 @@ class OutputFilenameTests(unittest.TestCase):
         )
 
     def test_default_mask_filename_matches_existing_format(self):
+        """
+        Verify that default mask filename tags preserve the established format.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.assertEqual(
             render_mask_filename("2d", 3, 2, 5, "a1b2c3d4", ".png", "tumor"),
             "a1b2c3d4_img003_mask002_%tumor%_comp005.png",
         )
         self.assertEqual(
-            render_mask_filename("3d", 3, 2, 5, "a1b2c3d4", ".nii.gz", "tumor", label_value=7),
+            render_mask_filename(
+                "3d", 3, 2, 5, "a1b2c3d4", ".nii.gz", "tumor", label_value=7
+            ),
             "a1b2c3d4_img003_mask002_%tumor%_label007_comp005.nii.gz",
         )
 
     def test_custom_segment_order_and_separator(self):
+        """
+        Verify custom filename tag order and separator rendering.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.assertEqual(
             render_image_filename(
                 "2d",
@@ -47,6 +84,15 @@ class OutputFilenameTests(unittest.TestCase):
         )
 
     def test_validation_rejects_unsafe_separator_and_duplicates(self):
+        """
+        Verify rejection of unsafe separators and repeated filename tags.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         with self.assertRaises(OutputFilenameError):
             validate_output_filenames(["short_id"], ["short_id"], "/")
         with self.assertRaises(OutputFilenameError):

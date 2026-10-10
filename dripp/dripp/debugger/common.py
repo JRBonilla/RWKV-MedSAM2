@@ -1,4 +1,6 @@
-"""Shared imports and utilities for the Tk-based DRIPP debugger."""
+"""
+Shared imports and utilities for the Tk-based DRIPP debugger.
+"""
 
 import ctypes
 import json
@@ -37,7 +39,6 @@ from dripp.helpers import (
 from dripp.indexer import build_groupings, index_dataset
 from dripp.preprocessor import Preprocessor
 
-
 if os.name == "nt":
     SHILCreateFromPath = ctypes.windll.shell32.SHILCreateFromPath
     SHILCreateFromPath.argtypes = [
@@ -63,20 +64,16 @@ else:
 class TextHandler(logging.Handler):
     """
     Forward log records into a Tk text widget.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
 
     def __init__(self, text_widget):
         """
-        Initialize the object.
+        Initialize a logging handler that appends records to the supplied Tk text
+        widget.
 
         Args:
-            text_widget (Any): Text or ScrolledText widget that receives log output.
+            text_widget (tk.Text | scrolledtext.ScrolledText): Text or ScrolledText
+                widget that receives log output.
 
         Returns:
             None.
@@ -89,14 +86,14 @@ class TextHandler(logging.Handler):
         Append a formatted log record to the text widget.
 
         Args:
-            record (Any): Logging record to emit.
+            record (logging.LogRecord): Logging record to emit.
 
         Returns:
             None.
         """
         msg = self.format(record)
         # Insert message at the end, then scroll to it.
-        self.text_widget.configure(state='normal')
-        self.text_widget.insert(tk.END, msg + '\n')
-        self.text_widget.configure(state='disabled')
+        self.text_widget.configure(state="normal")
+        self.text_widget.insert(tk.END, msg + "\n")
+        self.text_widget.configure(state="disabled")
         self.text_widget.see(tk.END)
