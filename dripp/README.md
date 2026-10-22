@@ -6,20 +6,35 @@ layout.
 
 ## Install
 
-From this repository:
+Use Python 3.10 or newer. From the repository root:
 
 ```bash
-pip install -e "dripp[opencv]"
+python -m pip install Pillow -e "dripp[opencv]"
 ```
 
 This installs the `dripp` command and the standard CPU OpenCV wheel. If your
 environment already provides `cv2` (for example, a custom CUDA-enabled OpenCV
-build), install with `pip install -e dripp` instead so pip does not replace it.
+build), install with `python -m pip install Pillow -e dripp` instead so pip does
+not replace it. The debugger also needs Tk and a graphical display; Tk is a
+system Python dependency, not a pip extra.
+
+GPU preprocessing requires CuPy and an available CUDA device. The `gpu` extra
+installs `cupy-cuda12x` for CUDA 12 environments:
+
+```bash
+python -m pip install -e "dripp[gpu]"
+```
+
+For a CUDA 11 environment, install its matching CuPy wheel separately instead.
+CuPy accelerates array operations. GPU resizing additionally requires an OpenCV
+build with CUDA support; the standard OpenCV wheel uses CPU resizing.
 
 ## Create A Local Config
 
-DRIPP ships with defaults, then optionally loads `DRIPP_CONFIG`, then a local
-`dripp.ini` in the current directory.
+DRIPP loads [packaged defaults](dripp/defaults.ini), then the file named by
+`DRIPP_CONFIG` if set, then `dripp.ini` in the current directory. Later files
+override earlier values. This repository already includes a local `dripp.ini`;
+edit it directly, or create a template in a new working directory:
 
 ```bash
 dripp config init
@@ -33,8 +48,12 @@ base_unproc = /path/to/raw/datasets
 base_proc = /path/to/preprocessed/output
 index_dir = /path/to/dataset/indexes
 groups_dir = /path/to/dataset/indexes/Groups
+ct_stats_dir = /path/to/dataset/indexes/CTStats_v2
 csv_filename = datasets.csv
 ```
+
+Indexing writes group files under `{index_dir}/Groups`; preprocessing reads
+`groups_dir`. Keep these paths aligned when using the same indexed data.
 
 Your datasets CSV is expected at:
 
@@ -106,7 +125,10 @@ ExampleCT,ct,.nii.gz,.nii.gz,,imagesTr,imagesTs,labelsTr,,regex-file,"images: (?
 
 ### Column Reference
 
-Required or strongly recommended columns:
+The CSV must contain `Dataset Name`, `Modality`, `Image File Type`,
+`Mask File Type`, `Root Folder`, and `Preprocessed?` headers. Values may be blank
+where described below. `Mask Classes` and `Segmentation Tasks` must also have
+values for a dataset to produce an index.
 
 | Column | Meaning |
 | --- | --- |
@@ -114,9 +136,9 @@ Required or strongly recommended columns:
 | `Modality` | Comma-separated modality names such as `ct`, `mri`, `x-ray`, `ultrasound`, `histopathology`, or `default`. |
 | `Image File Type` | Comma-separated raw image extensions to index, for example `.png,.jpg` or `.nii.gz`. |
 | `Mask File Type` | Comma-separated raw mask extensions to index. |
-| `Root Folder` | Optional folder inside the dataset folder. Leave blank if files are directly under `{base_unproc}/{Dataset Name}`. |
+| `Root Folder` | Required header; optional folder inside the dataset folder. Leave blank if files are directly under `{base_unproc}/{Dataset Name}`. |
 | `Train Folders` | Optional comma-separated folders containing training images. If blank or unresolved, DRIPP searches the dataset directory. |
-| `Test Folders` | Optional comma-separated folders containing test images. If blank, DRIPP treats indexed images as training data only. |
+| `Test Folders` | Optional comma-separated folders containing test images. If no test images are found, DRIPP randomly assigns annotated groups to train/test with an 80% training probability. Related groups with the same identifier stay together within a subdataset. |
 | `Mask Folders` | Optional comma-separated folders containing masks. If blank or unresolved, DRIPP searches the dataset directory. |
 | `Mask Key` | Optional filename token used to distinguish masks from images when they share folders/extensions. |
 | `Grouping Strategy` | How grouping regexes are applied: `regex-file`, `regex-folder`, `regex`, or `filename`. |
@@ -124,8 +146,8 @@ Required or strongly recommended columns:
 | `Mask Classes` | Class mapping used to label output masks. Required for indexing to produce groups. |
 | `Segmentation Tasks` | Task mapping such as `task_name=class1,class2`. Required for indexing task metadata. |
 | `Background Value` | Optional integer background label. Defaults to `0`. |
-| `Preprocessing Options` | Optional behavior flags for preprocessing. Blank means defaults. |
-| `Preprocessed?` | Optional status flag. `yes` is treated as preprocessed; anything else is treated as not preprocessed. |
+| `Preprocessing Options` | Optional typed preprocessing settings. Blank uses effective configuration defaults. |
+| `Preprocessed?` | Required header; `yes` is treated as preprocessed, while blank or any other value is false. This flag does not prevent an explicitly requested preprocessing run. |
 
 Folder columns support direct relative paths and simple wildcard searches. A
 folder value beginning with `*` searches for directories whose path contains the
@@ -140,9 +162,10 @@ Every regex should capture the shared case/group identifier in a named group:
 (?P<id>...)
 ```
 
-Any additional named groups are preserved as extra identifiers. A special
-additional group named `id2` is included in output filenames and can help match
-multi-image groups.
+Additional named groups are preserved as extra identifiers. The special group
+`id2` is omitted from the grouping key, allowing several images to share one
+group. It contributes to the composite output identifier and can help match
+masks within multi-image groups.
 
 ### Grouping Strategies
 
@@ -195,7 +218,8 @@ pipelines:
 2D, 3D, Video
 ```
 
-Multiple blocks can be separated by commas:
+Multiple blocks can be separated by commas. These path-based examples require
+`regex-folder` or `regex`:
 
 ```text
 [ct: liver: 3D] {images: imagesTr/(?P<id>.+)_0000\.nii\.gz; masks: labelsTr/(?P<id>.+)\.nii\.gz},
@@ -211,13 +235,18 @@ With `regex-folder`, include enough relative path structure for the full match:
 ### Mask Classes And Tasks
 
 `Mask Classes` maps output class names to matching rules. Rules can be numeric
-labels, label ranges, filename keywords, palette colors, or `*` as a fallback.
+labels, label ranges, filename keywords, palette colors, or the match-all rule
+`*`.
 
 Single-subdataset example:
 
 ```text
-tumor=1|organ=2|other=*
+tumor=1|organ=2
 ```
+
+Use `foreground=*` when every mask should receive one class. The current matcher
+checks filename keywords and `*` before palette or numeric rules, so combining
+`*` with numeric classes does not provide a numeric-label fallback.
 
 Multi-subdataset example:
 
@@ -231,8 +260,11 @@ Multi-subdataset example:
 liver_task=liver,tumor|brain_task=edema,core,enhancing
 ```
 
-For a dataset to index cleanly, class names referenced in `Segmentation Tasks`
-should also appear in `Mask Classes`.
+Each populated subdataset must have at least one class that matches a declared
+segmentation task; otherwise indexing raises an error before writing index
+files. Task matching treats spaces and underscores as spelling variants.
+Default class mappings are inherited by named subdatasets unless that subdataset
+defines its own mapping.
 
 ## Preprocessing Options
 
@@ -291,13 +323,18 @@ highest-resolution viewing axis. The viewing axis remains at full resolution so
 slice-count and contiguity thresholds refer to real source slices; downsampling
 is applied only within each slice for the fast area calculation.
 
-The active server run enables the complete policy globally in `dripp.ini`:
+Packaged defaults use a 64-voxel minimum and a downsample factor of 2, with
+slice-area, slice-count, and contiguity filters disabled. The repository's local
+`dripp.ini` overrides these with the following `[preprocessing]` values:
 
-```text
-min_component_voxels_3d=64; mask_qc_downsample_3d=2;
-min_slice_area_px_3d=32; min_slice_area_fraction_3d=0.00153;
-min_qualified_slices_3d=8;
-require_contiguous_qualified_slices_3d=true
+```ini
+[preprocessing]
+min_component_voxels_3d = 64
+mask_qc_downsample_3d = 2
+min_slice_area_px_3d = 32
+min_slice_area_fraction_3d = 0.00153
+min_qualified_slices_3d = 8
+require_contiguous_qualified_slices_3d = true
 ```
 
 ## Index Datasets
@@ -314,6 +351,34 @@ Index every dataset in the CSV:
 dripp index --all
 ```
 
+Indexes are written to `{index_dir}/Indexes/{Dataset Name}_index.json`, and
+groupings to `{index_dir}/Groups/{Dataset Name}_groups.json`. The all-dataset
+command also writes `{index_dir}/Tasks/{csv_stem}_tasks.json`. Check the indexing
+logs: missing class/task definitions skip a dataset, and `index --all` continues
+after per-dataset errors.
+
+### Prepare CT Profiles
+
+Before preprocessing a dataset that includes CT, provide a completed schema-v2
+profile file at `{ct_stats_dir}/{Dataset Name}_ct_stats.json`. Profiles contain
+fixed intensity windows and normalization statistics for each CT subdataset.
+Named subdatasets require exact profile names; a `default` profile is used only
+for an unnamed/default subdataset.
+
+After indexing, generate these profiles with the repository's profile builder:
+
+```bash
+python scripts/preprocessing/compute_ct_stats.py \
+  --metadata-csv /path/to/raw/datasets/datasets.csv \
+  --groups-dir /path/to/dataset/indexes/Groups \
+  --data-root /path/to/raw/datasets \
+  --output-dir /path/to/dataset/indexes/CTStats_v2 \
+  --dataset DATASET_NAME
+```
+
+This script has its own path arguments; it does not derive them from `dripp.ini`.
+Legacy statistics files or incomplete profiles are rejected by preprocessing.
+
 ## Preprocess Datasets
 
 Preprocess one dataset:
@@ -328,13 +393,13 @@ Preprocess every dataset:
 dripp preprocess --all
 ```
 
-Resume all-dataset preprocessing at a specific dataset:
+Start all-dataset preprocessing at a specific CSV row:
 
 ```bash
 dripp preprocess --all --start-at DATASET_NAME
 ```
 
-Limit the number of groups per split while testing:
+Limit randomly sampled groups per split and subdataset while testing:
 
 ```bash
 dripp preprocess --dataset DATASET_NAME --max-groups 2
@@ -345,6 +410,25 @@ Enable GPU acceleration for a run:
 ```bash
 dripp preprocess --dataset DATASET_NAME --gpu
 ```
+
+The dataset-manager CLI currently preprocesses to 512×512 in-plane resolution.
+`--start-at` selects the first dataset to process; it does not resume inside a
+partly processed dataset or skip datasets marked `Preprocessed?=yes`.
+
+Under `{base_proc}/{Dataset Name}`, each run writes:
+
+- `{Dataset Name}_groups.json`: nested groups with processing status, QC, and
+  explicit image/mask pairings. Unselected groups retain their original metadata.
+- `groupings.json`: legacy flat entries for accepted or partial groups that have
+  both saved images and masks.
+- `preprocessing_report.json`: attempted-group counts, quality settings,
+  rejection/failure reasons, and elapsed time.
+- `.preprocessing_logs/`: dataset logs.
+
+The command also writes `dataset_manager.pkl` and a metadata CSV under
+`base_proc`. That CSV uses internal metadata field names; it is not a replacement
+for the input CSV schema. Per-group failures are recorded in the manifests, so
+check the report even when the command prints `Preprocessing complete`.
 
 ## Launch The Debugger
 
@@ -380,6 +464,9 @@ Supported 3D formats:
 ```text
 .nii, .nii.gz, .nrrd, .mha, .mhd
 ```
+
+2D image and mask outputs also accept these medical-volume extensions. Video
+frame and video mask outputs require one of the raster formats above.
 
 ## Troubleshooting
 
@@ -470,4 +557,13 @@ Existing module commands remain available:
 ```bash
 python -m dripp.indexer --dataset DATASET_NAME
 python -m dripp.dataset -preprocess --dataset DATASET_NAME
+```
+
+The module preprocessing command additionally supports `--workers`, `--seed`,
+`--output-dir`, and repeatable `--modality` filters. These options are not exposed
+by the `dripp preprocess` console command:
+
+```bash
+python -m dripp.dataset -preprocess --all --workers 2 --seed 42 \
+  --modality ct --modality mri --output-dir /path/to/preprocessed/output
 ```

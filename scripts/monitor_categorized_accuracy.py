@@ -15,6 +15,7 @@ MODELS = {
     'uoft_medsam2': 'UofT MedSAM2',
 }
 STAGES = {'preparing_all_data':'Preparing test data', 'pilot':'Checking models on the small pilot',
+          'validating_frozen_sources':'Checking frozen evaluation source and checkpoints',
           'validating_pilot_reports':'Checking pilot results and reports',
           'production':'Full accuracy evaluation', 'final_reports':'Building final reports',
           'complete':'Complete', 'failed':'Stopped — needs attention'}
